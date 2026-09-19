@@ -5,7 +5,8 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 
-from .pursuit import FULL_POWER_PCT, PursuitGains, TrackSpeed
+from .drive import FULL_POWER_PCT, TrackSpeed
+from .pursuit import PursuitGains
 from .target import SelectionRule
 
 

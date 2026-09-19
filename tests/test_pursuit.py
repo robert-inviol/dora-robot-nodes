@@ -1,7 +1,8 @@
 import pytest
 
+from follower.drive import STOPPED, TrackSpeed
 from follower.people import Person, TrackId
-from follower.pursuit import DriveCommand, PursuitGains, TrackSpeed, pursue
+from follower.pursuit import PursuitGains, pursue
 
 GAINS = PursuitGains(
     turn=0.8,
@@ -10,7 +11,6 @@ GAINS = PursuitGains(
     frame_fill_deadband=0.08,
     max_speed=TrackSpeed(20),
 )
-STOPPED = DriveCommand(TrackSpeed(0), TrackSpeed(0))
 
 
 def _target(centre_x: float = 0.5, frame_fill: float = 0.55) -> Person:
@@ -72,14 +72,3 @@ def test_turning_while_approaching_keeps_both_tracks_moving_forward_at_different
     command = pursue(_target(centre_x=0.6, frame_fill=0.0), GAINS)
 
     assert command.left.percent > command.right.percent > 0
-
-
-@pytest.mark.parametrize("percent", [-101, 101])
-def test_a_track_speed_beyond_full_power_is_rejected(percent):
-    with pytest.raises(ValueError, match="outside -100..100"):
-        TrackSpeed(percent)
-
-
-@pytest.mark.parametrize("percent", [-100, 0, 100])
-def test_track_speeds_up_to_full_power_are_accepted(percent):
-    assert TrackSpeed(percent).percent == percent
