@@ -4,11 +4,10 @@ import os
 import threading
 import time
 
-import pyarrow as pa
 from aiohttp import web
 from dora import Node
 
-from follower.operator import PilotStatus
+from messages.status import DriverStatus, PilotStatus
 
 from .desk import ControlDesk
 from .server import ControlServer
@@ -20,10 +19,11 @@ STICK_STALE_AFTER_S = 0.3
 
 
 class StatusBoard:
-    """The follower's latest status: written by the dora loop, read by the web server thread."""
+    """The latest pilot and driver status: written by the dora loop, read by the web server thread."""
 
     def __init__(self):
-        self.latest: PilotStatus | None = None
+        self.pilot: PilotStatus | None = None
+        self.driver: DriverStatus | None = None
 
 
 def serve_in_background(app: web.Application, port: int) -> None:
@@ -39,7 +39,7 @@ def main() -> None:
     board = StatusBoard()
     server = ControlServer(
         desk,
-        latest_status=lambda: board.latest,
+        status_board=board,
         perception_url=os.environ[PERCEPTION_URL_VARIABLE],
         clock=time.monotonic,
     )
@@ -54,7 +54,8 @@ def main() -> None:
             continue
         if event["id"] == "tick":
             command = desk.command(time.monotonic())
-            node.send_output("command", pa.array([command.to_row()]))
-        elif event["id"] == "status":
-            for row in event["value"].to_pylist():
-                board.latest = PilotStatus.from_row(row)
+            node.send_output("command", command.to_arrow())
+        elif event["id"] == "pilot":
+            board.pilot = PilotStatus.from_arrow(event["value"])
+        elif event["id"] == "driver":
+            board.driver = DriverStatus.from_arrow(event["value"])

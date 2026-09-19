@@ -1,4 +1,5 @@
-from follower.people import Person, TrackId, people_in
+from follower.people import Person, people_in
+from messages.status import TrackId
 
 
 def _row(**overrides):

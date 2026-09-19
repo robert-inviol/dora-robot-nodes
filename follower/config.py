@@ -2,10 +2,10 @@
 
 import tomllib
 from dataclasses import dataclass
-from enum import Enum
 from pathlib import Path
 
-from .drive import FULL_POWER_PCT, TrackSpeed
+from messages.drive import FULL_POWER_PCT, PowerCap
+
 from .pilot import StaleAfter
 from .pursuit import PursuitGains
 from .target import SelectionRule
@@ -13,17 +13,6 @@ from .target import SelectionRule
 
 class ConfigError(ValueError):
     pass
-
-
-class TankMode(Enum):
-    DRY_RUN = "dry_run"
-    ARMED = "armed"
-
-
-@dataclass(frozen=True)
-class TankSettings:
-    mode: TankMode
-    serial_device: str
 
 
 @dataclass(frozen=True)
@@ -35,10 +24,9 @@ class TargetSettings:
 
 @dataclass(frozen=True)
 class FollowerConfig:
-    tank: TankSettings
     target: TargetSettings
     gains: PursuitGains
-    manual_max_speed: TrackSpeed
+    manual_max_power: PowerCap
     stale_after: StaleAfter
 
 
@@ -60,25 +48,20 @@ def _not_negative(name: str, value: float) -> float:
     return value
 
 
-def _speed_cap(name: str, percent: float) -> TrackSpeed:
-    return TrackSpeed(int(_within(name, percent, 1, FULL_POWER_PCT)))
+def _power_cap(name: str, percent: float) -> PowerCap:
+    return PowerCap(int(_within(name, percent, 1, FULL_POWER_PCT)))
 
 
 def load_config(path: Path) -> FollowerConfig:
     settings = tomllib.loads(path.read_text())
     try:
-        tank, target, pursuit, teleop, safety = (
-            settings["tank"],
+        target, pursuit, manual, safety = (
             settings["target"],
             settings["pursuit"],
-            settings["teleop"],
+            settings["manual"],
             settings["safety"],
         )
         return FollowerConfig(
-            tank=TankSettings(
-                mode=TankMode(tank["mode"]),
-                serial_device=tank["serial_device"],
-            ),
             target=TargetSettings(
                 selection_rule=SelectionRule(target["selection_rule"]),
                 min_confidence=_within("target.min_confidence", target["min_confidence"], 0, 1),
@@ -93,9 +76,9 @@ def load_config(path: Path) -> FollowerConfig:
                 frame_fill_deadband=_within(
                     "pursuit.frame_fill_deadband", pursuit["frame_fill_deadband"], 0, 1
                 ),
-                max_speed=_speed_cap("pursuit.max_speed_pct", pursuit["max_speed_pct"]),
+                max_power=_power_cap("pursuit.max_power_pct", pursuit["max_power_pct"]),
             ),
-            manual_max_speed=_speed_cap("teleop.max_speed_pct", teleop["max_speed_pct"]),
+            manual_max_power=_power_cap("manual.max_power_pct", manual["max_power_pct"]),
             stale_after=StaleAfter(
                 detections_s=_positive(
                     "safety.stale_detections_after_s", safety["stale_detections_after_s"]

@@ -1,5 +1,6 @@
-from follower.people import Person, TrackId
+from follower.people import Person
 from follower.target import SelectionRule, TargetLock
+from messages.status import TrackId
 
 RELEASE_AFTER_S = 1.5
 

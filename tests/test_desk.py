@@ -1,6 +1,6 @@
 import pytest
 
-from follower.operator import DriveMode, OperatorCommand
+from messages.operator import DriveMode, OperatorCommand
 from teleop.desk import ControlDesk
 
 STICK_STALE_AFTER_S = 0.25

@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from follower.config import ConfigError, TankMode, load_config
+from follower.config import ConfigError, load_config
 from follower.target import SelectionRule
 
 SHIPPED_CONFIG = Path(__file__).parent.parent / "follower.toml"
@@ -16,18 +16,8 @@ def _config_with(tmp_path: Path, old: str, new: str) -> Path:
     return path
 
 
-def test_the_shipped_config_moves_nothing_until_someone_arms_it():
-    assert load_config(SHIPPED_CONFIG).tank.mode is TankMode.DRY_RUN
-
-
-def test_the_shipped_config_is_capped_at_the_child_safe_speed():
-    assert load_config(SHIPPED_CONFIG).gains.max_speed.percent == 20
-
-
-def test_the_tank_can_be_armed(tmp_path):
-    path = _config_with(tmp_path, 'mode = "dry_run"', 'mode = "armed"')
-
-    assert load_config(path).tank.mode is TankMode.ARMED
+def test_the_shipped_config_is_capped_at_the_child_safe_power():
+    assert load_config(SHIPPED_CONFIG).gains.max_power.percent == 20
 
 
 def test_the_selection_rule_is_read(tmp_path):
@@ -43,19 +33,19 @@ def test_an_unknown_selection_rule_is_rejected(tmp_path):
         load_config(path)
 
 
-@pytest.mark.parametrize("max_speed_pct", [0, 101])
-def test_a_speed_cap_outside_1_to_100_is_rejected(tmp_path, max_speed_pct):
-    path = _config_with(tmp_path, "max_speed_pct = 20", f"max_speed_pct = {max_speed_pct}")
+@pytest.mark.parametrize("max_power_pct", [0, 101])
+def test_a_follow_power_cap_outside_1_to_100_is_rejected(tmp_path, max_power_pct):
+    path = _config_with(tmp_path, "max_power_pct = 20", f"max_power_pct = {max_power_pct}")
 
-    with pytest.raises(ConfigError, match="pursuit.max_speed_pct"):
+    with pytest.raises(ConfigError, match="pursuit.max_power_pct"):
         load_config(path)
 
 
-@pytest.mark.parametrize("max_speed_pct", [1, 100])
-def test_a_speed_cap_from_1_to_100_is_accepted(tmp_path, max_speed_pct):
-    path = _config_with(tmp_path, "max_speed_pct = 20", f"max_speed_pct = {max_speed_pct}")
+@pytest.mark.parametrize("max_power_pct", [1, 100])
+def test_a_power_cap_from_1_to_100_is_accepted(tmp_path, max_power_pct):
+    path = _config_with(tmp_path, "max_power_pct = 20", f"max_power_pct = {max_power_pct}")
 
-    assert load_config(path).gains.max_speed.percent == max_speed_pct
+    assert load_config(path).gains.max_power.percent == max_power_pct
 
 
 def test_a_missing_setting_is_named(tmp_path):
@@ -65,11 +55,11 @@ def test_a_missing_setting_is_named(tmp_path):
         load_config(path)
 
 
-@pytest.mark.parametrize("max_speed_pct", [0, 101])
-def test_a_manual_speed_cap_outside_1_to_100_is_rejected(tmp_path, max_speed_pct):
-    path = _config_with(tmp_path, "max_speed_pct = 50", f"max_speed_pct = {max_speed_pct}")
+@pytest.mark.parametrize("max_power_pct", [0, 101])
+def test_a_manual_power_cap_outside_1_to_100_is_rejected(tmp_path, max_power_pct):
+    path = _config_with(tmp_path, "max_power_pct = 50", f"max_power_pct = {max_power_pct}")
 
-    with pytest.raises(ConfigError, match="teleop.max_speed_pct"):
+    with pytest.raises(ConfigError, match="manual.max_power_pct"):
         load_config(path)
 
 

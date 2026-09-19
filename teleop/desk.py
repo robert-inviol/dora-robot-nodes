@@ -2,7 +2,7 @@
 
 import threading
 
-from follower.operator import DriveMode, OperatorCommand
+from messages.operator import DriveMode, OperatorCommand
 
 
 class ControlDesk:

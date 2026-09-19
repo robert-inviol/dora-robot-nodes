@@ -1,9 +1,9 @@
 """People parsed from the detection rows the perception bridge publishes."""
 
 from dataclasses import dataclass
-from typing import Any, Mapping, NewType, Sequence
+from typing import Any, Mapping, Sequence
 
-TrackId = NewType("TrackId", int)
+from messages.status import TrackId
 
 PERSON_CLASS_NAME = "person"
 # The bridge's track_id for a detection that hailotracker has not numbered yet.
