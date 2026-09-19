@@ -5,7 +5,7 @@ import pytest
 from follower.config import ConfigError, load_config
 from follower.target import SelectionRule
 
-SHIPPED_CONFIG = Path(__file__).parent.parent / "follower.toml"
+SHIPPED_CONFIG = Path(__file__).parents[3] / "robots" / "tank" / "follower.toml"
 
 
 def _config_with(tmp_path: Path, old: str, new: str) -> Path:

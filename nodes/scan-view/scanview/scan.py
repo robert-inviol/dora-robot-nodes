@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
-# The column and parameter names are set by lidar/lidar-node/src/wire.rs.
+# The column and parameter names are set by nodes/lidar/lidar-node/src/wire.rs.
 BEARING_COLUMN = "bearing_deg"
 RANGE_COLUMN = "range_m"
 SPIN_RATE_PARAMETER = "spin_rev_per_s"
