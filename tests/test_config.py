@@ -79,3 +79,16 @@ def test_both_stale_input_timeouts_are_read(tmp_path):
     stale_after = load_config(path).stale_after
 
     assert (stale_after.detections_s, stale_after.operator_s) == (0.5, 0.8)
+
+
+def test_a_forward_gain_of_zero_is_accepted_for_turning_on_the_spot(tmp_path):
+    path = _config_with(tmp_path, "forward_gain = 0", "forward_gain = 0.0")
+
+    assert load_config(path).gains.forward == 0
+
+
+def test_a_negative_forward_gain_is_rejected(tmp_path):
+    path = _config_with(tmp_path, "forward_gain = 0", "forward_gain = -0.5")
+
+    with pytest.raises(ConfigError, match="pursuit.forward_gain"):
+        load_config(path)

@@ -54,6 +54,12 @@ def _positive(name: str, value: float) -> float:
     return value
 
 
+def _not_negative(name: str, value: float) -> float:
+    if value < 0:
+        raise ValueError(f"{name} is {value}, expected 0 or more")
+    return value
+
+
 def _speed_cap(name: str, percent: float) -> TrackSpeed:
     return TrackSpeed(int(_within(name, percent, 1, FULL_POWER_PCT)))
 
@@ -80,7 +86,7 @@ def load_config(path: Path) -> FollowerConfig:
             ),
             gains=PursuitGains(
                 turn=_positive("pursuit.turn_gain", pursuit["turn_gain"]),
-                forward=_positive("pursuit.forward_gain", pursuit["forward_gain"]),
+                forward=_not_negative("pursuit.forward_gain", pursuit["forward_gain"]),
                 target_frame_fill=_within(
                     "pursuit.target_frame_fill", pursuit["target_frame_fill"], 0, 1
                 ),

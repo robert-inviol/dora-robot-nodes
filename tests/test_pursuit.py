@@ -13,6 +13,15 @@ GAINS = PursuitGains(
 )
 
 
+TURN_ONLY = PursuitGains(
+    turn=0.8,
+    forward=0.0,
+    target_frame_fill=0.55,
+    frame_fill_deadband=0.08,
+    max_speed=TrackSpeed(20),
+)
+
+
 def _target(centre_x: float = 0.5, frame_fill: float = 0.55) -> Person:
     return Person(TrackId(1), centre_x=centre_x, frame_fill=frame_fill, area=0.1)
 
@@ -72,3 +81,16 @@ def test_turning_while_approaching_keeps_both_tracks_moving_forward_at_different
     command = pursue(_target(centre_x=0.6, frame_fill=0.0), GAINS)
 
     assert command.left.percent > command.right.percent > 0
+
+
+@pytest.mark.parametrize("frame_fill", [0.05, 0.55, 1.0])
+def test_with_no_forward_gain_an_off_centre_target_is_turned_towards_on_the_spot(frame_fill):
+    command = pursue(_target(centre_x=0.9, frame_fill=frame_fill), TURN_ONLY)
+
+    assert command.left.percent > 0
+    assert command.right.percent == -command.left.percent
+
+
+@pytest.mark.parametrize("frame_fill", [0.05, 1.0])
+def test_with_no_forward_gain_a_centred_target_needs_no_movement_at_any_distance(frame_fill):
+    assert pursue(_target(centre_x=0.5, frame_fill=frame_fill), TURN_ONLY) == STOPPED
