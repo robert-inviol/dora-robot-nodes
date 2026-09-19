@@ -18,6 +18,7 @@ from .sdp import reveal_browser_address
 
 PAGE_FILE = Path(__file__).with_name("page.html")
 PERCEPTION_PORT_PLACEHOLDER = "__PERCEPTION_PORT__"
+MAP_PORT_PLACEHOLDER = "__MAP_PORT__"
 STATUS_PERIOD_S = 0.1
 # A page that stops answering pings is dropped, which idles the controls.
 PAGE_PING_PERIOD_S = 1.0
@@ -53,14 +54,17 @@ class ControlServer:
         desk: ControlDesk,
         status_board: StatusSource,
         perception_url: str,
+        map_port: int,
         clock: Callable[[], float],
     ):
         self._desk = desk
         self._status_board = status_board
         self._perception_url = perception_url
         self._clock = clock
-        self._page = PAGE_FILE.read_text().replace(
-            PERCEPTION_PORT_PLACEHOLDER, str(urlsplit(perception_url).port)
+        self._page = (
+            PAGE_FILE.read_text()
+            .replace(PERCEPTION_PORT_PLACEHOLDER, str(urlsplit(perception_url).port))
+            .replace(MAP_PORT_PLACEHOLDER, str(map_port))
         )
 
     def app(self) -> web.Application:

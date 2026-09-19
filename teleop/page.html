@@ -31,6 +31,15 @@
   #view { grid-area:view; position:relative; min-height:0; background:#000;
           border:1px solid var(--line); border-radius:10px; overflow:hidden; }
   @media (orientation: portrait) { #view { aspect-ratio:16/9; max-height:45dvh; } }
+  /* The video and the map share the view: one fills it, the other is a thumbnail that swaps them when tapped. */
+  .pane { position:absolute; overflow:hidden; background:#000; }
+  .pane.big { inset:0; }
+  .pane.mini { right:8px; bottom:8px; width:clamp(110px, 30%, 260px); z-index:2; cursor:pointer;
+               border:1px solid var(--dim); border-radius:8px; box-shadow:0 2px 12px rgba(0,0,0,.6); }
+  #videoPane.mini { aspect-ratio:16/9; }
+  #mapPane.mini { aspect-ratio:1; }
+  /* A thumbnail is only a button; what is inside it gets no clicks of its own. */
+  .pane.mini > * { pointer-events:none; }
   #video, #overlay { position:absolute; inset:0; width:100%; height:100%; }
   #video { object-fit:contain; }
   #overlay { pointer-events:none; }
@@ -74,13 +83,17 @@
     <h1>Tank controls</h1>
     <span id="link" class="badge stop">NO LINK</span>
     <span id="picture" class="badge">NO VIDEO</span>
+    <span id="map" class="badge">NO MAP</span>
     <span id="mode" class="badge">MANUAL</span>
     <span id="armed" class="badge">...</span>
   </header>
 
   <div id="view">
-    <video id="video" autoplay muted playsinline></video>
-    <canvas id="overlay"></canvas>
+    <div id="videoPane" class="pane big">
+      <video id="video" autoplay muted playsinline></video>
+      <canvas id="overlay"></canvas>
+    </div>
+    <div id="mapPane" class="pane mini" hidden></div>
   </div>
 
   <div id="panel">
@@ -267,8 +280,42 @@ function drawOverlay() {
   requestAnimationFrame(drawOverlay);
 }
 
+// Map
+const MAP_RETRY_MS = 5000;
+const MAP_HOST = `${location.hostname}:__MAP_PORT__`;
+const panes = [$('videoPane'), $('mapPane')];
+let mapReported = false;
+
+// The map's drawing code comes from the node that serves the map, so a tank without a lidar still gets this page.
+function loadMap() {
+  const script = document.createElement('script');
+  script.src = `http://${MAP_HOST}/map.js`;
+  script.onload = () => {
+    $('mapPane').hidden = false;
+    LidarMap.attach($('mapPane'), {
+      socketUrl: `ws://${MAP_HOST}/plane`,
+      onStatus: ({ live }) => setBadge('map', live ? 'MAP LIVE' : 'NO MAP', live ? 'go' : ''),
+    });
+  };
+  script.onerror = () => {
+    script.remove();
+    if (!mapReported) report('map: no map script at ' + MAP_HOST + ', retrying');
+    mapReported = true;
+    setTimeout(loadMap, MAP_RETRY_MS);
+  };
+  document.head.append(script);
+}
+
+for (const pane of panes) {
+  pane.addEventListener('click', () => {
+    if (!pane.classList.contains('mini')) return;
+    for (const each of panes) { each.classList.toggle('mini'); each.classList.toggle('big'); }
+  });
+}
+
 connectControls();
 connectVideo();
+loadMap();
 connectDetections();
 showStatus();
 drawOverlay();

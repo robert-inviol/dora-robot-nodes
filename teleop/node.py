@@ -14,6 +14,7 @@ from .server import ControlServer
 
 PORT_VARIABLE = "TELEOP_PORT"
 PERCEPTION_URL_VARIABLE = "PERCEPTION_URL"
+MAP_PORT_VARIABLE = "MAP_PORT"
 # The page repeats the stick position ten times a second while it is held.
 STICK_STALE_AFTER_S = 0.3
 
@@ -41,6 +42,7 @@ def main() -> None:
         desk,
         status_board=board,
         perception_url=os.environ[PERCEPTION_URL_VARIABLE],
+        map_port=int(os.environ[MAP_PORT_VARIABLE]),
         clock=time.monotonic,
     )
     serve_in_background(server.app(), port)
