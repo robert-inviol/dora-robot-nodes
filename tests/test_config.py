@@ -63,3 +63,19 @@ def test_a_missing_setting_is_named(tmp_path):
 
     with pytest.raises(ConfigError, match="turn_gain"):
         load_config(path)
+
+
+@pytest.mark.parametrize("max_speed_pct", [0, 101])
+def test_a_manual_speed_cap_outside_1_to_100_is_rejected(tmp_path, max_speed_pct):
+    path = _config_with(tmp_path, "max_speed_pct = 50", f"max_speed_pct = {max_speed_pct}")
+
+    with pytest.raises(ConfigError, match="teleop.max_speed_pct"):
+        load_config(path)
+
+
+def test_both_stale_input_timeouts_are_read(tmp_path):
+    path = _config_with(tmp_path, "stale_operator_after_s = 0.5", "stale_operator_after_s = 0.8")
+
+    stale_after = load_config(path).stale_after
+
+    assert (stale_after.detections_s, stale_after.operator_s) == (0.5, 0.8)

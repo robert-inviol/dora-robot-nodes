@@ -10,6 +10,7 @@ import pyarrow as pa
 from dora import Node
 
 from .config import FollowerConfig, TankMode, TankSettings, load_config
+from .operator import OperatorCommand
 from .pilot import Pilot
 from .tank import LoggedTank, SerialTank, Tank, open_serial_port
 from .target import TargetLock
@@ -28,9 +29,11 @@ def build_pilot(config: FollowerConfig, tank: Tank) -> Pilot:
     return Pilot(
         lock=TargetLock(config.target.selection_rule, config.target.release_after_s),
         gains=config.gains,
+        manual_max_speed=config.manual_max_speed,
         tank=tank,
+        armed=config.tank.mode is TankMode.ARMED,
         min_confidence=config.target.min_confidence,
-        stale_detections_after_s=config.stale_detections_after_s,
+        stale_after=config.stale_after,
     )
 
 
@@ -52,7 +55,8 @@ def main() -> None:
     config = load_config(Path(os.environ[CONFIG_PATH_VARIABLE]))
     print(
         f"[follower] tank mode {config.tank.mode.value}, "
-        f"max speed {config.gains.max_speed.percent}%, "
+        f"follow max {config.gains.max_speed.percent}%, "
+        f"manual max {config.manual_max_speed.percent}%, "
         f"rule {config.target.selection_rule.value}"
     )
     # SIGTERM becomes an exit so the finally block still stops the motors.
@@ -68,12 +72,16 @@ def main() -> None:
             if event["type"] != "INPUT":
                 continue
             now_s = time.monotonic()
-            if event["id"] == "detections":
+            if event["id"] == "operator":
+                for row in event["value"].to_pylist():
+                    pilot.on_operator(OperatorCommand.from_row(row), now_s)
+            elif event["id"] == "detections":
                 announcement = pilot.on_detections(event["value"].to_pylist(), now_s)
                 if announcement is not None:
                     print(f"[follower] {announcement}")
                     node.send_output("events", _hud_event(announcement))
             elif event["id"] == "tick":
                 pilot.on_tick(now_s)
+                node.send_output("status", pa.array([pilot.status.to_row()]))
     finally:
         tank.stop()

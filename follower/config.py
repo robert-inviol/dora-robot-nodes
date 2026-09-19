@@ -6,6 +6,7 @@ from enum import Enum
 from pathlib import Path
 
 from .drive import FULL_POWER_PCT, TrackSpeed
+from .pilot import StaleAfter
 from .pursuit import PursuitGains
 from .target import SelectionRule
 
@@ -37,7 +38,8 @@ class FollowerConfig:
     tank: TankSettings
     target: TargetSettings
     gains: PursuitGains
-    stale_detections_after_s: float
+    manual_max_speed: TrackSpeed
+    stale_after: StaleAfter
 
 
 def _within(name: str, value: float, low: float, high: float) -> float:
@@ -52,13 +54,18 @@ def _positive(name: str, value: float) -> float:
     return value
 
 
+def _speed_cap(name: str, percent: float) -> TrackSpeed:
+    return TrackSpeed(int(_within(name, percent, 1, FULL_POWER_PCT)))
+
+
 def load_config(path: Path) -> FollowerConfig:
     settings = tomllib.loads(path.read_text())
     try:
-        tank, target, pursuit, safety = (
+        tank, target, pursuit, teleop, safety = (
             settings["tank"],
             settings["target"],
             settings["pursuit"],
+            settings["teleop"],
             settings["safety"],
         )
         return FollowerConfig(
@@ -80,12 +87,16 @@ def load_config(path: Path) -> FollowerConfig:
                 frame_fill_deadband=_within(
                     "pursuit.frame_fill_deadband", pursuit["frame_fill_deadband"], 0, 1
                 ),
-                max_speed=TrackSpeed(
-                    int(_within("pursuit.max_speed_pct", pursuit["max_speed_pct"], 1, FULL_POWER_PCT))
-                ),
+                max_speed=_speed_cap("pursuit.max_speed_pct", pursuit["max_speed_pct"]),
             ),
-            stale_detections_after_s=_positive(
-                "safety.stale_detections_after_s", safety["stale_detections_after_s"]
+            manual_max_speed=_speed_cap("teleop.max_speed_pct", teleop["max_speed_pct"]),
+            stale_after=StaleAfter(
+                detections_s=_positive(
+                    "safety.stale_detections_after_s", safety["stale_detections_after_s"]
+                ),
+                operator_s=_positive(
+                    "safety.stale_operator_after_s", safety["stale_operator_after_s"]
+                ),
             ),
         )
     except KeyError as missing:

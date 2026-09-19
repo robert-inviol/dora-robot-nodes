@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>Tank controls</title>
+<style>
+  :root { --bg:#10141a; --panel:#1b222c; --line:#2c3644; --text:#e8edf3; --dim:#8b97a7;
+          --go:#2fd27a; --warn:#ffb020; --stop:#e5484d; --gap:10px; }
+  * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  html, body { height:100%; margin:0; overflow:hidden; overscroll-behavior:none; }
+  body { background:var(--bg); color:var(--text); font:15px/1.35 system-ui, sans-serif; }
+
+  /* Upright: video across the top, controls in what is left. */
+  main { height:100vh; height:100dvh; padding:var(--gap); display:grid; gap:var(--gap);
+         grid-template: "head" auto "view" auto "panel" minmax(0, 1fr) / minmax(0, 1fr); }
+  /* Sideways or a laptop window: video takes the full height, controls in a side column. */
+  @media (orientation: landscape) {
+    main { grid-template: "view head" auto "view panel" minmax(0, 1fr)
+                          / minmax(0, 1fr) clamp(210px, 30vw, 360px); }
+  }
+
+  header { grid-area:head; display:flex; align-items:center; gap:6px; flex-wrap:wrap; }
+  h1 { font-size:16px; margin:0 auto 0 0; letter-spacing:.02em; white-space:nowrap; }
+  .badge { padding:2px 9px; border-radius:999px; font-size:11px; font-weight:700; white-space:nowrap;
+           background:var(--panel); border:1px solid var(--line); color:var(--dim); }
+  .badge.go { color:#06140c; background:var(--go); border-color:var(--go); }
+  .badge.warn { color:#1d1300; background:var(--warn); border-color:var(--warn); }
+  .badge.stop { color:#fff; background:var(--stop); border-color:var(--stop); }
+
+  #view { grid-area:view; position:relative; min-height:0; background:#000;
+          border:1px solid var(--line); border-radius:10px; overflow:hidden; }
+  @media (orientation: portrait) { #view { aspect-ratio:16/9; max-height:45dvh; } }
+  #video, #overlay { position:absolute; inset:0; width:100%; height:100%; }
+  #video { object-fit:contain; }
+  #overlay { pointer-events:none; }
+
+  #panel { grid-area:panel; min-height:0; display:grid; gap:var(--gap);
+           grid-template: "readout readout" auto "stick buttons" minmax(0, 1fr) / minmax(0, 3fr) minmax(0, 2fr); }
+  @media (orientation: landscape) {
+    #panel { grid-template: "readout" auto "buttons" auto "stick" minmax(0, 1fr) / minmax(0, 1fr); }
+  }
+
+  #readout { grid-area:readout; padding:6px 10px; background:var(--panel); border:1px solid var(--line);
+             border-radius:10px; display:grid; grid-template-columns:repeat(3, 1fr); gap:6px;
+             font-variant-numeric:tabular-nums; }
+  #readout div span { display:block; color:var(--dim); font-size:10px; text-transform:uppercase; }
+
+  #buttons { grid-area:buttons; display:grid; gap:var(--gap); grid-auto-rows:minmax(0, 1fr); }
+  @media (orientation: landscape) { #buttons { grid-template-columns:1fr 1fr; grid-auto-rows:auto; } }
+  button { font:inherit; font-weight:800; letter-spacing:.04em; color:var(--text); min-height:52px;
+           border:2px solid var(--line); border-radius:12px; background:var(--panel);
+           padding:8px; cursor:pointer; touch-action:manipulation; }
+  #follow.on { background:var(--go); border-color:var(--go); color:#06140c; }
+  #stop { background:var(--stop); border-color:var(--stop); color:#fff; font-size:19px; }
+
+  /* The stick is the largest square that fits the space it is given. */
+  #stick { grid-area:stick; min-height:0; container-type:size; display:grid; place-items:center; }
+  #pad { position:relative; width:min(100cqw, 100cqh, 340px); aspect-ratio:1; border-radius:50%;
+         background:radial-gradient(circle, #232c38 0%, var(--panel) 70%);
+         border:2px solid var(--line); touch-action:none; user-select:none; }
+  #pad::before, #pad::after { content:""; position:absolute; background:var(--line); }
+  #pad::before { left:50%; top:12%; bottom:12%; width:1px; }
+  #pad::after { top:50%; left:12%; right:12%; height:1px; }
+  #knob { position:absolute; left:50%; top:50%; width:36%; aspect-ratio:1; z-index:1;
+          transform:translate(-50%, -50%);
+          border-radius:50%; background:#3d4a5c; border:2px solid #5b6b80; }
+  #pad.held #knob { background:var(--go); border-color:#b8f5d3; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Tank controls</h1>
+    <span id="link" class="badge stop">NO LINK</span>
+    <span id="picture" class="badge">NO VIDEO</span>
+    <span id="mode" class="badge">MANUAL</span>
+    <span id="armed" class="badge">...</span>
+  </header>
+
+  <div id="view">
+    <video id="video" autoplay muted playsinline></video>
+    <canvas id="overlay"></canvas>
+  </div>
+
+  <div id="panel">
+    <div id="readout">
+      <div><span>Left track</span><b id="left">0%</b></div>
+      <div><span>Right track</span><b id="right">0%</b></div>
+      <div><span>Following</span><b id="locked">nobody</b></div>
+    </div>
+    <div id="buttons">
+      <button id="follow">FOLLOW ME</button>
+      <button id="stop">STOP</button>
+    </div>
+    <div id="stick"><div id="pad"><div id="knob"></div></div></div>
+  </div>
+</main>
+
+<script>
+const STICK_PERIOD_MS = 100;
+const STICK_DEADZONE = 0.08;
+const NOBODY_LOCKED = -1;
+
+const $ = id => document.getElementById(id);
+const video = $('video'), overlay = $('overlay'), pad = $('pad'), knob = $('knob');
+const paint = overlay.getContext('2d');
+
+let control = null;
+let status = { mode: 'manual', locked_track_id: NOBODY_LOCKED, left_pct: 0, right_pct: 0, armed: false };
+let stick = { throttle: 0, steer: 0 };
+let stickHeld = false;
+let people = [];
+
+// Controls link
+function send(message) {
+  if (control && control.readyState === WebSocket.OPEN) control.send(JSON.stringify(message));
+}
+
+function connectControls() {
+  control = new WebSocket(`ws://${location.host}/control`);
+  control.onopen = () => setBadge('link', 'LINKED', 'go');
+  control.onmessage = event => { status = JSON.parse(event.data); showStatus(); };
+  control.onclose = () => { setBadge('link', 'NO LINK', 'stop'); setTimeout(connectControls, 1000); };
+}
+
+// Shown on the robot's log, since a phone has no developer console to look at.
+function report(text) {
+  console.log(text);
+  send({ type: 'report', text });
+}
+
+function setBadge(id, text, tone) {
+  $(id).textContent = text;
+  $(id).className = 'badge' + (tone ? ' ' + tone : '');
+}
+
+function showStatus() {
+  const following = status.mode === 'follow';
+  setBadge('mode', following ? 'FOLLOWING' : 'MANUAL', following ? 'go' : '');
+  setBadge('armed', status.armed ? 'MOTORS LIVE' : 'DRY RUN', status.armed ? 'warn' : '');
+  $('follow').classList.toggle('on', following);
+  $('follow').textContent = following ? 'FOLLOWING (tap for manual)' : 'FOLLOW ME';
+  $('left').textContent = status.left_pct + '%';
+  $('right').textContent = status.right_pct + '%';
+  $('locked').textContent = status.locked_track_id === NOBODY_LOCKED ? 'nobody' : 'person ' + status.locked_track_id;
+}
+
+$('follow').onclick = () => send({ type: 'mode', mode: status.mode === 'follow' ? 'manual' : 'follow' });
+$('stop').onclick = () => { releaseStick(); send({ type: 'stop' }); };
+
+// Joystick
+function moveStick(event) {
+  const box = pad.getBoundingClientRect();
+  const reach = (box.width - knob.offsetWidth) / 2;
+  let dx = event.clientX - (box.left + box.width / 2);
+  let dy = event.clientY - (box.top + box.height / 2);
+  const pull = Math.hypot(dx, dy);
+  if (pull > reach) { dx *= reach / pull; dy *= reach / pull; }
+  knob.style.transform = `translate(calc(-50% + ${dx}px), calc(-50% + ${dy}px))`;
+  const settle = value => Math.abs(value) < STICK_DEADZONE ? 0 : Math.max(-1, Math.min(1, value));
+  stick = { throttle: settle(-dy / reach), steer: settle(dx / reach) };
+}
+
+function releaseStick() {
+  stickHeld = false;
+  stick = { throttle: 0, steer: 0 };
+  knob.style.transform = '';
+  pad.classList.remove('held');
+}
+
+pad.addEventListener('pointerdown', event => {
+  pad.setPointerCapture(event.pointerId);
+  stickHeld = true;
+  pad.classList.add('held');
+  moveStick(event);
+  send({ type: 'stick', ...stick });
+});
+pad.addEventListener('pointermove', event => { if (stickHeld) moveStick(event); });
+for (const ending of ['pointerup', 'pointercancel', 'lostpointercapture']) {
+  pad.addEventListener(ending, () => { if (stickHeld) { releaseStick(); send({ type: 'stick', ...stick }); } });
+}
+window.addEventListener('blur', () => { if (stickHeld) { releaseStick(); send({ type: 'stick', ...stick }); } });
+setInterval(() => { if (stickHeld) send({ type: 'stick', ...stick }); }, STICK_PERIOD_MS);
+
+// Video
+const VIDEO_RETRY_MS = 2000;
+
+async function connectVideo() {
+  setBadge('picture', 'VIDEO ...', '');
+  const peer = new RTCPeerConnection();
+  let retrying = false;
+  const retry = why => {
+    if (retrying) return;
+    retrying = true;
+    report('video: ' + why + ', retrying');
+    setBadge('picture', 'NO VIDEO', 'stop');
+    peer.close();
+    setTimeout(connectVideo, VIDEO_RETRY_MS);
+  };
+  peer.ontrack = event => {
+    report('video: track received, ' + event.streams.length + ' stream(s)');
+    video.srcObject = event.streams[0] || new MediaStream([event.track]);
+  };
+  peer.oniceconnectionstatechange = () => report('video: ice ' + peer.iceConnectionState);
+  peer.onconnectionstatechange = () => {
+    report('video: connection ' + peer.connectionState);
+    if (['failed', 'disconnected'].includes(peer.connectionState)) retry('connection ' + peer.connectionState);
+  };
+  try {
+    peer.addTransceiver('video', { direction: 'recvonly' });
+    await peer.setLocalDescription(await peer.createOffer());
+    await new Promise(done => {
+      if (peer.iceGatheringState === 'complete') return done();
+      peer.onicegatheringstatechange = () => { if (peer.iceGatheringState === 'complete') done(); };
+    });
+    const reply = await fetch('/offer', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sdp: peer.localDescription.sdp, type: peer.localDescription.type }),
+    });
+    if (!reply.ok) return retry('offer answered HTTP ' + reply.status);
+    await peer.setRemoteDescription(await reply.json());
+  } catch (error) {
+    retry('handshake threw ' + error);
+  }
+}
+
+video.addEventListener('playing', () => {
+  setBadge('picture', 'VIDEO LIVE', 'go');
+  report('video: playing at ' + video.videoWidth + 'x' + video.videoHeight);
+});
+video.addEventListener('error', () => report('video: element error ' + (video.error && video.error.message)));
+
+// Tracker overlay
+function connectDetections() {
+  const feed = new WebSocket(`ws://${location.hostname}:__PERCEPTION_PORT__/ws`);
+  feed.onmessage = event => { people = (JSON.parse(event.data).detections || []).filter(d => d.label === 'person'); };
+  feed.onclose = () => { people = []; setTimeout(connectDetections, 1000); };
+}
+
+function drawOverlay() {
+  const box = overlay.getBoundingClientRect();
+  if (overlay.width !== box.width || overlay.height !== box.height) {
+    overlay.width = box.width; overlay.height = box.height;
+  }
+  paint.clearRect(0, 0, overlay.width, overlay.height);
+  // The picture is letterboxed inside the view, so boxes are placed within the picture's own rectangle.
+  const shape = video.videoWidth ? video.videoWidth / video.videoHeight : 16 / 9;
+  const pictureWidth = Math.min(overlay.width, overlay.height * shape);
+  const pictureHeight = pictureWidth / shape;
+  const left = (overlay.width - pictureWidth) / 2, top = (overlay.height - pictureHeight) / 2;
+  for (const person of people) {
+    const locked = person.track_id === status.locked_track_id;
+    const x = left + person.bbox.x * pictureWidth, y = top + person.bbox.y * pictureHeight;
+    const w = person.bbox.w * pictureWidth, h = person.bbox.h * pictureHeight;
+    paint.strokeStyle = locked ? '#2fd27a' : 'rgba(232,237,243,.55)';
+    paint.lineWidth = locked ? 4 : 2;
+    paint.strokeRect(x, y, w, h);
+    const label = locked ? `FOLLOWING ${person.track_id}` : `person ${person.track_id}`;
+    paint.font = 'bold 13px system-ui, sans-serif';
+    paint.fillStyle = locked ? '#2fd27a' : 'rgba(27,34,44,.85)';
+    paint.fillRect(x, Math.max(top, y - 20), paint.measureText(label).width + 10, 20);
+    paint.fillStyle = locked ? '#06140c' : '#e8edf3';
+    paint.fillText(label, x + 5, Math.max(top + 14, y - 6));
+  }
+  requestAnimationFrame(drawOverlay);
+}
+
+connectControls();
+connectVideo();
+connectDetections();
+showStatus();
+drawOverlay();
+</script>
+</body>
+</html>

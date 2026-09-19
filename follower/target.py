@@ -36,6 +36,9 @@ class TargetLock:
     def locked_id(self) -> TrackId | None:
         return self._locked_id
 
+    def release(self) -> None:
+        self._locked_id = None
+
     def update(self, people: Sequence[Person], now_s: float) -> Person | None:
         """Return the person to follow in this frame, or None when there is nobody to follow."""
         if self._locked_id is not None:
