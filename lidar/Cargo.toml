@@ -1,0 +1,10 @@
+[workspace]
+resolver = "3"
+members = ["delta2a", "lidar-node"]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.85"
+
+[profile.release]
+strip = true

@@ -1,0 +1,14 @@
+[package]
+name = "lidar-node"
+version = "0.1.0"
+description = "dora node that publishes Delta-2A lidar revolutions"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+delta2a = { path = "../delta2a" }
+# The node API has to match the version of the dora CLI that runs the dataflow.
+dora-node-api = { version = "=0.3.13", default-features = false }
+eyre = "0.6"
+# Without the default libudev feature, so the binary links statically.
+serialport = { version = "4.7", default-features = false }
