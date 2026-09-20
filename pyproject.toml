@@ -1,0 +1,33 @@
+[project]
+name = "dora-robot-nodes-workspace"
+version = "0.1.0"
+description = "Development workspace for the nodes in this repository; not a package itself"
+requires-python = ">=3.11"
+dependencies = [
+    "dora-rig-messages",
+    "dora-person-follower",
+    "dora-teleop",
+    "dora-scan-view",
+    "dora-hailo-perception",
+]
+
+[tool.uv]
+package = false
+
+[tool.uv.workspace]
+members = ["lib/*", "nodes/dora-person-follower", "nodes/dora-teleop", "nodes/dora-scan-view", "nodes/dora-hailo-perception"]
+
+[tool.uv.sources]
+dora-rig-messages = { workspace = true }
+dora-person-follower = { workspace = true }
+dora-teleop = { workspace = true }
+dora-scan-view = { workspace = true }
+dora-hailo-perception = { workspace = true }
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.pytest.ini_options]
+testpaths = ["lib", "nodes"]
+# Test files in different packages may share a name.
+addopts = "--import-mode=importlib"

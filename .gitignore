@@ -1,0 +1,7 @@
+__pycache__/
+.pytest_cache/
+.venv/
+out/
+hailort.log
+nodes/dora-delta2a-lidar/target/
+nodes/dora-delta2a-lidar/dist/
