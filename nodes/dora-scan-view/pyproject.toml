@@ -6,6 +6,7 @@ build-backend = "hatchling.build"
 name = "dora-scan-view"
 version = "0.1.0"
 description = "A dora node serving a top-down map page of a planar lidar scan"
+readme = "README.md"
 license = "MIT"
 requires-python = ">=3.11"
 dependencies = [

@@ -5,6 +5,7 @@ members = ["delta2a", "dora-delta2a-lidar"]
 [workspace.package]
 edition = "2021"
 rust-version = "1.85"
+license = "MIT"
 
 [profile.release]
 strip = true

@@ -4,6 +4,8 @@ version = "0.1.0"
 description = "dora node that publishes Delta-2A lidar revolutions"
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
+readme = "../README.md"
 
 [dependencies]
 delta2a = { path = "../delta2a" }

@@ -4,3 +4,4 @@ version = "0.1.0"
 description = "Decoder for the serial stream of a 3irobotics Delta-2A lidar"
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
