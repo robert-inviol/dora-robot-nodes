@@ -7,8 +7,9 @@ import time
 from aiohttp import web
 from dora import Node
 
+from messages.scan import Scan
+
 from .plane import PointPlane
-from .scan import SPIN_RATE_PARAMETER, readings_in
 from .server import MapServer
 
 PORT_VARIABLE = "SCANVIEW_PORT"
@@ -41,8 +42,5 @@ def main() -> None:
         if event["type"] == "STOP":
             break
         if event["type"] == "INPUT" and event["id"] == "scan":
-            plane.add_revolution(
-                readings_in(event["value"].to_pylist()),
-                spin_rev_per_s=event["metadata"][SPIN_RATE_PARAMETER],
-                now_s=time.monotonic(),
-            )
+            scan = Scan.from_arrow(event["value"])
+            plane.add_revolution(scan.readings, scan.spin_rev_per_s, now_s=time.monotonic())

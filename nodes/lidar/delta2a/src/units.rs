@@ -34,6 +34,10 @@ pub struct Range {
 }
 
 impl Range {
+    pub fn from_metres(metres: f32) -> Self {
+        Self { metres }
+    }
+
     /// A count of zero is how the lidar says that nothing came back.
     pub(crate) fn from_wire(quarter_millimetres: u16) -> Option<Self> {
         (quarter_millimetres != 0).then(|| Self {
@@ -53,6 +57,12 @@ pub struct SpinRate {
 }
 
 impl SpinRate {
+    pub fn from_revolutions_per_second(revolutions_per_second: f32) -> Self {
+        Self {
+            revolutions_per_second,
+        }
+    }
+
     pub(crate) fn from_wire(count: u8) -> Self {
         Self {
             revolutions_per_second: f32::from(count) * REVOLUTIONS_PER_SECOND_PER_COUNT,

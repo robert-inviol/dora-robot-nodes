@@ -6,7 +6,7 @@ mod wire;
 use std::time::Instant;
 
 use dora_node_api::dora_core::config::DataId;
-use dora_node_api::{DoraNode, Event};
+use dora_node_api::{DoraNode, Event, MetadataParameters};
 use eyre::WrapErr;
 
 use link::LidarLink;
@@ -28,8 +28,8 @@ fn main() -> eyre::Result<()> {
                 for revolution in link.poll(Instant::now()) {
                     node.send_output(
                         scan_output.clone(),
-                        wire::scan_parameters(&revolution),
-                        wire::scan_rows(&revolution),
+                        MetadataParameters::default(),
+                        wire::scan_message(&revolution),
                     )?;
                 }
             }

@@ -1,7 +1,7 @@
 import pytest
 
+from messages.scan import RangeReading
 from scanview.plane import PointPlane
-from scanview.scan import RangeReading
 
 BIN_COUNT = 360
 WINDOW_REVOLUTIONS = 4

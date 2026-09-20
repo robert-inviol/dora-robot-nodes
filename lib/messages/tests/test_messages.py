@@ -4,6 +4,7 @@ import pytest
 from messages.drive import STOPPED, DriveDemand, PowerCap
 from messages.fixtures import EXAMPLES, read_fixture
 from messages.operator import DriveMode, OperatorCommand
+from messages.scan import SCAN_TYPE, Scan
 from messages.status import DriverStatus, PilotStatus
 
 
@@ -29,6 +30,15 @@ def test_an_output_carrying_more_than_one_message_is_rejected():
 
     with pytest.raises(ValueError, match="expected one row"):
         DriveDemand.from_arrow(two_rows)
+
+
+def test_a_scan_whose_bearings_and_ranges_are_out_of_step_is_rejected():
+    out_of_step = pa.array(
+        [{"spin_rev_per_s": 8.0, "bearing_deg": [0.0, 90.0], "range_m": [1.5]}], type=SCAN_TYPE
+    )
+
+    with pytest.raises(ValueError, match="2 bearings for 1 ranges"):
+        Scan.from_arrow(out_of_step)
 
 
 def test_a_wish_within_the_cap_is_scaled_by_the_cap():

@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from statistics import median
 from typing import Any, Sequence
 
-from .scan import RangeReading
+from messages.scan import RangeReading
 
 FULL_TURN_DEGREES = 360.0
 MILLIMETRES_PER_METRE = 1000

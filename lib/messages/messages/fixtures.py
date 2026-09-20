@@ -10,6 +10,7 @@ import pyarrow as pa
 
 from .drive import DriveDemand
 from .operator import DriveMode, OperatorCommand
+from .scan import RangeReading, Scan
 from .status import DriverStatus, PilotStatus, TrackId
 
 FIXTURE_DIR = Path(__file__).parent / "fixtures"
@@ -26,6 +27,15 @@ EXAMPLES: dict[str, Message] = {
     "pilot_status": PilotStatus(DriveMode.FOLLOW, locked_id=TrackId(7)),
     "pilot_status_nobody_locked": PilotStatus(DriveMode.MANUAL, locked_id=None),
     "driver_status": DriverStatus(armed=True, left_pct=35, right_pct=-12),
+    "scan": Scan(
+        spin_rev_per_s=8.0,
+        readings=(
+            RangeReading(bearing_deg=0.0, range_m=0.5),
+            RangeReading(bearing_deg=90.0, range_m=None),
+            RangeReading(bearing_deg=180.0, range_m=3.25),
+            RangeReading(bearing_deg=292.5, range_m=11.75),
+        ),
+    ),
 }
 
 

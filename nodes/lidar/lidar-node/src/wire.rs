@@ -1,19 +1,22 @@
-//! The `scan` output: one row per sample of a revolution, in bearing order.
+//! The `scan` output: one revolution as the single-row message that lib/messages defines as `Scan`.
 
 use std::sync::Arc;
 
 use delta2a::Revolution;
-use dora_node_api::arrow::array::{ArrayRef, Float32Array, StructArray};
+use dora_node_api::arrow::array::{Array, ArrayRef, Float32Array, ListArray, StructArray};
+use dora_node_api::arrow::buffer::OffsetBuffer;
 use dora_node_api::arrow::datatypes::{DataType, Field};
-use dora_node_api::{MetadataParameters, Parameter};
 
+const SPIN_RATE_FIELD: &str = "spin_rev_per_s";
 /// Degrees clockwise from the lidar's zero mark, seen from above.
-pub const BEARING_COLUMN: &str = "bearing_deg";
-/// Null where nothing came back.
-pub const RANGE_COLUMN: &str = "range_m";
-pub const SPIN_RATE_PARAMETER: &str = "spin_rev_per_s";
+const BEARINGS_FIELD: &str = "bearing_deg";
+/// In step with the bearings, null where nothing came back.
+const RANGES_FIELD: &str = "range_m";
+const LIST_ITEM: &str = "item";
 
-pub fn scan_rows(revolution: &Revolution) -> StructArray {
+/// A reader compares the whole type, so every nullable flag here is part of the contract.
+pub fn scan_message(revolution: &Revolution) -> StructArray {
+    let spin_rate = Float32Array::from(vec![revolution.spin_rate.revolutions_per_second()]);
     let bearings: Float32Array = revolution
         .samples
         .iter()
@@ -24,35 +27,95 @@ pub fn scan_rows(revolution: &Revolution) -> StructArray {
         .iter()
         .map(|sample| sample.range.map(|range| range.metres()))
         .collect();
+    let bearings = one_list(bearings, false);
+    let ranges = one_list(ranges, true);
     StructArray::from(vec![
         (
-            Arc::new(Field::new(BEARING_COLUMN, DataType::Float32, false)),
+            Arc::new(Field::new(SPIN_RATE_FIELD, DataType::Float32, true)),
+            Arc::new(spin_rate) as ArrayRef,
+        ),
+        (
+            Arc::new(Field::new(
+                BEARINGS_FIELD,
+                bearings.data_type().clone(),
+                true,
+            )),
             Arc::new(bearings) as ArrayRef,
         ),
         (
-            Arc::new(Field::new(RANGE_COLUMN, DataType::Float32, true)),
+            Arc::new(Field::new(RANGES_FIELD, ranges.data_type().clone(), true)),
             Arc::new(ranges) as ArrayRef,
         ),
     ])
 }
 
-pub fn scan_parameters(revolution: &Revolution) -> MetadataParameters {
-    let spin_rate = f64::from(revolution.spin_rate.revolutions_per_second());
-    MetadataParameters::from([(SPIN_RATE_PARAMETER.to_owned(), Parameter::Float(spin_rate))])
+/// A list column holding the one list of a single-row message.
+fn one_list(items: Float32Array, items_nullable: bool) -> ListArray {
+    let item = Arc::new(Field::new(LIST_ITEM, DataType::Float32, items_nullable));
+    let offsets = OffsetBuffer::from_lengths([items.len()]);
+    ListArray::new(item, offsets, Arc::new(items), None)
 }
 
 #[cfg(test)]
 mod tests {
-    use delta2a::{Frame, FrameDecoder, RevolutionAssembler};
-    use dora_node_api::arrow::array::Array;
+    use std::fs::File;
+
+    use delta2a::{
+        Bearing, Frame, FrameDecoder, Range, RangeSample, RevolutionAssembler, SpinRate,
+    };
+    use dora_node_api::arrow::ipc::reader::FileReader;
 
     use super::*;
 
+    const SCAN_FIXTURE: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../../lib/messages/messages/fixtures/scan.arrow"
+    );
     const DESK_CAPTURE: &[u8] = include_bytes!("../../delta2a/tests/fixtures/desk_capture.bin");
 
-    fn first_whole_revolution() -> Revolution {
+    /// The same example that lib/messages/messages/fixtures.py writes as `scan`.
+    fn fixture_example() -> Revolution {
+        let readings = [
+            (0.0, Some(0.5)),
+            (90.0, None),
+            (180.0, Some(3.25)),
+            (292.5, Some(11.75)),
+        ];
+        Revolution {
+            spin_rate: SpinRate::from_revolutions_per_second(8.0),
+            samples: readings
+                .into_iter()
+                .map(|(degrees, metres)| RangeSample {
+                    bearing: Bearing::from_degrees(degrees),
+                    range: metres.map(Range::from_metres),
+                })
+                .collect(),
+        }
+    }
+
+    fn golden_scan() -> StructArray {
+        let file = File::open(SCAN_FIXTURE).expect("the scan fixture is in lib/messages");
+        let mut batches = FileReader::try_new(file, None).expect("the fixture is an Arrow file");
+        let batch = batches
+            .next()
+            .expect("the fixture holds one record batch")
+            .expect("the batch can be read");
+        StructArray::from(batch)
+    }
+
+    #[test]
+    fn a_revolution_is_written_exactly_as_the_golden_fixture() {
+        let written = scan_message(&fixture_example());
+        let golden = golden_scan();
+
+        assert_eq!(written.data_type(), golden.data_type());
+        assert_eq!(written, golden);
+    }
+
+    #[test]
+    fn a_real_revolution_is_one_row_with_a_null_for_every_miss() {
         let mut assembler = RevolutionAssembler::new();
-        FrameDecoder::new()
+        let revolution = FrameDecoder::new()
             .push(DESK_CAPTURE)
             .into_iter()
             .filter_map(|frame| match frame {
@@ -60,36 +123,24 @@ mod tests {
                 Frame::SpeedFault(_) => None,
             })
             .nth(1)
-            .expect("the capture holds two whole revolutions")
-    }
-
-    #[test]
-    fn a_revolution_becomes_one_row_per_sample_with_null_for_a_miss() {
-        let revolution = first_whole_revolution();
-
-        let rows = scan_rows(&revolution);
-
-        assert_eq!(rows.len(), revolution.samples.len());
-        let ranges = rows.column_by_name(RANGE_COLUMN).unwrap();
+            .expect("the capture holds two whole revolutions");
         let misses = revolution
             .samples
             .iter()
             .filter(|sample| sample.range.is_none())
             .count();
+
+        let message = scan_message(&revolution);
+
+        assert_eq!(message.len(), 1);
+        let ranges = message.column_by_name(RANGES_FIELD).unwrap();
+        let ranges = ranges
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap()
+            .value(0);
+        assert_eq!(ranges.len(), revolution.samples.len());
         assert!(misses > 0);
         assert_eq!(ranges.null_count(), misses);
-        assert_eq!(rows.column_by_name(BEARING_COLUMN).unwrap().null_count(), 0);
-    }
-
-    #[test]
-    fn the_spin_rate_travels_as_a_parameter() {
-        let revolution = first_whole_revolution();
-
-        let parameters = scan_parameters(&revolution);
-
-        let Some(Parameter::Float(spin_rate)) = parameters.get(SPIN_RATE_PARAMETER) else {
-            panic!("no spin rate in {parameters:?}");
-        };
-        assert!((7.5..=8.5).contains(spin_rate), "{spin_rate}");
     }
 }
