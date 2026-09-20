@@ -7,7 +7,6 @@ Combines the Hailo inference pipeline with:
 - WebRTC streaming for live video
 - WebSocket for real-time detection/event data
 """
-import sys
 import os
 import threading
 import queue
@@ -15,9 +14,6 @@ import asyncio
 import time
 import json
 import fractions
-
-# Add parent directory to path for gst_hailo_pipeline import
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np
 import pyarrow as pa
@@ -27,7 +23,7 @@ from aiohttp import web
 from aiortc import RTCPeerConnection, RTCSessionDescription, VideoStreamTrack
 from av import VideoFrame
 
-from gst_hailo_pipeline import GstHailoPipeline
+from .pipeline import GstHailoPipeline
 
 
 class HailoVideoTrack(VideoStreamTrack):
@@ -74,7 +70,7 @@ class GstBridgeWebRTCNode:
 
     Inputs:
         - tick: Timer to process detection queue
-        - events: Events from rules_engine to forward to WebSocket
+        - events: Text events from other nodes to list in the live view
     """
 
 
@@ -428,7 +424,7 @@ class GstBridgeWebRTCNode:
                         self._process_queue()
 
                     elif input_id == "events":
-                        # Receive events from rules_engine - zero-copy Arrow
+                        # Text events from other nodes - zero-copy Arrow
                         try:
                             # Direct access to Arrow StructArray - no IPC deserialization
                             events_list = event["value"].to_pylist()
