@@ -6,6 +6,7 @@ build-backend = "hatchling.build"
 name = "dora-teleop"
 version = "0.1.0"
 description = "A dora node serving a control page for a robot: joystick, follow toggle, stop, and low-latency WebRTC video with a tracker overlay"
+readme = "README.md"
 license = "MIT"
 requires-python = ">=3.11"
 dependencies = [

@@ -6,6 +6,7 @@ build-backend = "hatchling.build"
 name = "dora-rig-messages"
 version = "0.1.0"
 description = "The messages small dora robot nodes exchange: each defined once with an explicit Arrow type and a golden fixture"
+readme = "README.md"
 license = "MIT"
 requires-python = ">=3.11"
 dependencies = [
