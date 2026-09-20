@@ -1,4 +1,4 @@
-//! The `scan` output: one revolution as the single-row message that lib/messages defines as `Scan`.
+//! The `scan` output: one revolution as the single-row message that lib/dora-rig-messages defines as `Scan`.
 
 use std::sync::Arc;
 
@@ -69,11 +69,11 @@ mod tests {
 
     const SCAN_FIXTURE: &str = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../../lib/messages/messages/fixtures/scan.arrow"
+        "/../../../lib/dora-rig-messages/dora_rig_messages/fixtures/scan.arrow"
     );
     const DESK_CAPTURE: &[u8] = include_bytes!("../../delta2a/tests/fixtures/desk_capture.bin");
 
-    /// The same example that lib/messages/messages/fixtures.py writes as `scan`.
+    /// The same example that lib/dora-rig-messages/dora_rig_messages/fixtures.py writes as `scan`.
     fn fixture_example() -> Revolution {
         let readings = [
             (0.0, Some(0.5)),
@@ -94,7 +94,7 @@ mod tests {
     }
 
     fn golden_scan() -> StructArray {
-        let file = File::open(SCAN_FIXTURE).expect("the scan fixture is in lib/messages");
+        let file = File::open(SCAN_FIXTURE).expect("the scan fixture is in lib/dora-rig-messages");
         let mut batches = FileReader::try_new(file, None).expect("the fixture is an Arrow file");
         let batch = batches
             .next()
