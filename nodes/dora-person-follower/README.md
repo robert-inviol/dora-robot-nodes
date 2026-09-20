@@ -23,7 +23,7 @@ arriving.
 | `events` | A line of text whenever the followed person changes, in the shape `dora-hailo-perception` lists in its live view |
 
 `FOLLOWER_CONFIG` names a TOML file with the selection rule, the gains, the power caps and the
-timeouts.
+timeouts. `follower.example.toml` is one to start from.
 
 ```yaml
 - id: follower

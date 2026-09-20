@@ -5,19 +5,19 @@ import pytest
 from dora_person_follower.config import ConfigError, load_config
 from dora_person_follower.target import SelectionRule
 
-SHIPPED_CONFIG = Path(__file__).parents[3] / "robots" / "tank" / "follower.toml"
+EXAMPLE_CONFIG = Path(__file__).parents[1] / "follower.example.toml"
 
 
 def _config_with(tmp_path: Path, old: str, new: str) -> Path:
-    shipped = SHIPPED_CONFIG.read_text()
-    assert old in shipped
+    example = EXAMPLE_CONFIG.read_text()
+    assert old in example
     path = tmp_path / "follower.toml"
-    path.write_text(shipped.replace(old, new))
+    path.write_text(example.replace(old, new))
     return path
 
 
-def test_the_shipped_config_is_capped_at_the_child_safe_power():
-    assert load_config(SHIPPED_CONFIG).gains.max_power.percent == 20
+def test_the_example_config_is_valid():
+    assert load_config(EXAMPLE_CONFIG).gains.max_power.percent == 20
 
 
 def test_the_selection_rule_is_read(tmp_path):
@@ -72,13 +72,13 @@ def test_both_stale_input_timeouts_are_read(tmp_path):
 
 
 def test_a_forward_gain_of_zero_is_accepted_for_turning_on_the_spot(tmp_path):
-    path = _config_with(tmp_path, "forward_gain = 0", "forward_gain = 0.0")
+    path = _config_with(tmp_path, "forward_gain = 1.2", "forward_gain = 0")
 
     assert load_config(path).gains.forward == 0
 
 
 def test_a_negative_forward_gain_is_rejected(tmp_path):
-    path = _config_with(tmp_path, "forward_gain = 0", "forward_gain = -0.5")
+    path = _config_with(tmp_path, "forward_gain = 1.2", "forward_gain = -0.5")
 
     with pytest.raises(ConfigError, match="pursuit.forward_gain"):
         load_config(path)

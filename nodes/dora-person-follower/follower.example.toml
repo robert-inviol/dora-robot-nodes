@@ -1,0 +1,27 @@
+[target]
+# Who to follow when nobody is locked: "largest", "most_central" or "first_seen".
+selection_rule = "largest"
+min_confidence = 0.5
+# How long the locked person may be out of sight before someone else can be chosen.
+release_after_s = 1.5
+
+[pursuit]
+# Too low and the robot lags behind the person; too high and it swings left and right.
+turn_gain = 0.8
+# How eagerly the robot closes to the following distance. 0 keeps it on the spot, turning only.
+forward_gain = 1.2
+# Share of the frame height the person fills at the following distance.
+target_frame_fill = 0.55
+frame_fill_deadband = 0.08
+# Percent of full motor power while following.
+max_power_pct = 20
+
+[manual]
+# Percent of full motor power at full stick deflection.
+max_power_pct = 50
+
+[safety]
+# In follow mode the pilot asks for a stop when detections have been silent for this long.
+stale_detections_after_s = 0.5
+# In either mode the pilot asks for a stop when the operator's commands stop arriving for this long.
+stale_operator_after_s = 0.5
