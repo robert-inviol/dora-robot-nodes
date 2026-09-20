@@ -1,5 +1,5 @@
 [package]
-name = "lidar-node"
+name = "dora-delta2a-lidar"
 version = "0.1.0"
 description = "dora node that publishes Delta-2A lidar revolutions"
 edition.workspace = true

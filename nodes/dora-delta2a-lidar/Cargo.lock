@@ -463,6 +463,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "dora-delta2a-lidar"
+version = "0.1.0"
+dependencies = [
+ "delta2a",
+ "dora-node-api",
+ "eyre",
+ "serialport",
+]
+
+[[package]]
 name = "dora-message"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -961,16 +971,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6480ccc157a1389bb2e4891b24751b0f798ba640d22386f23143fbcc89da195a"
 dependencies = [
  "libc",
-]
-
-[[package]]
-name = "lidar-node"
-version = "0.1.0"
-dependencies = [
- "delta2a",
- "dora-node-api",
- "eyre",
- "serialport",
 ]
 
 [[package]]

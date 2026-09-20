@@ -6,5 +6,5 @@ cd "$(dirname "$0")"
 PI_TARGET=aarch64-unknown-linux-musl
 
 rustup target add "$PI_TARGET"
-cargo build --release --package lidar-node --target "$PI_TARGET"
-install -D "target/$PI_TARGET/release/lidar-node" dist/lidar-node
+cargo build --release --package dora-delta2a-lidar --target "$PI_TARGET"
+install -D "target/$PI_TARGET/release/dora-delta2a-lidar" dist/dora-delta2a-lidar
