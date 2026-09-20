@@ -1,0 +1,21 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "dora-person-follower"
+version = "0.1.0"
+description = "A dora node that follows one tracked person: target lock, proportional pursuit, and a manual override"
+license = "MIT"
+requires-python = ">=3.11"
+dependencies = [
+    "dora-rs>=0.3.13",
+    "pyarrow>=22",
+    "dora-rig-messages",
+]
+
+[project.scripts]
+dora-person-follower = "dora_person_follower.node:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["dora_person_follower"]

@@ -1,0 +1,21 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "dora-teleop"
+version = "0.1.0"
+description = "A dora node serving a control page for a robot: joystick, follow toggle, stop, and low-latency WebRTC video with a tracker overlay"
+license = "MIT"
+requires-python = ">=3.11"
+dependencies = [
+    "dora-rs>=0.3.13",
+    "aiohttp>=3.9",
+    "dora-rig-messages",
+]
+
+[project.scripts]
+dora-teleop = "dora_teleop.node:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["dora_teleop"]

@@ -1,0 +1,16 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "dora-rig-messages"
+version = "0.1.0"
+description = "The messages small dora robot nodes exchange: each defined once with an explicit Arrow type and a golden fixture"
+license = "MIT"
+requires-python = ">=3.11"
+dependencies = [
+    "pyarrow>=22",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["dora_rig_messages"]
