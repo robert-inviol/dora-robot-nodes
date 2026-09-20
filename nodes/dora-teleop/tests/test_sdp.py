@@ -1,6 +1,6 @@
 from dora_teleop.sdp import reveal_browser_address
 
-BROWSER = "192.168.111.71"
+BROWSER = "192.0.2.10"
 MDNS_NAME = "ed03282a-d5ce-4d2a-8eae-7f416325ac8b.local"
 
 
