@@ -1,0 +1,17 @@
+[package]
+name = "dora-keyframe-replay"
+version = "0.1.0"
+description = "dora node that plays back a recording of keyframes as if a camera were sending them"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+readme = "../README.md"
+
+[dependencies]
+perception-wire = { path = "../perception-wire" }
+dora-node-api.workspace = true
+eyre.workspace = true
+
+[dev-dependencies]
+depth-perception = { path = "../depth-perception" }
+glam = "0.29"

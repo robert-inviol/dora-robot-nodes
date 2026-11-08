@@ -1,0 +1,13 @@
+[package]
+name = "perception-wire"
+version = "0.1.0"
+description = "The keyframe, segments and scene messages that lib/dora-rig-messages defines, in Rust"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+depth-perception = { path = "../depth-perception" }
+dora-node-api.workspace = true
+eyre.workspace = true
+glam = "0.29"

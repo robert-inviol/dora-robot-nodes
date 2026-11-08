@@ -1,0 +1,85 @@
+# The perception pipeline fed live by the camera machine's dataflow (dora-realsense-keyframes/examples/camera-dataflow.yml).
+# ZENOH_CONNECT is the camera machine's address.
+# Paths are relative to this file. Build the Rust nodes with `cargo build --release` in the node
+# directory, and run `uv sync` in each Python node's directory, before `dora start`.
+# With CONCEPTS_BACKEND: api, the concepts node needs ANTHROPIC_API_KEY in the environment dora runs in.
+nodes:
+  # Keyframes from the camera's machine, and scenes back to it.
+  - id: link
+    path: ../../dora-zenoh-bridge/target/release/dora-zenoh-bridge
+    env:
+      ZENOH_CONNECT: tcp/192.0.2.10:7447
+      ZENOH_SUBSCRIBE: rig/keyframe=keyframe,rig/imu=imu
+      ZENOH_PUBLISH: structure=rig/structure,scene=rig/scene
+    inputs:
+      tick: dora/timer/millis/5
+      structure:
+        source: geometry/structure
+        queue_size: 1
+      scene:
+        source: geometry/scene
+        queue_size: 1
+    outputs:
+      - keyframe
+      - imu
+
+  # Names the object types once at the start, then every CONCEPTS_REFRESH_S.
+  - id: concepts
+    path: ../../dora-scene-concepts/.venv/bin/dora-scene-concepts
+    env:
+      CONCEPTS_MODEL: claude-opus-5-5
+      CONCEPTS_BACKEND: claude-cli
+      CONCEPTS_REFRESH_S: "600"
+    inputs:
+      keyframe:
+        source: link/keyframe
+        queue_size: 1
+    outputs:
+      - concepts
+
+  # Holds only the newest keyframe, so it never works through a backlog.
+  - id: sam3
+    path: ../../dora-sam3-segmenter/.venv/bin/dora-sam3-segmenter
+    env:
+      # Four object types per pass fit a 6 GB GPU.
+      SAM3_BATCH_SIZE: "4"
+      SAM3_IDLE_CONCEPTS_PER_KEYFRAME: "8"
+    inputs:
+      keyframe:
+        source: link/keyframe
+        queue_size: 1
+      concepts: concepts/concepts
+    outputs:
+      - segments
+
+  - id: geometry
+    path: ../target/release/dora-depth-perception
+    inputs:
+      keyframe: link/keyframe
+      segments: sam3/segments
+    outputs:
+      - structure
+      - scene
+
+  - id: view
+    path: ../../dora-scene-view/.venv/bin/dora-scene-view
+    env:
+      SCENE_VIEW_PORT: "8090"
+      SCENE_VIEW_TIMINGS_CSV: /tmp/perception-timings.csv
+    inputs:
+      # Kept, not just the newest, so the keyframe that segments arrive for is still at hand.
+      keyframe:
+        source: link/keyframe
+        queue_size: 10
+      segments:
+        source: sam3/segments
+        queue_size: 1
+      structure:
+        source: geometry/structure
+        queue_size: 1
+      scene:
+        source: geometry/scene
+        queue_size: 1
+      concepts:
+        source: concepts/concepts
+        queue_size: 1

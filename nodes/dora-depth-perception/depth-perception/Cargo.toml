@@ -1,0 +1,19 @@
+[package]
+name = "depth-perception"
+version = "0.1.0"
+description = "Room geometry from one RGB-D frame: gravity-aligned point cloud, walls, floor, ceiling, room, object footprints"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+glam = "0.29"
+rand = { version = "0.8", default-features = false, features = ["small_rng"] }
+rayon = "1.10"
+
+[dev-dependencies]
+criterion = { version = "0.5", default-features = false }
+
+[[bench]]
+name = "frame"
+harness = false

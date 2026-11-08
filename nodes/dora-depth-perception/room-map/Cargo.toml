@@ -1,0 +1,17 @@
+[package]
+name = "room-map"
+version = "0.1.0"
+description = "One map of a room from a walk of keyframes: gravity-aligned 4-DoF odometry, loop closure, voxel fusion"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+depth-perception = { path = "../depth-perception" }
+perception-wire = { path = "../perception-wire" }
+dora-node-api.workspace = true
+eyre.workspace = true
+glam = "0.29"
+jpeg-decoder = { version = "0.3", default-features = false }
+rayon = "1.10"
+serde_json = "1"

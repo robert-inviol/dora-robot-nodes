@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Room Map</title>
+<style>
+  :root { --bg: #111418; --panel: rgba(20, 24, 30, 0.9); --text: #e6e9ee; --muted: #9aa3ad; --line: #2c333c; --accent: #4fa3ff; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text); font: 13px/1.4 system-ui, sans-serif; overflow: hidden; }
+  #view { position: fixed; inset: 0; }
+  #panel { position: fixed; top: 12px; left: 12px; width: 290px; max-height: calc(100% - 24px); overflow: auto;
+           background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px; box-sizing: border-box; }
+  h1 { font-size: 14px; margin: 0 0 8px; }
+  .row { display: flex; align-items: center; gap: 8px; margin: 6px 0; }
+  .row label { flex: 1; }
+  button { background: #1f2630; color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 5px 9px; cursor: pointer; font: inherit; }
+  button:hover { border-color: var(--accent); }
+  pre { color: var(--muted); font-size: 11px; white-space: pre-wrap; margin: 8px 0 0; }
+  @media (max-width: 600px) { #panel { width: calc(100% - 32px); left: 16px; max-height: 45%; } }
+</style>
+</head>
+<body>
+<div id="view"></div>
+<div id="panel">
+  <h1 id="title"></h1>
+  <div class="row"><button id="start">Start view</button><button id="top">Top down</button></div>
+  <div class="row"><label for="cloud">Map points</label><input type="checkbox" id="cloud" checked></div>
+  <div class="row"><label for="path">Camera path</label><input type="checkbox" id="path" checked></div>
+  <div class="row"><label for="planes">Planes</label><input type="checkbox" id="planes" checked></div>
+  <div class="row"><label for="room">Room</label><input type="checkbox" id="room" checked></div>
+  <div class="row"><label for="size">Point size</label><input type="range" id="size" min="1" max="6" value="2"></div>
+  <pre id="report"></pre>
+</div>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+} }
+</script>
+<script type="module">
+import * as THREE from "three";
+import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+
+const MAP = __MAP_JSON__;
+// Map is (right, forward, up) of the first keyframe; three.js is (x right, y up, z towards viewer).
+const toThree = ([r, f, u]) => new THREE.Vector3(r, u, -f);
+const decode = (b64, Type) => new Type(Uint8Array.from(atob(b64), c => c.charCodeAt(0)).buffer);
+const SURFACE = { "wall": 0x5b8def, "floor": 0xb07a4a, "ceiling": 0x9aa3ad, "level surface": 0xd4c24a };
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(devicePixelRatio);
+document.getElementById("view").appendChild(renderer.domElement);
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x111418);
+const camera = new THREE.PerspectiveCamera(60, 1, 0.05, 200);
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+
+const raw = decode(MAP.positions_b64, Float32Array);
+const positions = new Float32Array(raw.length);
+for (let i = 0; i < raw.length; i += 3) { positions[i] = raw[i]; positions[i + 1] = raw[i + 2]; positions[i + 2] = -raw[i + 1]; }
+const geometry = new THREE.BufferGeometry();
+geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+geometry.setAttribute("color", new THREE.BufferAttribute(decode(MAP.colors_b64, Uint8Array), 3, true));
+const pointMaterial = new THREE.PointsMaterial({ size: 2, sizeAttenuation: false, vertexColors: true });
+const cloud = new THREE.Points(geometry, pointMaterial);
+scene.add(cloud);
+
+const pathGroup = new THREE.Group();
+const pathPoints = MAP.path.map(toThree);
+pathGroup.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(pathPoints), new THREE.LineBasicMaterial({ color: 0xffd23f })));
+const markers = new THREE.BufferGeometry().setFromPoints(pathPoints);
+markers.setAttribute("color", new THREE.BufferAttribute(new Float32Array(MAP.registered.flatMap(ok => ok ? [1, 0.82, 0.25] : [1, 0.2, 0.2])), 3));
+pathGroup.add(new THREE.Points(markers, new THREE.PointsMaterial({ size: 6, sizeAttenuation: false, vertexColors: true })));
+const headings = [];
+MAP.path.forEach((p, i) => {
+  if (i % 10) return;
+  const yaw = MAP.headings[i];
+  const ahead = [p[0] - 0.3 * Math.sin(yaw), p[1] + 0.3 * Math.cos(yaw), p[2]];
+  headings.push(toThree(p), toThree(ahead));
+});
+pathGroup.add(new THREE.LineSegments(new THREE.BufferGeometry().setFromPoints(headings), new THREE.LineBasicMaterial({ color: 0xff7f0e })));
+scene.add(pathGroup);
+
+const planeGroup = new THREE.Group();
+const fan = ring => ring.slice(1, -1).flatMap((_, k) => [ring[0], ring[k + 1], ring[k + 2]]);
+for (const plane of MAP.planes) {
+  const corners = plane.outline.map(toThree);
+  const color = SURFACE[plane.kind] ?? 0xffffff;
+  planeGroup.add(new THREE.Mesh(new THREE.BufferGeometry().setFromPoints(fan(corners)),
+    new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.15, side: THREE.DoubleSide, depthWrite: false })));
+  planeGroup.add(new THREE.LineLoop(new THREE.BufferGeometry().setFromPoints(corners), new THREE.LineBasicMaterial({ color })));
+}
+scene.add(planeGroup);
+
+const roomGroup = new THREE.Group();
+if (MAP.room) {
+  const lower = MAP.room.footprint.map(([r, f]) => toThree([r, f, MAP.room.floor]));
+  const upper = MAP.room.footprint.map(([r, f]) => toThree([r, f, MAP.room.ceiling]));
+  const seen = new THREE.LineBasicMaterial({ color: 0xf2f2f2 });
+  const unseen = new THREE.LineDashedMaterial({ color: 0xf2f2f2, dashSize: 0.15, gapSize: 0.1 });
+  for (let k = 0; k < lower.length; k++) {
+    const a = (k + lower.length - 1) % lower.length;
+    const line = new THREE.LineLoop(new THREE.BufferGeometry().setFromPoints([lower[a], lower[k], upper[k], upper[a]]), MAP.room.edge_seen[k] ? seen : unseen);
+    line.computeLineDistances();
+    roomGroup.add(line);
+  }
+}
+scene.add(roomGroup);
+
+function startView() {
+  camera.position.set(0, 0, 0);
+  controls.target.set(0, 0, -2);
+  controls.update();
+}
+function topDown() {
+  const box = new THREE.Box3().setFromPoints(pathPoints).expandByScalar(3);
+  const centre = box.getCenter(new THREE.Vector3());
+  camera.up.set(0, 0, -1);
+  camera.position.set(centre.x, 12, centre.z);
+  controls.target.copy(centre);
+  controls.update();
+  camera.up.set(0, 1, 0);
+}
+document.getElementById("title").textContent = MAP.title;
+document.getElementById("report").textContent = MAP.report;
+document.getElementById("start").onclick = startView;
+document.getElementById("top").onclick = topDown;
+for (const [id, group] of [["cloud", cloud], ["path", pathGroup], ["planes", planeGroup], ["room", roomGroup]]) {
+  document.getElementById(id).onchange = e => (group.visible = e.target.checked);
+}
+document.getElementById("size").oninput = e => (pointMaterial.size = Number(e.target.value));
+function resize() {
+  renderer.setSize(innerWidth, innerHeight);
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+}
+addEventListener("resize", resize);
+resize();
+topDown();
+renderer.setAnimationLoop(() => { controls.update(); renderer.render(scene, camera); });
+</script>
+</body>
+</html>
