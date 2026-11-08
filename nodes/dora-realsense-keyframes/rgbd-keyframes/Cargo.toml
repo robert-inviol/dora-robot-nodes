@@ -1,0 +1,10 @@
+[package]
+name = "rgbd-keyframes"
+version = "0.1.0"
+description = "Choosing keyframes from an RGB-D camera with an IMU, and estimating gravity while it moves"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+glam = "0.29"

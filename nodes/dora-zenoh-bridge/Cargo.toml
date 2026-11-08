@@ -1,0 +1,23 @@
+[workspace]
+
+[package]
+name = "dora-zenoh-bridge"
+version = "0.1.0"
+description = "dora node that carries messages between dataflows on different machines over Zenoh"
+edition = "2021"
+rust-version = "1.88"
+license = "MIT"
+readme = "README.md"
+
+[dependencies]
+# The node API has to match the version of the dora CLI that runs the dataflow.
+dora-node-api = { version = "=0.3.13", default-features = false }
+# The same arrow-ipc as the node API's arrow, with compression added.
+arrow-ipc = { version = "=54.3.1", features = ["zstd"] }
+eyre = "0.6"
+zenoh = "1.10"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+[profile.release]
+strip = true
+debug = "line-tables-only"

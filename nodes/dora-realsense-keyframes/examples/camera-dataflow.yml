@@ -1,0 +1,30 @@
+# On the camera's machine: D455 keyframes out over Zenoh to the perception machine. Paths are relative to
+# this file; build with `cargo build --release -p dora-realsense-keyframes` here and `cargo build --release`
+# in dora-zenoh-bridge.
+nodes:
+  - id: camera
+    path: ../target/release/dora-realsense-keyframes
+    env:
+      # Set both to keep a recording for dora-keyframe-replay (KEYFRAME_RECORDING and IMU_RECORDING there).
+      # KEYFRAME_RECORD_PATH: recordings/walk.arrow
+      # IMU_RECORD_PATH: recordings/walk.imu.arrow
+    inputs:
+      # Hands captured keyframes to dora; the camera itself runs on its own thread.
+      tick: dora/timer/millis/20
+    outputs:
+      - keyframe
+      - imu
+
+  - id: bridge
+    path: ../../dora-zenoh-bridge/target/release/dora-zenoh-bridge
+    env:
+      ZENOH_LISTEN: tcp/0.0.0.0:7447
+      ZENOH_PUBLISH: keyframe=rig/keyframe,imu=rig/imu
+      ZENOH_SUBSCRIBE: rig/structure=structure,rig/scene=scene
+    inputs:
+      keyframe: camera/keyframe
+      imu: camera/imu
+      tick: dora/timer/millis/10
+    outputs:
+      - structure
+      - scene

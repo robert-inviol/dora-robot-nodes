@@ -1,0 +1,19 @@
+[package]
+name = "dora-realsense-keyframes"
+version = "0.1.0"
+description = "dora node that captures aligned colour and depth from a RealSense D400 with an IMU and sends keyframes"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+readme = "../README.md"
+
+[dependencies]
+rgbd-keyframes = { path = "../rgbd-keyframes" }
+perception-wire = { path = "../../dora-depth-perception/perception-wire" }
+depth-perception = { path = "../../dora-depth-perception/depth-perception" }
+# The node API has to match the version of the dora CLI that runs the dataflow.
+dora-node-api = { version = "=0.3.13", default-features = false }
+eyre = "0.6"
+glam = "0.29"
+jpeg-encoder = "0.6"
+realsense-rust = "1.3"
