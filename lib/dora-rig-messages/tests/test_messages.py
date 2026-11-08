@@ -97,3 +97,12 @@ def test_status_messages_survive_the_trip_between_nodes():
 
     assert PilotStatus.from_arrow(pilot.to_arrow()) == pilot
     assert DriverStatus.from_arrow(driver.to_arrow()) == driver
+
+
+def test_imu_samples_without_a_timestamp_each_are_rejected():
+    import numpy as np
+
+    from dora_rig_messages.perception import Imu
+
+    with pytest.raises(ValueError, match="imu gyro has 1 timestamps"):
+        Imu(0, 0, np.zeros(0, np.int64), np.zeros((0, 3), np.float32), np.zeros(1, np.int64), np.zeros((2, 3), np.float32))
