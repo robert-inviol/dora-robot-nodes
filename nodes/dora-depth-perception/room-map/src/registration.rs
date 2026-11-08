@@ -133,7 +133,26 @@ fn smallest_eigenvalue(a: [[f64; 4]; 4]) -> f64 {
     value
 }
 
+/// A heading the solution is drawn towards, such as the one the gyro measured.
+#[derive(Clone, Copy, Debug)]
+pub struct YawPrior {
+    pub yaw_rad: f32,
+    /// In the units of the normal equations: as strong as this many points one metre from the camera, each
+    /// moving a metre per radian of turn.
+    pub weight: f64,
+}
+
 pub fn register(source: &[Vec3], target: &Target, seed: Pose, settings: &RegistrationSettings) -> Registration {
+    register_with(source, target, seed, settings, None)
+}
+
+/// Registration whose heading is held near `prior`: the data still sets it, but a scene that constrains
+/// the turn weakly cannot drag it far from the prior.
+pub fn register_near_yaw(source: &[Vec3], target: &Target, seed: Pose, settings: &RegistrationSettings, prior: YawPrior) -> Registration {
+    register_with(source, target, seed, settings, Some(prior))
+}
+
+fn register_with(source: &[Vec3], target: &Target, seed: Pose, settings: &RegistrationSettings, prior: Option<YawPrior>) -> Registration {
     let mut pose = seed;
     let mut last = Normal4::default();
     for &max_distance in &settings.correspondence_schedule_m {
@@ -165,7 +184,12 @@ pub fn register(source: &[Vec3], target: &Target, seed: Pose, settings: &Registr
             for (k, row) in damped.iter_mut().enumerate() {
                 row[k] += settings.damping;
             }
-            let Some(step) = solve4(damped, last.g) else { break };
+            let mut gradient = last.g;
+            if let Some(prior) = prior {
+                damped[0][0] += prior.weight;
+                gradient[0] += prior.weight * crate::pose::wrap_angle(prior.yaw_rad - pose.yaw_rad) as f64;
+            }
+            let Some(step) = solve4(damped, gradient) else { break };
             // The turn linearised above acts on the rotated point only, so the translation just adds.
             pose = Pose {
                 yaw_rad: crate::pose::wrap_angle(pose.yaw_rad + step[0] as f32),

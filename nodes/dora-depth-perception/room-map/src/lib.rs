@@ -3,10 +3,13 @@
 //! Every keyframe's points are in its own gravity-aligned floor frame (x right, y forward, z up, at the
 //! camera), so the keyframes differ only by a turn about the vertical and a translation: a 4-DoF pose.
 //! Consecutive keyframes are registered against a local model of the last few, the walk's drift is
-//! closed against its start, and every keyframe is fused into one voxel map.
+//! closed against its start, and every keyframe is fused into one voxel map. With a gyro recording, the gyro
+//! gives each keyframe's turn and registration only refines it.
 
 pub mod fusion;
 pub mod grid;
+pub mod heading;
+pub mod keyframe_gaps;
 pub mod placement;
 pub mod pose;
 pub mod recording;

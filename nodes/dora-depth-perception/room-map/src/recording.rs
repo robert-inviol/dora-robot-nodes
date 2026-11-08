@@ -1,22 +1,36 @@
-//! Reading a keyframe recording: an Arrow IPC file with one keyframe message per batch.
+//! Reading recordings: Arrow IPC files with one keyframe, or one imu, message per batch.
 
 use std::fs::File;
 
 use dora_node_api::arrow::array::StructArray;
 use dora_node_api::arrow::ipc::reader::FileReader;
 use eyre::{Context, Result};
-use perception_wire::{decode_keyframe, Keyframe, MessageContext};
+use perception_wire::{decode_imu, decode_keyframe, Imu, Keyframe, MessageContext};
 
-pub fn read_keyframes(path: &str) -> Result<Vec<Keyframe>> {
-    let file = File::open(path).wrap_err_with(|| format!("opening the keyframe recording {path}"))?;
+fn read_messages<T>(path: &str, name: &str, decode: impl Fn(&StructArray) -> Result<T>) -> Result<Vec<T>> {
+    let file = File::open(path).wrap_err_with(|| format!("opening the {name} recording {path}"))?;
     let reader = FileReader::try_new(file, None).wrap_err_with(|| format!("reading {path} as Arrow IPC"))?;
-    let mut keyframes = Vec::new();
+    let mut messages = Vec::new();
     for batch in reader {
         let row = StructArray::from(batch.wrap_err_with(|| format!("reading a batch of {path}"))?);
-        keyframes.push(decode_keyframe(&row).for_message("keyframe")?);
+        messages.push(decode(&row).for_message(name)?);
     }
-    eyre::ensure!(!keyframes.is_empty(), "the keyframe recording {path} is empty");
-    Ok(keyframes)
+    eyre::ensure!(!messages.is_empty(), "the {name} recording {path} is empty");
+    Ok(messages)
+}
+
+pub fn read_keyframes(path: &str) -> Result<Vec<Keyframe>> {
+    read_messages(path, "keyframe", |row| decode_keyframe(row))
+}
+
+/// For each keyframe, in order, the imu message that leads up to it, matched by frame id.
+pub fn read_imu_for(path: &str, keyframes: &[Keyframe]) -> Result<Vec<Imu>> {
+    let mut by_frame: std::collections::HashMap<u64, Imu> =
+        read_messages(path, "imu", |row| decode_imu(row))?.into_iter().map(|imu| (imu.frame_id, imu)).collect();
+    keyframes
+        .iter()
+        .map(|k| by_frame.remove(&k.frame_id).ok_or_else(|| eyre::eyre!("the imu recording {path} has no message for keyframe {}", k.frame_id)))
+        .collect()
 }
 
 /// The colour image as packed RGB rows.
