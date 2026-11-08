@@ -29,5 +29,6 @@ dev = ["pytest>=8"]
 
 [tool.pytest.ini_options]
 testpaths = ["lib", "nodes"]
-# Test files in different packages may share a name.
-addopts = "--import-mode=importlib"
+# Test files in different packages may share a name. The nodes with environments of their own run their tests
+# from their own directories.
+addopts = "--import-mode=importlib --ignore=nodes/dora-sam3-segmenter --ignore=nodes/dora-scene-concepts --ignore=nodes/dora-scene-view"

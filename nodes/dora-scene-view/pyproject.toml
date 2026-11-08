@@ -1,0 +1,35 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "dora-scene-view"
+version = "0.1.0"
+description = "A dora node serving a live 3D debug view of keyframes, segments and scenes"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+dependencies = [
+    "dora-rs==0.3.13",
+    "dora-rig-messages",
+    "aiohttp>=3.9",
+    "numpy>=2",
+    "pillow>=11",
+]
+
+[project.scripts]
+dora-scene-view = "dora_scene_view.node:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["dora_scene_view"]
+artifacts = ["dora_scene_view/page.html"]
+
+# Runs beside the GPU nodes, with its own environment.
+[tool.uv]
+package = true
+
+[tool.uv.sources]
+dora-rig-messages = { path = "../../lib/dora-rig-messages", editable = true }
+
+[dependency-groups]
+dev = ["pytest>=8"]

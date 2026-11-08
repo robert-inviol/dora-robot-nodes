@@ -1,0 +1,389 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Room Hulls</title>
+<style>
+  :root { --bg: #111418; --panel: rgba(20, 24, 30, 0.88); --text: #e6e9ee; --muted: #9aa3ad; --line: #2c333c; --accent: #4fa3ff; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text); font: 13px/1.4 system-ui, sans-serif; overflow: hidden; }
+  #view { position: fixed; inset: 0; }
+  #panel { position: fixed; top: 12px; left: 12px; width: 270px; max-height: calc(100% - 24px); overflow: auto;
+           background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px; box-sizing: border-box; }
+  h1 { font-size: 14px; margin: 0 0 8px; }
+  .row { display: flex; align-items: center; gap: 8px; margin: 6px 0; }
+  .row label { flex: 1; }
+  button { background: #1f2630; color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 5px 9px; cursor: pointer; font: inherit; }
+  button:hover { border-color: var(--accent); }
+  .help { color: var(--muted); font-size: 12px; margin: 8px 0; }
+  .help kbd { background: #222a33; border: 1px solid var(--line); border-radius: 3px; padding: 0 4px; font-size: 11px; }
+  #objects, #surfaces { margin-top: 8px; border-top: 1px solid var(--line); padding-top: 6px; }
+  .obj { display: flex; align-items: center; gap: 6px; padding: 3px 4px; border-radius: 4px; cursor: pointer; }
+  .obj:hover { background: #1f2630; }
+  .swatch { width: 10px; height: 10px; border-radius: 2px; flex: none; }
+  .obj .dims { margin-left: auto; color: var(--muted); font-variant-numeric: tabular-nums; font-size: 11px; }
+  .tag { position: absolute; padding: 1px 5px; border-radius: 3px; font-size: 11px; color: #fff; white-space: nowrap;
+         pointer-events: none; transform: translate(-50%, -100%); }
+  #toggle { display: none; }
+  @media (max-width: 600px) {
+    #panel { width: calc(100% - 32px); left: 16px; max-height: 45%; }
+    #panel.collapsed > :not(#toggle) { display: none; }
+    #toggle { display: inline-block; }
+  }
+</style>
+</head>
+<body>
+<div id="view"></div>
+<div id="tags"></div>
+<div id="panel">
+  <button id="toggle">Panel</button>
+  <h1 id="title"></h1>
+  <div class="help" id="room-size"></div>
+  <div class="row"><button id="pov">Camera view</button><button id="top">Top down</button></div>
+  <div class="row"><label for="points">Point cloud</label><input type="checkbox" id="points" checked></div>
+  <div class="row"><label for="segments">Segments</label><input type="checkbox" id="segments" checked></div>
+  <div class="row"><label for="planes">Planes</label><input type="checkbox" id="planes" checked></div>
+  <div class="row"><label for="room">Room</label><input type="checkbox" id="room" checked></div>
+  <div class="row"><label for="boxes">Boxes</label><input type="checkbox" id="boxes" checked></div>
+  <div class="row"><label for="labels">Labels</label><input type="checkbox" id="labels" checked></div>
+  <div class="row"><label for="size">Point size</label><input type="range" id="size" min="1" max="8" value="2"></div>
+  <div class="help">Drag to orbit, right-drag to pan, scroll to zoom.<br>
+    <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> move, <kbd>Q</kbd><kbd>E</kbd> down/up, hold <kbd>Shift</kbd> for faster.
+    Click an object to fly to it.</div>
+  <div id="objects"></div>
+  <div id="surfaces"></div>
+</div>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+} }
+</script>
+<script type="module">
+import * as THREE from "three";
+import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+
+const SCENE = __SCENE_JSON__;
+// Golden-angle hues keep neighbouring segment indices visibly different however many there are.
+const segmentColor = i => new THREE.Color().setHSL((i * 0.618034) % 1, 0.75, 0.55);
+const segmentCss = i => `#${segmentColor(i).getHexString()}`;
+const SURFACE_COLORS = {
+  "wall": ["#5b8def", "#3fb6c9", "#7a6ff0", "#4fc48a", "#2f7fd8", "#61a9ff"],
+  "floor": ["#b07a4a"], "ceiling": ["#9aa3ad"], "level surface": ["#d4c24a", "#e08a3c"],
+};
+// Plane colour is blended over the photo so the surface texture still shows through.
+const PLANE_TINT = 0.6;
+// Unsegmented points stay visible as room context but recede behind the segments.
+const BACKGROUND_DIM = 0.35;
+const MOVE_SPEED_M_PER_S = 1.5;
+
+// Data is (right, forward, up); three.js is (x right, y up, z towards viewer).
+const toThree = (r, f, u) => new THREE.Vector3(r, u, -f);
+
+function decode(b64, Type) {
+  const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+  return new Type(bytes.buffer);
+}
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(window.devicePixelRatio);
+document.getElementById("view").appendChild(renderer.domElement);
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x111418);
+const cam = SCENE.camera;
+const camera = new THREE.PerspectiveCamera(cam.vertical_fov_deg, 1, 0.05, 100);
+
+function decodePositions(b64) {
+  const raw = decode(b64, Float32Array);
+  const positions = new Float32Array(raw.length);
+  for (let i = 0; i < raw.length; i += 3) {
+    positions[i] = raw[i]; positions[i + 1] = raw[i + 2]; positions[i + 2] = -raw[i + 1];
+  }
+  return positions;
+}
+const measuredPositions = decodePositions(SCENE.positions_b64);
+const flattenedPositions = decodePositions(SCENE.flattened_b64);
+const geometry = new THREE.BufferGeometry();
+const positionAttribute = new THREE.BufferAttribute(flattenedPositions.slice(), 3);
+geometry.setAttribute("position", positionAttribute);
+function showFlattened(on) {
+  positionAttribute.array.set(on ? flattenedPositions : measuredPositions);
+  positionAttribute.needsUpdate = true;
+}
+const photoColors = decode(SCENE.colors_b64, Uint8Array);
+const pointSegments = decode(SCENE.segments_b64, Int16Array);
+const pointPlanes = decode(SCENE.planes_b64, Int16Array);
+const wallCount = {};
+SCENE.planes.forEach(pl => {
+  const shades = SURFACE_COLORS[pl.kind];
+  wallCount[pl.kind] = (wallCount[pl.kind] ?? -1) + 1;
+  pl.color = new THREE.Color(shades[wallCount[pl.kind] % shades.length]);
+});
+const palette = SCENE.objects.map((_, i) => segmentColor(i));
+const colorAttribute = new THREE.BufferAttribute(new Uint8Array(photoColors.length), 3, true);
+geometry.setAttribute("color", colorAttribute);
+const overlays = { segments: true, planes: true };
+function recolour() {
+  const out = colorAttribute.array;
+  const dim = overlays.segments || overlays.planes ? BACKGROUND_DIM : 1;
+  for (let p = 0; p < pointSegments.length; p++) {
+    const seg = pointSegments[p], plane = pointPlanes[p];
+    for (let c = 0; c < 3; c++) {
+      const photo = photoColors[3 * p + c];
+      if (overlays.segments && seg !== SCENE.no_segment) {
+        out[3 * p + c] = 255 * [palette[seg].r, palette[seg].g, palette[seg].b][c];
+      } else if (overlays.planes && plane !== SCENE.no_plane) {
+        const tint = SCENE.planes[plane].color;
+        out[3 * p + c] = PLANE_TINT * 255 * [tint.r, tint.g, tint.b][c] + (1 - PLANE_TINT) * photo;
+      } else {
+        out[3 * p + c] = photo * dim;
+      }
+    }
+  }
+  colorAttribute.needsUpdate = true;
+}
+recolour();
+const pointMaterial = new THREE.PointsMaterial({ size: 2, sizeAttenuation: false, vertexColors: true });
+const cloud = new THREE.Points(geometry, pointMaterial);
+scene.add(cloud);
+// With the full cloud hidden, segment points still draw on their own; this shares the cloud's buffers.
+const segmentOnlyGeometry = new THREE.BufferGeometry();
+segmentOnlyGeometry.setAttribute("position", positionAttribute);
+segmentOnlyGeometry.setAttribute("color", colorAttribute);
+segmentOnlyGeometry.setIndex(pointSegments.reduce((kept, id, p) => (id !== SCENE.no_segment && kept.push(p), kept), []));
+const segmentCloud = new THREE.Points(segmentOnlyGeometry, pointMaterial);
+scene.add(segmentCloud);
+function updateCloudVisibility() {
+  cloud.visible = document.getElementById("points").checked;
+  segmentCloud.visible = !cloud.visible && overlays.segments;
+}
+
+const planeGroup = new THREE.Group();
+scene.add(planeGroup);
+SCENE.planes.forEach(pl => {
+  const corners = pl.outline.map(([r, f, u]) => toThree(r, f, u));
+  const fan = [];
+  for (let k = 1; k < corners.length - 1; k++) fan.push(corners[0], corners[k], corners[k + 1]);
+  planeGroup.add(new THREE.Mesh(
+    new THREE.BufferGeometry().setFromPoints(fan),
+    new THREE.MeshBasicMaterial({ color: pl.color, transparent: true, opacity: 0.18, side: THREE.DoubleSide, depthWrite: false }),
+  ));
+  planeGroup.add(new THREE.LineLoop(
+    new THREE.BufferGeometry().setFromPoints(corners),
+    new THREE.LineBasicMaterial({ color: pl.color }),
+  ));
+  pl.centre = corners.reduce((a, p) => a.add(p), new THREE.Vector3()).multiplyScalar(1 / corners.length);
+});
+
+// Inferred room: seen walls are filled faintly, sides no wall was seen on are dashed outlines only.
+const ROOM_COLOR = 0xf2f2f2;
+const roomGroup = new THREE.Group();
+scene.add(roomGroup);
+if (SCENE.room) {
+  const room = SCENE.room;
+  const lower = room.footprint.map(([r, f]) => toThree(r, f, room.floor));
+  const upper = room.footprint.map(([r, f]) => toThree(r, f, room.ceiling));
+  const faceMaterial = new THREE.MeshBasicMaterial({ color: ROOM_COLOR, transparent: true, opacity: 0.06, side: THREE.DoubleSide, depthWrite: false });
+  const seenLine = new THREE.LineBasicMaterial({ color: ROOM_COLOR, transparent: true, opacity: 0.7 });
+  const unseenLine = new THREE.LineDashedMaterial({ color: ROOM_COLOR, transparent: true, opacity: 0.5, dashSize: 0.15, gapSize: 0.1 });
+  const fan = ring => ring.slice(1, -1).flatMap((_, k) => [ring[0], ring[k + 1], ring[k + 2]]);
+  for (const ring of [lower, upper]) {
+    roomGroup.add(new THREE.Mesh(new THREE.BufferGeometry().setFromPoints(fan(ring)), faceMaterial));
+  }
+  const n = lower.length;
+  for (let k = 0; k < n; k++) {
+    // Edge k ends at corner k, so it runs from corner k - 1.
+    const a = (k + n - 1) % n, b = k;
+    const quad = [lower[a], lower[b], upper[b], upper[a]];
+    const seen = room.edge_seen[k];
+    if (seen) roomGroup.add(new THREE.Mesh(new THREE.BufferGeometry().setFromPoints(fan(quad)), faceMaterial));
+    const outline = new THREE.LineLoop(new THREE.BufferGeometry().setFromPoints(quad), seen ? seenLine : unseenLine);
+    outline.computeLineDistances();
+    roomGroup.add(outline);
+  }
+  const footprint = new THREE.Shape(room.footprint.map(([r, f]) => new THREE.Vector2(r, f)));
+  const area = Math.abs(THREE.ShapeUtils.area(footprint.getPoints()));
+  const height = room.ceiling - room.floor;
+  document.getElementById("room-size").textContent =
+    `Room: ${area.toFixed(1)} m\u00b2 floor, ${height.toFixed(2)} m high, ${(area * height).toFixed(0)} m\u00b3 (convex, unseen sides dashed)`;
+} else {
+  document.getElementById("room-size").textContent = `No room: ${SCENE.room_problem}`;
+}
+
+const boxGroup = new THREE.Group();
+scene.add(boxGroup);
+const tagLayer = document.getElementById("tags");
+const tags = [];
+SCENE.objects.forEach((o, i) => {
+  const color = segmentCss(i);
+  if (o.centroid) {
+    o.centre = toThree(...o.centroid);
+    o.anchor = toThree(o.centroid[0], o.centroid[1], o.top);
+  }
+  if (o.box) {
+    const b = o.box;
+    const bottom = b.corners.map(([r, f]) => toThree(r, f, b.bottom));
+    const top = b.corners.map(([r, f]) => toThree(r, f, b.top));
+    const segments = [];
+    for (let k = 0; k < 4; k++) {
+      const n = (k + 1) % 4;
+      segments.push(bottom[k], bottom[n], top[k], top[n], bottom[k], top[k]);
+    }
+    boxGroup.add(new THREE.LineSegments(
+      new THREE.BufferGeometry().setFromPoints(segments),
+      new THREE.LineBasicMaterial({ color }),
+    ));
+    o.anchor = top.reduce((a, p) => a.add(p), new THREE.Vector3()).multiplyScalar(1 / 4);
+  }
+  if (!o.anchor) return;
+  const tag = document.createElement("div");
+  tag.className = "tag";
+  tag.style.background = color;
+  tag.textContent = o.box ? `${o.label} ${o.box.size_m.map(s => s.toFixed(2)).join("x")} m` : o.label;
+  tagLayer.appendChild(tag);
+  tags.push({ el: tag, anchor: o.anchor });
+});
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+
+function cameraView() {
+  const forward = toThree(...cam.forward);
+  camera.position.set(0, 0, 0);
+  camera.up.copy(toThree(...cam.up));
+  controls.target.copy(forward.multiplyScalar(cam.median_depth_m));
+  controls.update();
+}
+function topDown() {
+  const centre = toThree(0, cam.median_depth_m, 0);
+  camera.up.set(0, 0, -1);
+  camera.position.set(centre.x, 9, centre.z);
+  controls.target.copy(centre);
+  controls.update();
+  camera.up.set(0, 1, 0);
+}
+function flyTo(o) {
+  if (!o.centre) return;
+  const reach = o.box ? Math.max(1.2, o.box.size_m[0] * 1.8) : 1.2;
+  const offset = camera.position.clone().sub(controls.target).normalize().multiplyScalar(reach);
+  controls.target.copy(o.centre);
+  camera.position.copy(o.centre.clone().add(offset));
+  controls.update();
+}
+
+const list = document.getElementById("objects");
+SCENE.objects.forEach((o, i) => {
+  const row = document.createElement("div");
+  row.className = "obj";
+  const dims = o.box ? `${o.box.distance_m.toFixed(1)} m` : "no box";
+  row.innerHTML = `<span class="swatch" style="background:${segmentCss(i)}"></span>` +
+    `<span>${o.label}</span><span class="dims">${dims}</span>`;
+  row.title = `score ${o.score}, ${o.point_count} points` +
+    (o.box ? `, ${o.box.size_m.map(s => s.toFixed(2)).join(" x ")} m` : ", too few depth points for a box");
+  row.onclick = () => flyTo(o);
+  list.appendChild(row);
+});
+document.getElementById("title").textContent = `${SCENE.name}: ${SCENE.objects.length} segments`;
+document.getElementById("segments").onchange = e => { overlays.segments = e.target.checked; recolour(); updateCloudVisibility(); };
+document.getElementById("room").onchange = e => (roomGroup.visible = e.target.checked);
+document.getElementById("planes").onchange = e => {
+  overlays.planes = e.target.checked; planeGroup.visible = e.target.checked; recolour(); showFlattened(e.target.checked);
+};
+const surfaceList = document.getElementById("surfaces");
+SCENE.planes.forEach(pl => {
+  const row = document.createElement("div");
+  row.className = "obj";
+  row.innerHTML = `<span class="swatch" style="background:#${pl.color.getHexString()}"></span>` +
+    `<span>${pl.kind}</span><span class="dims">${pl.area_m2.toFixed(1)} m&sup2;</span>`;
+  row.onclick = () => flyTo({ centre: pl.centre });
+  surfaceList.appendChild(row);
+});
+document.getElementById("pov").onclick = cameraView;
+document.getElementById("top").onclick = topDown;
+document.getElementById("points").onchange = updateCloudVisibility;
+document.getElementById("boxes").onchange = e => (boxGroup.visible = e.target.checked);
+document.getElementById("labels").onchange = e => (tagLayer.style.display = e.target.checked ? "" : "none");
+document.getElementById("size").oninput = e => (pointMaterial.size = Number(e.target.value));
+document.getElementById("toggle").onclick = () => document.getElementById("panel").classList.toggle("collapsed");
+
+const held = new Set();
+addEventListener("keydown", e => { if (e.target.tagName !== "INPUT") held.add(e.key.toLowerCase()); });
+addEventListener("keyup", e => held.delete(e.key.toLowerCase()));
+addEventListener("blur", () => held.clear());
+
+function moveFromKeys(dt) {
+  const forward = new THREE.Vector3();
+  camera.getWorldDirection(forward);
+  forward.y = 0;
+  if (forward.lengthSq() < 1e-6) forward.set(0, 0, -1);
+  forward.normalize();
+  const right = new THREE.Vector3().crossVectors(forward, new THREE.Vector3(0, 1, 0));
+  const step = new THREE.Vector3();
+  if (held.has("w")) step.add(forward);
+  if (held.has("s")) step.sub(forward);
+  if (held.has("d")) step.add(right);
+  if (held.has("a")) step.sub(right);
+  if (held.has("e")) step.y += 1;
+  if (held.has("q")) step.y -= 1;
+  if (step.lengthSq() === 0) return;
+  step.normalize().multiplyScalar(MOVE_SPEED_M_PER_S * dt * (held.has("shift") ? 3 : 1));
+  camera.position.add(step);
+  controls.target.add(step);
+}
+
+function placeTags() {
+  const w = renderer.domElement.clientWidth, h = renderer.domElement.clientHeight;
+  const p = new THREE.Vector3();
+  for (const t of tags) {
+    p.copy(t.anchor).project(camera);
+    const visible = p.z > -1 && p.z < 1 && Math.abs(p.x) < 1.1 && Math.abs(p.y) < 1.1;
+    t.el.style.display = visible ? "" : "none";
+    if (visible) {
+      t.el.style.left = `${(p.x + 1) / 2 * w}px`;
+      t.el.style.top = `${(1 - p.y) / 2 * h}px`;
+    }
+  }
+}
+
+function resize() {
+  renderer.setSize(innerWidth, innerHeight);
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+}
+addEventListener("resize", resize);
+resize();
+// Live: when a newer scene is ready, reload and come back to the same viewpoint.
+const VIEW_KEY = "scene-view-camera";
+try {
+  const saved = JSON.parse(sessionStorage.getItem(VIEW_KEY));
+  if (saved) {
+    camera.position.fromArray(saved.position);
+    controls.target.fromArray(saved.target);
+    controls.update();
+  } else {
+    cameraView();
+  }
+} catch { cameraView(); }
+updateCloudVisibility();
+// ?still keeps the page on one frame, for screenshots or a closer look.
+if (!new URLSearchParams(location.search).has("still")) setInterval(async () => {
+  const response = await fetch("version").catch(() => null);
+  if (!response || !response.ok) return;
+  if ((await response.text()) !== SCENE.version) {
+    try {
+      sessionStorage.setItem(VIEW_KEY, JSON.stringify({ position: camera.position.toArray(), target: controls.target.toArray() }));
+    } catch {}
+    location.reload();
+  }
+}, 1000);
+
+const clock = new THREE.Clock();
+renderer.setAnimationLoop(() => {
+  moveFromKeys(clock.getDelta());
+  controls.update();
+  renderer.render(scene, camera);
+  placeTags();
+});
+</script>
+</body>
+</html>

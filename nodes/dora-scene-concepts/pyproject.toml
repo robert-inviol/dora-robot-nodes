@@ -1,0 +1,32 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "dora-scene-concepts"
+version = "0.1.0"
+description = "A dora node that asks Claude which object types a keyframe shows, streaming each one out as it is named"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+dependencies = [
+    "dora-rs==0.3.13",
+    "dora-rig-messages",
+    "anthropic>=0.70",
+]
+
+[project.scripts]
+dora-scene-concepts = "dora_scene_concepts.node:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["dora_scene_concepts"]
+
+# Runs beside the GPU nodes, with its own environment, so a robot never installs the API client.
+[tool.uv]
+package = true
+
+[tool.uv.sources]
+dora-rig-messages = { path = "../../lib/dora-rig-messages", editable = true }
+
+[dependency-groups]
+dev = ["pytest>=8"]
