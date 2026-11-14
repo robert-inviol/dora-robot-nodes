@@ -69,7 +69,7 @@ PEOPLE_TRACKS_TYPE = pa.struct(
         _required("width", pa.uint16()),
         _required("height", pa.uint16()),
         _required("position_frame", pa.string()),
-        # The accelerometer at rest in camera coordinates, as in a keyframe; null once positions are in odom.
+        # The accelerometer smoothed over half a second, in its own axes (see camera_calibration.depth_to_imu); null once positions are in odom.
         pa.field("gravity_reaction", _list_of(pa.float32())),
         _required("tracks", _list_of(PERSON_TRACK_TYPE)),
     ]
