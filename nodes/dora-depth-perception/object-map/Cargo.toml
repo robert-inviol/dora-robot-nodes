@@ -1,0 +1,23 @@
+[package]
+name = "object-map"
+version = "0.1.0"
+description = "Persistent objects built from SAM 3 masks: matching, confirmation, merging and negative evidence"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+depth-perception = { path = "../depth-perception" }
+perception-wire = { path = "../perception-wire" }
+room-map = { path = "../room-map" }
+dora-node-api.workspace = true
+eyre.workspace = true
+glam = "0.29"
+jpeg-decoder = { version = "0.3", default-features = false }
+jpeg-encoder = "0.6"
+rayon = "1.10"
+serde = { version = "1", features = ["derive"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tracing-subscriber = "0.3"
