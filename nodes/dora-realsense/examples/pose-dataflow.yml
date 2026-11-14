@@ -1,0 +1,41 @@
+# On the camera's machine: the D455 through YOLOv8 pose on the Hailo-8, and the people placed in 3D. Paths are
+# relative to this file. Build `cargo build --release -p dora-realsense` in dora-realsense and `cargo build --release`
+# in dora-people-lift here; the pose node needs the Pi's hailo-all and python3-gi.
+nodes:
+  # The only node that opens the D455.
+  - id: camera
+    path: ../target/release/dora-realsense
+    env:
+      # This camera's calibration.json from librealsense's rs-imu-calibration.py, kept beside this file and out of git.
+      IMU_CALIBRATION_PATH: imu-calibration.json
+    inputs:
+      # Carries nothing; it keeps the node's events open so the dataflow can stop it.
+      tick: dora/timer/millis/500
+    outputs:
+      - model_input
+      - depth
+      - imu
+      - calibration
+
+  # YOLOv8 pose and hailotracker on the Hailo-8.
+  - id: pose
+    path: ../../dora-hailo-perception/dora_hailo_pose_node.py
+    env:
+      PYTHONPATH: ../../../lib/dora-rig-messages
+    inputs:
+      # Only the newest frame matters; an older one waiting here is already late.
+      model_input:
+        source: camera/model_input
+        queue_size: 1
+    outputs:
+      - person_poses
+
+  # Keypoints and torso in 3D from the frame's depth, smoothed into tracks.
+  - id: people
+    path: ../../dora-people-lift/target/release/dora-people-lift
+    inputs:
+      person_poses: pose/person_poses
+      depth: camera/depth
+      calibration: camera/calibration
+    outputs:
+      - people_tracks

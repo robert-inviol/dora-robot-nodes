@@ -8,3 +8,6 @@ nodes/dora-delta2a-lidar/dist/
 nodes/dora-depth-perception/target/
 nodes/dora-realsense-keyframes/target/
 nodes/dora-zenoh-bridge/target/
+nodes/dora-realsense/examples/imu-calibration.json
+nodes/dora-realsense/target/
+nodes/dora-people-lift/target/

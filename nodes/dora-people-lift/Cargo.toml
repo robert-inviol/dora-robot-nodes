@@ -1,0 +1,19 @@
+[package]
+name = "dora-people-lift"
+version = "0.1.0"
+description = "dora node that places the pose model's people in 3D with the depth camera and follows them as tracks"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+readme = "README.md"
+
+[dependencies]
+perception-wire = { path = "../dora-depth-perception/perception-wire" }
+# The node API has to match the version of the dora CLI that runs the dataflow.
+dora-node-api = { version = "=0.3.13", default-features = false }
+eyre = "0.6"
+glam = "0.29"
+
+[profile.release]
+strip = true
+debug = "line-tables-only"

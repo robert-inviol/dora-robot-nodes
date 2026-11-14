@@ -8,10 +8,14 @@ from typing import Protocol
 
 import pyarrow as pa
 
+from .camera import CameraCalibration, RigidTransform, StreamIntrinsics
 from .drive import DriveDemand
 import numpy as np
 
 from .operator import DriveMode, OperatorCommand
+from .people import (
+    Keypoint, PeopleTracks, PersonPose, PersonPoses, PersonTrack, PixelBox, Point, PositionFrame, TrackState, Velocity,
+)
 from .perception import (
     CameraIntrinsics, Concepts, Imu, Keyframe, Plane, Room, Scene, SceneObject, Segments, SurfaceKind,
 )
@@ -24,6 +28,8 @@ FIXTURE_DIR = Path(__file__).parent / "fixtures"
 class Message(Protocol):
     def to_arrow(self) -> pa.Array: ...
 
+
+_KEYPOINTS = tuple(Keypoint(400.0 + 8.0 * i, 140.0 + 24.0 * i, 0.75 if i % 4 else 0.25) for i in range(17))
 
 # Every float is exact in float32, so a fixture reads back equal to its example.
 EXAMPLES: dict[str, Message] = {
@@ -86,6 +92,47 @@ EXAMPLES: dict[str, Message] = {
         room=None,
         room_problem="no ceiling plane found, cannot bound the room",
         objects=(),
+    ),
+    "camera_calibration": CameraCalibration(
+        color=StreamIntrinsics(width=1280, height=720, fx=640.5, fy=640.25, ppx=639.75, ppy=360.5),
+        depth=StreamIntrinsics(width=848, height=480, fx=421.5, fy=421.5, ppx=424.25, ppy=239.75),
+        depth_to_color=RigidTransform((1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0), (-0.0625, 0.0, 0.0)),
+        depth_to_imu=RigidTransform((1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0), (-0.03125, 0.0078125, -0.015625)),
+    ),
+    "person_poses": PersonPoses(
+        frame_id=42,
+        captured_camera_ns=1_762_560_000_100_000_000,
+        width=1280,
+        height=720,
+        people=(
+            PersonPose(TrackId(3), 0.875, PixelBox(400.0, 120.0, 180.0, 520.0), _KEYPOINTS),
+            PersonPose(None, 0.5, PixelBox(900.5, 200.25, 90.0, 300.0), _KEYPOINTS),
+        ),
+    ),
+    "person_poses_nobody": PersonPoses(frame_id=43, captured_camera_ns=1_762_560_000_133_333_333, width=1280, height=720, people=()),
+    "people_tracks": PeopleTracks(
+        frame_id=42,
+        captured_camera_ns=1_762_560_000_100_000_000,
+        width=1280,
+        height=720,
+        position_frame=PositionFrame.CAMERA,
+        gravity_reaction=(-0.0625, -9.75, -0.375),
+        tracks=(
+            PersonTrack(
+                TrackId(3), TrackState.CONFIRMED, 0.875, PixelBox(400.0, 120.0, 180.0, 520.0), _KEYPOINTS,
+                position=Point(-0.25, 0.125, 2.5),
+                velocity=Velocity(0.5, 0.0, -0.25),
+                keypoints_3d=(Point(-0.25, -0.625, 2.5),) * 16 + (None,),
+            ),
+            PersonTrack(
+                TrackId(9), TrackState.LOST, 0.5, PixelBox(900.5, 200.25, 90.0, 300.0), _KEYPOINTS,
+                position=None, velocity=None, keypoints_3d=(None,) * 17,
+            ),
+        ),
+    ),
+    "people_tracks_in_odom": PeopleTracks(
+        frame_id=43, captured_camera_ns=1_762_560_000_133_333_333, width=1280, height=720,
+        position_frame=PositionFrame.ODOM, gravity_reaction=None, tracks=(),
     ),
 }
 

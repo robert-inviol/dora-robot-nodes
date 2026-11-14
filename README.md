@@ -10,7 +10,9 @@ one node without the rest.
 
 | Package | What it does |
 |---|---|
-| [`dora-hailo-perception`](nodes/dora-hailo-perception) | Camera through YOLOv8 on a Hailo-8, detections with persistent track ids, and the video to browsers over WebRTC. Raspberry Pi 5 only |
+| [`dora-hailo-perception`](nodes/dora-hailo-perception) | Camera through YOLOv8 on a Hailo-8, detections with persistent track ids, and the video to browsers over WebRTC; or another node's frames through YOLOv8 pose (`dora-hailo-pose`). Raspberry Pi 5 only |
+| [`dora-realsense`](nodes/dora-realsense) | A RealSense D455 in Rust: every frame's letterboxed model input, raw depth, IMU samples and calibration, on the camera's clock |
+| [`dora-people-lift`](nodes/dora-people-lift) | The pose model's people placed in 3D with depth, smoothed and followed as tracks, in Rust |
 | [`dora-person-follower`](nodes/dora-person-follower) | Decides where the robot goes: the operator's joystick, or towards one tracked person. Publishes a drive demand and knows nothing about the robot underneath |
 | [`dora-teleop`](nodes/dora-teleop) | A control page for a phone or laptop: joystick, follow toggle, stop button, the live video with the tracker's boxes, and the map |
 | [`dora-delta2a-lidar`](nodes/dora-delta2a-lidar) | The 3irobotics Delta-2A lidar, in Rust: decodes its serial stream and publishes each turn of the head as one scan |
@@ -58,6 +60,8 @@ Tested with dora 0.3.13 on a Raspberry Pi 5, Debian 12, HailoRT 4.20.
 uv sync
 uv run pytest
 cargo test --manifest-path nodes/dora-delta2a-lidar/Cargo.toml
+cargo test --manifest-path nodes/dora-realsense/Cargo.toml
+cargo test --manifest-path nodes/dora-people-lift/Cargo.toml
 ```
 
 `uv sync` installs every Python package here into one environment. After a deliberate change to

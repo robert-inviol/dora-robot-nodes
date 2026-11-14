@@ -1,0 +1,18 @@
+[package]
+name = "dora-realsense"
+version = "0.1.0"
+description = "dora node that owns a RealSense D400 with an IMU and publishes every frame: model input, depth, IMU and calibration"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+readme = "../README.md"
+
+[dependencies]
+rgbd-frames = { path = "../rgbd-frames" }
+rgbd-keyframes = { path = "../../dora-realsense-keyframes/rgbd-keyframes" }
+perception-wire = { path = "../../dora-depth-perception/perception-wire" }
+# The node API has to match the version of the dora CLI that runs the dataflow.
+dora-node-api = { version = "=0.3.13", default-features = false }
+eyre = "0.6"
+glam = "0.29"
+realsense-rust = "1.3"

@@ -1192,6 +1192,8 @@ dependencies = [
  "dora-node-api",
  "eyre",
  "glam",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

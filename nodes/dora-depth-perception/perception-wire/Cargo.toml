@@ -11,3 +11,5 @@ depth-perception = { path = "../depth-perception" }
 dora-node-api.workspace = true
 eyre.workspace = true
 glam = "0.29"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

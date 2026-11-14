@@ -1,0 +1,14 @@
+[workspace]
+resolver = "3"
+members = ["rgbd-frames", "dora-realsense"]
+# The node links librealsense2, which only the camera's machine has; everything else builds anywhere.
+default-members = ["rgbd-frames"]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+
+[profile.release]
+strip = true
+debug = "line-tables-only"

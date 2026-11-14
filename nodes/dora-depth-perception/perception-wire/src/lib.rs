@@ -1,6 +1,10 @@
 //! The perception messages of lib/dora-rig-messages/dora_rig_messages/perception.py, as single-row Arrow structs.
 //! Field names, types and nullability must match that module exactly; the tests read its golden fixtures.
 
+pub mod camera;
+pub mod people;
+mod serde_wire;
+
 use std::sync::Arc;
 
 use depth_perception::{CameraIntrinsics, ObjectFootprint, Plane, Room, RoomError};
@@ -190,7 +194,7 @@ fn floats(values: impl IntoIterator<Item = f32>) -> ArrayRef {
     Arc::new(values.into_iter().collect::<Float32Array>())
 }
 
-fn checked<'a>(array: &'a dyn Array, fields: &Fields, name: &str) -> Result<&'a StructArray> {
+pub(crate) fn checked<'a>(array: &'a dyn Array, fields: &Fields, name: &str) -> Result<&'a StructArray> {
     let expected = DataType::Struct(fields.clone());
     if array.data_type() != &expected {
         bail!("expected the {name} wire type {expected:?}, received {:?}", array.data_type());
@@ -425,6 +429,49 @@ mod tests {
         let path = format!("{}/../../../lib/dora-rig-messages/dora_rig_messages/fixtures/{name}.arrow", env!("CARGO_MANIFEST_DIR"));
         let mut reader = FileReader::try_new(File::open(&path).unwrap_or_else(|e| panic!("{path}: {e}")), None).unwrap();
         StructArray::from(reader.next().unwrap().unwrap())
+    }
+
+    #[test]
+    fn the_camera_calibration_fixture_decodes_and_encodes_back_to_itself() {
+        let golden = fixture("camera_calibration");
+        let calibration = camera::decode_camera_calibration(&golden).unwrap();
+        assert_eq!((calibration.color.width, calibration.depth.width), (1280, 848));
+        assert_eq!(calibration.depth_to_imu.translation_m, [-0.03125, 0.0078125, -0.015625]);
+        assert_eq!(camera::encode_camera_calibration(&calibration), golden);
+    }
+
+    #[test]
+    fn the_person_poses_fixtures_decode_and_encode_back_to_themselves() {
+        for name in ["person_poses", "person_poses_nobody"] {
+            let golden = fixture(name);
+            let poses = people::decode_person_poses(&golden).unwrap();
+            assert_eq!(people::encode_person_poses(&poses), golden, "{name}");
+        }
+        let poses = people::decode_person_poses(&fixture("person_poses")).unwrap();
+        assert_eq!(poses.people.iter().map(|p| p.track_id).collect::<Vec<_>>(), vec![Some(3), None]);
+        assert_eq!(poses.people[0].keypoints[1], people::Keypoint { x_px: 408.0, y_px: 164.0, score: 0.75 });
+    }
+
+    #[test]
+    fn the_people_tracks_fixtures_decode_and_encode_back_to_themselves() {
+        for name in ["people_tracks", "people_tracks_in_odom"] {
+            let golden = fixture(name);
+            let tracks = people::decode_people_tracks(&golden).unwrap();
+            assert_eq!(people::encode_people_tracks(&tracks), golden, "{name}");
+        }
+        let tracks = people::decode_people_tracks(&fixture("people_tracks")).unwrap();
+        assert_eq!(tracks.position_frame, people::PositionFrame::Camera);
+        assert_eq!(tracks.tracks[1].state, people::TrackState::Lost);
+        assert_eq!(tracks.tracks[0].keypoints_3d[16], None);
+        assert_eq!(tracks.tracks[0].position, Some(people::Point { x_m: -0.25, y_m: 0.125, z_m: 2.5 }));
+    }
+
+    #[test]
+    fn a_rigid_transform_and_its_inverse_cancel() {
+        let quarter_turn_about_z = camera::RigidTransform { rotation: [0.0, 1.0, 0.0, -1.0, 0.0, 0.0, 0.0, 0.0, 1.0], translation_m: [0.5, 0.0, -0.25] };
+        let point = Vec3::new(1.0, 2.0, 3.0);
+        assert_eq!(quarter_turn_about_z.apply(Vec3::X), Vec3::new(0.5, 1.0, -0.25));
+        assert!(quarter_turn_about_z.inverse().apply(quarter_turn_about_z.apply(point)).abs_diff_eq(point, 1e-6));
     }
 
     #[test]
