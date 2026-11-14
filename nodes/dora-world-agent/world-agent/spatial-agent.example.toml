@@ -7,6 +7,10 @@ executable = "claude"
 work_dir = "/tmp/spatial-agent"
 # A tool call that takes longer than this fails, and the agent sees the failure.
 mcp_tool_timeout_s = 5
+# Claude credentials for every claude process: "signed_in_cli" uses the CLI's own sign-in; a token from
+# `claude setup-token` in a file only the node's user can read is given as
+#   credentials = { oauth_token_file = "/path/to/token" }
+credentials = "signed_in_cli"
 
 [answering]
 # A question gets its final message after this long, whatever is still running.

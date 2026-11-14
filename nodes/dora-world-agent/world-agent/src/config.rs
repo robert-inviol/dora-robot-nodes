@@ -68,6 +68,19 @@ pub struct ClaudeConfig {
     /// How long claude waits for one tool call before giving up on it.
     #[serde(rename = "mcp_tool_timeout_s", deserialize_with = "seconds")]
     pub mcp_tool_timeout: Duration,
+    /// Where every claude process gets its Claude credentials.
+    pub credentials: ClaudeCredentials,
+}
+
+/// Where a claude process gets its Claude credentials.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum ClaudeCredentials {
+    /// The CLI's own sign-in for the user the node runs as.
+    SignedInCli,
+    /// A `claude setup-token` token in this file, read for every process started and handed to it as
+    /// `CLAUDE_CODE_OAUTH_TOKEN`. The file must not be readable by others.
+    OauthTokenFile(PathBuf),
 }
 
 /// Whether an answerer's goals move the robot at once or wait for the reconciler.
@@ -287,6 +300,19 @@ mod tests {
         assert_eq!(config.world_store.path, Path::new("/var/lib/spatial-agent/world.sqlite"));
         let backup = config.world_store.backup.unwrap();
         assert_eq!((backup.path.as_path(), backup.every), (Path::new("/var/lib/spatial-agent/backup/world.sqlite"), Duration::from_secs(600)));
+    }
+
+    #[test]
+    fn credentials_are_the_signed_in_cli_or_a_token_file() {
+        assert_eq!(SpatialConfig::parse(&example()).unwrap().claude.credentials, ClaudeCredentials::SignedInCli);
+        let text = example().replace(
+            "credentials = \"signed_in_cli\"",
+            "credentials = { oauth_token_file = \"/home/robot/.config/spatial-agent/claude-token\" }",
+        );
+        assert_eq!(
+            SpatialConfig::parse(&text).unwrap().claude.credentials,
+            ClaudeCredentials::OauthTokenFile(PathBuf::from("/home/robot/.config/spatial-agent/claude-token"))
+        );
     }
 
     #[test]

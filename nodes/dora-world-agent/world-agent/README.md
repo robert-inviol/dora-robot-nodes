@@ -64,6 +64,7 @@ named again once more than `rename_after_change` of its objects differ from when
 |---|---|
 | `claude.executable`, `claude.work_dir` | The CLI, and the empty directory every process runs in |
 | `claude.mcp_tool_timeout_s` | A tool call taking longer fails, and the model sees the failure |
+| `claude.credentials` | `"signed_in_cli"` uses the CLI's own sign-in. `{ oauth_token_file = "<path>" }` hands every process the `claude setup-token` token in that file as `CLAUDE_CODE_OAUTH_TOKEN`, read at each start; a missing, empty or group/world-readable file stops the process from starting. Every process is tagged `job.name=spatial-agent` in its telemetry |
 | `answering.system_prompt`, `answering.deadline_s` | Every answerer's system prompt; when a question gets its final message |
 | `answering.answerers` | `model`, `effort` and `role` (`fast` or `deliberate`) of each answerer; exactly one is fast |
 | `reconciler` | `model`, `effort`, `system_prompt` of the reconciler |

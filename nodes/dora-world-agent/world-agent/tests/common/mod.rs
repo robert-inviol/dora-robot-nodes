@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use perception_wire::navigation::{NonNegative, UnixNanos};
 use world_agent::config::{
-    AnswererConfig, AnswererRole, AnsweringConfig, ClaudeConfig, CompositionChange, Effort, GoalDefaults, McpConfig,
+    AnswererConfig, AnswererRole, AnsweringConfig, ClaudeConfig, ClaudeCredentials, CompositionChange, Effort, GoalDefaults, McpConfig,
     ModelName, ModelProfile, RoomNamerConfig, SpatialConfig, SystemPrompt, WatchdogConfig, WorldStoreSettings,
 };
 
@@ -38,6 +38,7 @@ pub fn claude(work_dir: &Path) -> ClaudeConfig {
         executable: PathBuf::from(env!("CARGO_BIN_EXE_fake-claude")),
         work_dir: work_dir.to_owned(),
         mcp_tool_timeout: Duration::from_secs(5),
+        credentials: ClaudeCredentials::SignedInCli,
     }
 }
 

@@ -1,6 +1,8 @@
 //! One `claude` child process: how it is started, its input, and its output as typed events.
 
 use std::ffi::OsString;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -12,7 +14,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::mpsc;
 
-use crate::config::{ClaudeConfig, Effort, ModelName, ModelProfile, SystemPrompt};
+use crate::config::{ClaudeConfig, ClaudeCredentials, Effort, ModelName, ModelProfile, SystemPrompt};
 use crate::identity::{AgentId, AgentRegistry};
 use crate::mcp::{McpUrl, AGENT_ID_HEADER, SERVER_NAME};
 use crate::protocol::{
@@ -21,7 +23,7 @@ use crate::protocol::{
 };
 
 /// The environment every claude process gets on top of the supervisor's own, which carries the credentials.
-const LEAN_ENVIRONMENT: [(&str, &str); 8] = [
+const LEAN_ENVIRONMENT: [(&str, &str); 9] = [
     // MCP tools load up front; otherwise the first use of each costs a ToolSearch round trip.
     ("ENABLE_TOOL_SEARCH", "false"),
     // A "now" message aborts a running tool call instead of moving it to the background.
@@ -32,7 +34,11 @@ const LEAN_ENVIRONMENT: [(&str, &str); 8] = [
     ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1"),
     ("DISABLE_AUTOUPDATER", "1"),
     ("ENABLE_PROMPT_CACHING_1H", "1"),
+    // Names this workload in Claude Code's telemetry, where token-based runs carry no user.
+    ("OTEL_RESOURCE_ATTRIBUTES", "job.name=spatial-agent"),
 ];
+
+const OAUTH_TOKEN_VARIABLE: &str = "CLAUDE_CODE_OAUTH_TOKEN";
 
 /// Variables that must not reach a claude process: a killed turn must never be re-run on resume.
 const REMOVED_ENVIRONMENT: [&str; 1] = ["CLAUDE_CODE_RESUME_INTERRUPTED_TURN"];
@@ -83,6 +89,30 @@ pub enum SpawnError {
     UnexpectedTools { agent: AgentId, status: String },
     #[error("{agent} wrote to its input: {source}")]
     Input { agent: AgentId, source: std::io::Error },
+    #[error("reading the Claude OAuth token file {path}: {source}")]
+    TokenFile { path: PathBuf, source: std::io::Error },
+    #[error("the Claude OAuth token file {path} is empty")]
+    EmptyTokenFile { path: PathBuf },
+    #[error("the Claude OAuth token file {path} can be read by others (mode {mode:o}); make it 600")]
+    OpenTokenFile { path: PathBuf, mode: u32 },
+}
+
+/// A `claude setup-token` token. It never appears in logs or debug output.
+struct OauthToken(String);
+
+impl OauthToken {
+    fn read(path: &Path) -> Result<Self, SpawnError> {
+        let mode = std::fs::metadata(path).map_err(|source| SpawnError::TokenFile { path: path.to_owned(), source })?.permissions().mode();
+        if mode & 0o077 != 0 {
+            return Err(SpawnError::OpenTokenFile { path: path.to_owned(), mode: mode & 0o777 });
+        }
+        let text = std::fs::read_to_string(path).map_err(|source| SpawnError::TokenFile { path: path.to_owned(), source })?;
+        let token = text.trim();
+        if token.is_empty() {
+            return Err(SpawnError::EmptyTokenFile { path: path.to_owned() });
+        }
+        Ok(Self(token.to_owned()))
+    }
 }
 
 /// What a claude process says, or that it has gone.
@@ -176,6 +206,10 @@ impl Launcher {
         self.spawned.fetch_add(1, Ordering::Relaxed);
         let agent = AgentId(format!("agent-{}", SPAWNED.fetch_add(1, Ordering::Relaxed)));
         let session = SessionId::random();
+        let oauth_token = match &self.claude.credentials {
+            ClaudeCredentials::SignedInCli => None,
+            ClaudeCredentials::OauthTokenFile(path) => Some(OauthToken::read(path)?),
+        };
         let token = self.registry.register(agent.clone());
         let mut command = Command::new(&self.claude.executable);
         command
@@ -190,6 +224,9 @@ impl Launcher {
             .kill_on_drop(true);
         for name in REMOVED_ENVIRONMENT {
             command.env_remove(name);
+        }
+        if let Some(oauth_token) = &oauth_token {
+            command.env(OAUTH_TOKEN_VARIABLE, &oauth_token.0);
         }
         let mut child = match command.spawn() {
             Ok(child) => child,
@@ -373,5 +410,44 @@ impl AgentProcess {
 impl Drop for AgentProcess {
     fn drop(&mut self) {
         self.registry.unregister(&self.agent);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn token_file(name: &str, text: &str, mode: u32) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("spatial-agent-token-{}-{name}", std::process::id()));
+        std::fs::write(&path, text).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        path
+    }
+
+    #[test]
+    fn a_private_token_file_is_read_without_its_newline() {
+        let path = token_file("private", "sk-ant-oat01-example\n", 0o600);
+        assert_eq!(OauthToken::read(&path).unwrap().0, "sk-ant-oat01-example");
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn a_token_file_others_can_read_is_refused() {
+        let path = token_file("open", "sk-ant-oat01-example", 0o644);
+        assert!(matches!(OauthToken::read(&path), Err(SpawnError::OpenTokenFile { mode: 0o644, .. })));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn an_empty_token_file_is_refused() {
+        let path = token_file("empty", "\n", 0o600);
+        assert!(matches!(OauthToken::read(&path), Err(SpawnError::EmptyTokenFile { .. })));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn a_missing_token_file_is_refused() {
+        let path = std::env::temp_dir().join("spatial-agent-token-that-does-not-exist");
+        assert!(matches!(OauthToken::read(&path), Err(SpawnError::TokenFile { .. })));
     }
 }

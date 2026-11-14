@@ -21,7 +21,7 @@ use perception_wire::space_map::{
 };
 use world_agent::clock;
 use world_agent::config::{
-    AnswererConfig, AnswererRole, AnsweringConfig, ClaudeConfig, CompositionChange, Effort, GoalDefaults, McpConfig, ModelName,
+    AnswererConfig, AnswererRole, AnsweringConfig, ClaudeConfig, ClaudeCredentials, CompositionChange, Effort, GoalDefaults, McpConfig, ModelName,
     ModelProfile, RoomNamerConfig, SpatialConfig, SystemPrompt, WatchdogConfig, WorldStoreSettings,
 };
 use world_agent::world::SqlValue;
@@ -46,6 +46,7 @@ fn config(dir: &Path) -> SpatialConfig {
             executable: env!("CARGO_BIN_EXE_node-fake-claude").into(),
             work_dir: dir.join("claude"),
             mcp_tool_timeout: Duration::from_secs(5),
+            credentials: ClaudeCredentials::SignedInCli,
         },
         answering: AnsweringConfig {
             system_prompt: SystemPrompt("You answer questions.".to_owned()),
