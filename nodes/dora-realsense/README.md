@@ -15,7 +15,7 @@ builds only on the camera's machine: `cargo build --release -p dora-realsense`.
 | Input | What it carries |
 |---|---|
 | `tick` | Required, any dora timer. It carries nothing; dora closes the events of a node without inputs, and a stop could then never reach it |
-| `request_color` | Optional. When given, `color` is sent once for each message here instead of every frame |
+| `request_color` | Optional: `u64` frame ids. When given, `color` is sent only for the frames named here, instead of every frame. The node keeps the last 15 colour frames to answer from and fails on a request for an older one |
 
 | Output | What it carries |
 |---|---|
@@ -33,8 +33,23 @@ read them. `frame_id` counts frames from 0 and is the same across every output o
 | `IMU_CALIBRATION_PATH` | Required: this camera's `calibration.json` from librealsense's `tools/rs-imu-calibration/rs-imu-calibration.py`; every accelerometer and gyro sample is corrected with it |
 | `MODEL_INPUT_SIZE` | Optional: the side of the square `model_input`, default 640 |
 
-`examples/pose-dataflow.yml` runs the camera through YOLOv8 pose on a Hailo-8 (`dora-hailo-perception`'s
-`dora-hailo-pose`) and places the people in 3D (`dora-people-3d`).
+`dora-keyframe-picker`, in this workspace, picks keyframes from this node's frames without librealsense. It follows
+`imu` and `depth`, picks a frame at least once a second and sooner when the camera turns 10 degrees (never closer
+than 200 ms), and asks for that frame's colour on `request_color`. It then sends the `imu` and `keyframe` messages of
+`dora-rig-messages`: an `imu` message with every sample since the previous keyframe, then the keyframe. The keyframe
+holds depth redrawn onto the colour image from the calibration (each depth pixel painted over the colour pixels it
+covers, nearest wins, lens distortion not modelled), the colour as JPEG, and the camera's gravity estimate. Frames are
+not picked until the camera has a gravity estimate. Keyframe and imu `frame_id`s are this node's frame ids, so they
+match `odom_pose`'s `depth_frame_id`; `captured_unix_ns` is when the picker received the depth. `KEYFRAME_RECORD_PATH`
+and `IMU_RECORD_PATH` also append every keyframe and imu message it sends to Arrow IPC files, which
+`dora-keyframe-replay` plays.
 
-On a Raspberry Pi 5 the node uses about 35% of one core with `model_input`, `depth`, `imu` and `calibration`
-listed; shrinking one frame into the model input takes about 5.3 ms.
+`examples/pose-dataflow.yml` is everything the camera's machine runs for the spatial server: the camera through
+YOLOv8 pose on a Hailo-8 (`dora-hailo-perception`'s `dora-hailo-pose`), odometry
+(`dora-depth-inertial-odometry`), the people placed in 3D in the odom frame (`dora-people-3d`) and keyframes
+(`dora-keyframe-picker`). It publishes `rig/people_tracks`, `rig/odom_pose`, `rig/keyframe` and `rig/imu` over
+`dora-zenoh-bridge`.
+
+On a Raspberry Pi 5 the node uses about 40% of one core with `model_input`, `depth`, `imu`, `calibration` and
+`color` on request listed; shrinking one frame into the model input takes about 5.3 ms. The keyframe picker uses
+about 6%: aligning a keyframe's depth takes about 23 ms and its JPEG 18 ms, once a second.

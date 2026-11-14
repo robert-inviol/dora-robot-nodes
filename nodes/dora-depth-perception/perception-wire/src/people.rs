@@ -97,6 +97,9 @@ pub struct PersonTrack {
     pub velocity: Option<Velocity>,
     /// In keypoint order; None where depth has no reading or the keypoint is not trusted.
     pub keypoints_3d: Vec<Option<Point>>,
+    /// In keypoint order: the body joints (shoulders to ankles) the pose model saw this frame, fitted to a skeleton
+    /// with the person's own bone lengths. None for the face and for joints not seen.
+    pub skeleton_3d: Vec<Option<Point>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -106,7 +109,7 @@ pub struct PeopleTracks {
     pub width: u16,
     pub height: u16,
     pub position_frame: PositionFrame,
-    /// The accelerometer at rest in camera coordinates, as in a keyframe; None once positions are in odom.
+    /// The accelerometer smoothed over half a second, in its own axes; None once positions are in odom.
     #[serde(default)]
     pub gravity_reaction: Option<[f32; 3]>,
     pub tracks: Vec<PersonTrack>,
@@ -150,6 +153,7 @@ pub fn people_tracks_fields() -> Fields {
         optional("position", point_type()),
         optional("velocity", floats_struct(&["vx_m_s", "vy_m_s", "vz_m_s"])),
         required("keypoints_3d", list_of(point_type(), true)),
+        required("skeleton_3d", list_of(point_type(), true)),
     ]));
     Fields::from(vec![
         required("frame_id", DataType::UInt64),

@@ -1,6 +1,10 @@
-# On the camera's machine: the D455 through YOLOv8 pose on the Hailo-8, and the people placed in 3D. Paths are
-# relative to this file. Build `cargo build --release -p dora-realsense` in dora-realsense and `cargo build --release`
-# in dora-people-3d here; the pose node needs the Pi's hailo-all and python3-gi.
+# On the camera's machine, everything the spatial server needs from it: the D455 through YOLOv8 pose on the Hailo-8,
+# odometry from its depth and IMU, the people placed in 3D in the odom frame, and keyframes, published on
+# rig/people_tracks, rig/odom_pose, rig/keyframe and rig/imu. Paths are relative to this file. Build
+# `cargo build --release -p dora-realsense -p dora-keyframe-picker` in dora-realsense,
+# `cargo build --release -p dora-depth-inertial-odometry` in dora-depth-perception, and `cargo build --release` in
+# dora-people-3d and dora-zenoh-bridge; the pose node needs the Pi's hailo-all and python3-gi. Hold the camera still
+# from the start until the odometry node logs that it started.
 nodes:
   # The only node that opens the D455.
   - id: camera
@@ -11,11 +15,32 @@ nodes:
     inputs:
       # Carries nothing; it keeps the node's events open so the dataflow can stop it.
       tick: dora/timer/millis/500
+      # Colour only for the frames the keyframe picker names.
+      request_color: keyframes/request_color
     outputs:
       - model_input
       - depth
+      - color
       - imu
       - calibration
+
+  - id: odometry
+    path: ../../dora-depth-perception/target/release/dora-depth-inertial-odometry
+    inputs:
+      # Every imu message is needed: the tracker integrates all of them.
+      imu:
+        source: camera/imu
+        queue_size: 1000
+      # Every frame is wanted, in order; a frame dropped here costs one pose.
+      depth:
+        source: camera/depth
+        queue_size: 4
+      # The same message every second; the first one starts the node.
+      calibration:
+        source: camera/calibration
+        queue_size: 1
+    outputs:
+      - odom_pose
 
   # YOLOv8 pose and hailotracker on the Hailo-8.
   - id: pose
@@ -30,12 +55,53 @@ nodes:
     outputs:
       - person_poses
 
-  # Keypoints and torso in 3D from the frame's depth, smoothed into tracks.
+  # Keypoints and torso in 3D from the frame's depth, placed in the odom frame and smoothed into tracks.
   - id: people
     path: ../../dora-people-3d/target/release/dora-people-3d
+    env:
+      POSITION_FRAME: odom
     inputs:
       person_poses: pose/person_poses
       depth: camera/depth
       calibration: camera/calibration
+      odom_pose:
+        source: odometry/odom_pose
+        queue_size: 100
     outputs:
       - people_tracks
+
+  # A keyframe at least once a second, sooner on a turn, each led by every IMU sample since the last.
+  - id: keyframes
+    path: ../target/release/dora-keyframe-picker
+    inputs:
+      # Every imu message is needed: each keyframe carries all the samples since the last.
+      imu:
+        source: camera/imu
+        queue_size: 1000
+      depth:
+        source: camera/depth
+        queue_size: 4
+      color:
+        source: camera/color
+        queue_size: 4
+      calibration:
+        source: camera/calibration
+        queue_size: 1
+    outputs:
+      - request_color
+      - imu
+      - keyframe
+
+  # The people, the odometry and the keyframes to the spatial server, which connects here.
+  - id: link
+    path: ../../dora-zenoh-bridge/target/release/dora-zenoh-bridge
+    env:
+      ZENOH_LISTEN: tcp/0.0.0.0:7447
+      ZENOH_PUBLISH: people_tracks=rig/people_tracks,odom_pose=rig/odom_pose,keyframe=rig/keyframe,imu=rig/imu
+    inputs:
+      people_tracks: people/people_tracks
+      odom_pose: odometry/odom_pose
+      keyframe: keyframes/keyframe
+      imu:
+        source: keyframes/imu
+        queue_size: 100

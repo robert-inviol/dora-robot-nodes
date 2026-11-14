@@ -5,15 +5,16 @@
 //! a pipeline that also carries video hands over only the newest motion sample per video frame, while a motion-only
 //! one delivers every sample. The video thread sends straight to dora, so a frame waits on no timer.
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use dora_node_api::arrow::array::UInt16Array;
+use dora_node_api::arrow::array::{Array, AsArray, UInt16Array};
+use dora_node_api::arrow::datatypes::UInt64Type;
 use dora_node_api::dora_core::config::DataId;
 use dora_node_api::{DoraNode, Event, MetadataParameters, Parameter};
-use eyre::{eyre, Context, Result};
+use eyre::{bail, eyre, Context, Result};
 use glam::Vec3;
 use perception_wire::camera::{encode_camera_calibration, CameraCalibration, RigidTransform, StreamIntrinsics};
 use perception_wire::{encode_imu, Imu};
@@ -35,8 +36,10 @@ const IMU_OUTPUT: &str = "imu";
 const CALIBRATION_OUTPUT: &str = "calibration";
 /// Required input: any timer. It carries nothing; it keeps the node's events open so a stop can reach it.
 const TICK_INPUT: &str = "tick";
-/// Optional input: when the dataflow gives it, `color` is sent once for each message on it instead of every frame.
+/// Optional input: when the dataflow gives it, `color` is sent only for the frames it names, instead of every frame.
 const REQUEST_COLOR_INPUT: &str = "request_color";
+/// Colour frames kept for `request_color` to name; a request for an older one is an error.
+const COLOR_FRAMES_KEPT: usize = 15;
 /// Required: this camera's `calibration.json` from librealsense's `rs-imu-calibration.py`, applied to every sample.
 const IMU_CALIBRATION_VARIABLE: &str = "IMU_CALIBRATION_PATH";
 /// Optional: the side of the square `model_input`, default 640.
@@ -210,7 +213,7 @@ fn capture(
     mut node: DoraNode,
     imu_calibration: ImuCalibration,
     stopping: Arc<AtomicBool>,
-    color_requested: Arc<AtomicBool>,
+    color_requests: Arc<Mutex<Vec<u64>>>,
 ) -> Result<()> {
     let wanted = Wanted::from_node(&node)?;
     let context = RealsenseContext::new().wrap_err("creating the librealsense context")?;
@@ -228,7 +231,7 @@ fn capture(
     let motion = MotionPipeline(motion);
     std::thread::scope(|scope| {
         let motion = scope.spawn(|| stream_motion(motion, &imu_calibration, &motion_samples, &stopping));
-        let sent = stream_video(&mut node, video, &wanted, &calibration, &motion_samples, &stopping, &color_requested, || {
+        let sent = stream_video(&mut node, video, &wanted, &calibration, &motion_samples, &stopping, &color_requests, || {
             motion.is_finished()
         });
         stopping.store(true, Ordering::Relaxed);
@@ -245,7 +248,7 @@ fn stream_video(
     calibration: &CameraCalibration,
     motion_samples: &Mutex<MotionSamples>,
     stopping: &AtomicBool,
-    color_requested: &AtomicBool,
+    color_requests: &Mutex<Vec<u64>>,
     motion_finished: impl Fn() -> bool,
 ) -> Result<()> {
     let output = |name: &str| DataId::from(name.to_owned());
@@ -256,6 +259,9 @@ fn stream_video(
     let mut pending = Imu::default();
     // The camera can still hold motion samples from an earlier session; only those after the first depth frame count.
     let mut session_start_ns: Option<i64> = None;
+    // The last colour frames, oldest first, for `request_color`: frame id, capture time and pixels.
+    let mut kept_colors: VecDeque<(u64, i64, Vec<u8>)> = VecDeque::with_capacity(COLOR_FRAMES_KEPT);
+    let mut waiting_requests: Vec<u64> = Vec::new();
     eprintln!(
         "[realsense] streaming {}x{} colour, {}x{} depth at {VIDEO_FPS} fps, accel at {ACCEL_HZ} Hz and gyro at {GYRO_HZ} Hz",
         COLOR_SIZE.0, COLOR_SIZE.1, DEPTH_SIZE.0, DEPTH_SIZE.1
@@ -324,9 +330,29 @@ fn stream_video(
             }
             node.send_output(output(DEPTH_OUTPUT), parameters, depth_mm)?;
         }
-        if wanted.color && (!wanted.color_on_request || color_requested.swap(false, Ordering::Relaxed)) {
+        if wanted.color && !wanted.color_on_request {
             let parameters = image_parameters("rgb8", color.width(), color.height(), frame_id, frame_camera_ns);
             node.send_output_raw(output(COLOR_OUTPUT), parameters, rgb.len(), |out| out.copy_from_slice(rgb))?;
+        }
+        if wanted.color && wanted.color_on_request {
+            let mut pixels = if kept_colors.len() == COLOR_FRAMES_KEPT { kept_colors.pop_front().expect("full").2 } else { Vec::new() };
+            pixels.clear();
+            pixels.extend_from_slice(rgb);
+            kept_colors.push_back((frame_id, frame_camera_ns, pixels));
+            waiting_requests.append(&mut color_requests.lock().expect("colour requests lock"));
+            let mut still_waiting = Vec::new();
+            for requested in waiting_requests.drain(..) {
+                if requested > frame_id {
+                    still_waiting.push(requested);
+                    continue;
+                }
+                let Some((_, requested_ns, pixels)) = kept_colors.iter().find(|(id, _, _)| *id == requested) else {
+                    bail!("colour for frame {requested} was asked for after it was dropped; the camera keeps the last {COLOR_FRAMES_KEPT}");
+                };
+                let parameters = image_parameters("rgb8", color.width(), color.height(), requested, *requested_ns);
+                node.send_output_raw(output(COLOR_OUTPUT), parameters, pixels.len(), |out| out.copy_from_slice(pixels))?;
+            }
+            waiting_requests = still_waiting;
         }
         frame_id += 1;
     }
@@ -348,14 +374,17 @@ fn main() -> Result<()> {
         "give the camera a `{TICK_INPUT}` input (any dora timer) so the dataflow can stop it"
     );
     let stopping = Arc::new(AtomicBool::new(false));
-    let color_requested = Arc::new(AtomicBool::new(false));
+    let color_requests = Arc::new(Mutex::new(Vec::new()));
     let camera = {
-        let (stopping, color_requested) = (stopping.clone(), color_requested.clone());
-        std::thread::spawn(move || capture(node, imu_calibration, stopping, color_requested))
+        let (stopping, color_requests) = (stopping.clone(), color_requests.clone());
+        std::thread::spawn(move || capture(node, imu_calibration, stopping, color_requests))
     };
     while !camera.is_finished() {
         match events.recv_timeout(EVENT_WAIT) {
-            Some(Event::Input { id, .. }) if id.as_str() == REQUEST_COLOR_INPUT => color_requested.store(true, Ordering::Relaxed),
+            Some(Event::Input { id, data, .. }) if id.as_str() == REQUEST_COLOR_INPUT => {
+                let frames = data.as_primitive_opt::<UInt64Type>().ok_or_else(|| eyre!("request_color is {:?}, not u64 frame ids", data.data_type()))?;
+                color_requests.lock().expect("colour requests lock").extend(frames.values().iter().copied());
+            }
             Some(Event::Stop(_)) | None => break,
             _ => {}
         }

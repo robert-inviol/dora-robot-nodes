@@ -93,6 +93,7 @@ mod tests {
             position,
             velocity: Some(Velocity { vx_m_s: 0.5, vy_m_s: 0.0, vz_m_s: 0.0 }),
             keypoints_3d,
+            skeleton_3d: vec![None; Joint::ALL.len()],
         }
     }
 

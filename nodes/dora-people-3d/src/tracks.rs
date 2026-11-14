@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use glam::Vec3;
+use glam::{Affine3A, Vec3};
 use perception_wire::camera::CameraCalibration;
 use perception_wire::people::{
     PeopleTracks, PersonPose, PersonPoses, PersonTrack, Point, PositionFrame, TrackId, TrackState,
@@ -16,6 +16,7 @@ use perception_wire::people::{
 
 use crate::depth::DepthImage;
 use crate::one_euro::{OneEuro, OneEuroSettings};
+use crate::skeleton::{JointSighting, SkeletonFit, SkeletonSettings};
 
 /// COCO shoulders and hips.
 const TORSO_KEYPOINTS: [usize; 4] = [5, 6, 11, 12];
@@ -36,6 +37,7 @@ pub struct TrackSettings {
     /// How far from where a dropped person was heading a new pose-tracker id may turn up and still take them over.
     pub rejoin_radius_m: f32,
     pub smoothing: OneEuroSettings,
+    pub skeleton: SkeletonSettings,
 }
 
 impl Default for TrackSettings {
@@ -48,8 +50,49 @@ impl Default for TrackSettings {
             keep_lost: Duration::from_secs(2),
             rejoin_radius_m: 0.5,
             smoothing: OneEuroSettings::default(),
+            skeleton: SkeletonSettings::default(),
         }
     }
+}
+
+/// One tracked person of a pose frame, placed in the colour camera's frame.
+pub struct LiftedPerson {
+    pose: PersonPose,
+    pose_track_id: TrackId,
+    centre: Option<Vec3>,
+    keypoints_3d: Vec<Option<Vec3>>,
+    /// Unit directions from the colour camera through each keypoint the model is sure of.
+    rays: Vec<Option<Vec3>>,
+}
+
+/// One tracked person of a pose frame, placed in the frame tracks are kept in.
+struct PlacedPerson {
+    pose: PersonPose,
+    pose_track_id: TrackId,
+    centre: Option<Vec3>,
+    keypoints_3d: Vec<Option<Vec3>>,
+    sightings: Vec<Option<JointSighting>>,
+}
+
+/// A pose frame's tracked people placed in the colour camera's frame, before tracking.
+pub struct LiftedFrame {
+    pub frame_id: u64,
+    pub captured_camera_ns: i64,
+    /// Whether the frame's depth was there to place the people with.
+    pub depth_found: bool,
+    width: u16,
+    height: u16,
+    gravity_reaction: Option<[f32; 3]>,
+    people: Vec<LiftedPerson>,
+}
+
+/// The frame tracks are kept and reported in.
+#[derive(Clone, Copy, Debug)]
+pub enum Placement {
+    /// The colour camera's own frame.
+    Camera,
+    /// The odom frame, given the transform from the colour camera's frame into it at the pose frame's time.
+    Odom(Affine3A),
 }
 
 /// The depth frame a pose frame was taken with, and the gravity estimate at the time.
@@ -65,6 +108,7 @@ struct Followed {
     last_seen_ns: i64,
     filter: OneEuro,
     filtered_at_ns: Option<i64>,
+    skeleton: SkeletonFit,
     last: PersonTrack,
 }
 
@@ -86,6 +130,8 @@ pub struct PeopleTracker {
     /// Keyed by this tracker's own person id.
     followed: HashMap<TrackId, Followed>,
     next_id: TrackId,
+    /// Time spent fitting skeletons since it was last taken, and how many fits.
+    fitting: (std::time::Duration, u32),
 }
 
 fn point(v: Vec3) -> Point {
@@ -99,7 +145,12 @@ fn median(mut values: Vec<f32>) -> f32 {
 
 impl PeopleTracker {
     pub fn new(settings: TrackSettings) -> PeopleTracker {
-        PeopleTracker { settings, followed: HashMap::new(), next_id: 1 }
+        PeopleTracker { settings, followed: HashMap::new(), next_id: 1, fitting: (std::time::Duration::ZERO, 0) }
+    }
+
+    /// Time spent fitting skeletons, and how many fits, since the last call.
+    pub fn take_fitting_time(&mut self) -> (std::time::Duration, u32) {
+        std::mem::replace(&mut self.fitting, (std::time::Duration::ZERO, 0))
     }
 
     /// The torso centre and every keypoint in 3D, colour camera coordinates; None where depth cannot say.
@@ -159,31 +210,90 @@ impl PeopleTracker {
             .collect()
     }
 
-    /// The tracks for one pose frame. `depth` is None when its depth frame never arrived.
-    pub fn update(&mut self, poses: &PersonPoses, depth: Option<&DepthFrame>, calibration: Option<&CameraCalibration>) -> PeopleTracks {
-        let now_ns = poses.captured_camera_ns;
-        let lifted: Vec<(&PersonPose, TrackId, Option<Vec3>, Vec<Option<Vec3>>)> = poses
+    /// Forgets everyone, for when positions so far are in a frame that no longer applies. Ids keep counting on.
+    pub fn forget_everyone(&mut self) {
+        self.followed.clear();
+    }
+
+    /// A pose frame's tracked people in the colour camera's frame. `depth` is None when its depth frame never arrived.
+    pub fn lift_frame(&self, poses: &PersonPoses, depth: Option<&DepthFrame>, calibration: Option<&CameraCalibration>) -> LiftedFrame {
+        let people = poses
             .people
             .iter()
             .filter_map(|person| {
-                let pose_id = person.track_id?;
+                let pose_track_id = person.track_id?;
                 let (centre, keypoints_3d) = match (depth, calibration) {
                     (Some(depth), Some(calibration)) => self.lift(person, &depth.image, calibration),
                     _ => (None, vec![None; person.keypoints.len()]),
                 };
-                Some((person, pose_id, centre, keypoints_3d))
+                let rays = person
+                    .keypoints
+                    .iter()
+                    .map(|k| {
+                        let calibration = calibration.filter(|_| k.score >= self.settings.min_keypoint_score)?;
+                        Some(calibration.color.deproject(k.x_px, k.y_px, 1.0).normalize())
+                    })
+                    .collect();
+                Some(LiftedPerson { pose: person.clone(), pose_track_id, centre, keypoints_3d, rays })
             })
             .collect();
-        let seen: Vec<(TrackId, Option<Vec3>)> = lifted.iter().map(|(_, pose_id, centre, _)| (*pose_id, *centre)).collect();
+        LiftedFrame {
+            frame_id: poses.frame_id,
+            captured_camera_ns: poses.captured_camera_ns,
+            depth_found: depth.is_some(),
+            width: poses.width,
+            height: poses.height,
+            gravity_reaction: depth.and_then(|d| d.gravity_reaction),
+            people,
+        }
+    }
+
+    /// The tracks for one pose frame in the colour camera's frame. `depth` is None when its depth frame never arrived.
+    pub fn update(&mut self, poses: &PersonPoses, depth: Option<&DepthFrame>, calibration: Option<&CameraCalibration>) -> PeopleTracks {
+        let lifted = self.lift_frame(poses, depth, calibration);
+        self.track(lifted, Placement::Camera)
+    }
+
+    /// Follows a lifted frame's people, placed as `placement` says. Every frame given here must use the same kind of
+    /// placement as the frames before it.
+    pub fn track(&mut self, frame: LiftedFrame, placement: Placement) -> PeopleTracks {
+        let now_ns = frame.captured_camera_ns;
+        let camera_to_frame = match placement {
+            Placement::Camera => Affine3A::IDENTITY,
+            Placement::Odom(camera_to_odom) => camera_to_odom,
+        };
+        let place = |p: Vec3| camera_to_frame.transform_point3(p);
+        let camera_centre = place(Vec3::ZERO);
+        let lifted: Vec<PlacedPerson> = frame
+            .people
+            .into_iter()
+            .map(|p| {
+                let keypoints_3d: Vec<Option<Vec3>> = p.keypoints_3d.into_iter().map(|k| k.map(place)).collect();
+                let sightings = p
+                    .rays
+                    .iter()
+                    .zip(&keypoints_3d)
+                    .map(|(ray, surface)| {
+                        let direction = camera_to_frame.transform_vector3((*ray)?);
+                        Some(JointSighting { ray_origin: camera_centre, ray_direction: direction, surface: *surface })
+                    })
+                    .collect();
+                PlacedPerson { pose: p.pose, pose_track_id: p.pose_track_id, centre: p.centre.map(place), keypoints_3d, sightings }
+            })
+            .collect();
+        let seen: Vec<(TrackId, Option<Vec3>)> = lifted.iter().map(|p| (p.pose_track_id, p.centre)).collect();
         let person_ids = self.assign_people(&seen, now_ns);
         let mut tracks = Vec::new();
-        for ((person, pose_track_id, centre, keypoints_3d), track_id) in lifted.into_iter().zip(person_ids) {
+        for (placed, track_id) in lifted.into_iter().zip(person_ids) {
+            let PlacedPerson { pose: person, pose_track_id, centre, keypoints_3d, sightings } = placed;
+            let person = &person;
             let followed = self.followed.entry(track_id).or_insert_with(|| Followed {
                 pose_track_id,
                 frames_seen: 0,
                 last_seen_ns: now_ns,
                 filter: OneEuro::new(self.settings.smoothing),
                 filtered_at_ns: None,
+                skeleton: SkeletonFit::new(self.settings.skeleton),
                 last: PersonTrack {
                     track_id,
                     state: TrackState::Tentative,
@@ -193,6 +303,7 @@ impl PeopleTracker {
                     position: None,
                     velocity: None,
                     keypoints_3d: vec![],
+                    skeleton_3d: vec![],
                 },
             });
             followed.pose_track_id = pose_track_id;
@@ -208,6 +319,16 @@ impl PeopleTracker {
                 None => (None, None),
             };
             let state = if followed.frames_seen >= self.settings.confirm_after_frames { TrackState::Confirmed } else { TrackState::Tentative };
+            let skeleton_3d = match centre {
+                Some(centre) => {
+                    let started = std::time::Instant::now();
+                    let fitted = followed.skeleton.fit(now_ns, &sightings, f64::from(centre.distance(camera_centre)));
+                    self.fitting.0 += started.elapsed();
+                    self.fitting.1 += 1;
+                    fitted.into_iter().map(|p| p.map(point)).collect()
+                }
+                None => vec![None; person.keypoints.len()],
+            };
             let track = PersonTrack {
                 track_id,
                 state,
@@ -217,6 +338,7 @@ impl PeopleTracker {
                 position: position.or(followed.last.position),
                 velocity,
                 keypoints_3d: keypoints_3d.into_iter().map(|p| p.map(point)).collect(),
+                skeleton_3d,
             };
             followed.last = track.clone();
             tracks.push(track);
@@ -231,13 +353,17 @@ impl PeopleTracker {
             .collect();
         lost.sort_by_key(|track| track.track_id);
         tracks.extend(lost);
+        let (position_frame, gravity_reaction) = match placement {
+            Placement::Camera => (PositionFrame::Camera, frame.gravity_reaction),
+            Placement::Odom(_) => (PositionFrame::Odom, None),
+        };
         PeopleTracks {
-            frame_id: poses.frame_id,
+            frame_id: frame.frame_id,
             captured_camera_ns: now_ns,
-            width: poses.width,
-            height: poses.height,
-            position_frame: PositionFrame::Camera,
-            gravity_reaction: depth.and_then(|d| d.gravity_reaction),
+            width: frame.width,
+            height: frame.height,
+            position_frame,
+            gravity_reaction,
             tracks,
         }
     }
@@ -397,5 +523,29 @@ mod tests {
         tracker.update(&poses(0, vec![standing_person(Some(4), 32.0)]), Some(&depth), Some(&calibration()));
         let tracks = tracker.update(&poses(1, vec![standing_person(Some(4), 32.0), standing_person(Some(6), 32.0)]), Some(&depth), Some(&calibration()));
         assert_eq!(tracks.tracks.iter().map(|t| t.track_id).collect::<Vec<_>>(), vec![1, 2]);
+    }
+
+    #[test]
+    fn tracks_placed_in_odom_carry_the_odom_position_and_no_gravity() {
+        let depth_mm = wall(2500);
+        let depth = DepthFrame { image: DepthImage { width: 64, height: 48, depth_mm: &depth_mm }, gravity_reaction: Some([0.0, -9.8, 0.0]) };
+        let camera_to_odom = Affine3A::from_translation(Vec3::new(1.0, 2.0, 0.5));
+        let mut tracker = PeopleTracker::new(TrackSettings::default());
+        let lifted = tracker.lift_frame(&poses(0, vec![standing_person(Some(4), 32.0)]), Some(&depth), Some(&calibration()));
+        let tracks = tracker.track(lifted, Placement::Odom(camera_to_odom));
+        assert_eq!((tracks.position_frame, tracks.gravity_reaction), (PositionFrame::Odom, None));
+        // The torso's keypoints sit 5.5 px above the image centre: 0.275 m up at 2.5 m.
+        let position = tracks.tracks[0].position.unwrap();
+        assert!((position.x_m - 1.0).abs() < 1e-4 && (position.y_m - 1.725).abs() < 1e-4 && (position.z_m - 3.0).abs() < 1e-4, "{position:?}");
+        assert!((tracks.tracks[0].keypoints_3d[0].unwrap().z_m - 3.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn people_forgotten_after_an_odometry_restart_come_back_under_new_ids() {
+        let mut tracker = PeopleTracker::new(TrackSettings::default());
+        tracker.update(&poses(0, vec![standing_person(Some(4), 32.0)]), None, None);
+        tracker.forget_everyone();
+        let tracks = tracker.update(&poses(1, vec![standing_person(Some(4), 32.0)]), None, None);
+        assert_eq!(ids(&tracks), vec![(2, TrackState::Tentative)]);
     }
 }

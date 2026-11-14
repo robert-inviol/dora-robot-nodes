@@ -32,13 +32,20 @@ Camera machine (Pi with the D455 and a Hailo-8), `nodes/dora-realsense/examples/
 dora-realsense (the only node that opens the D455; every stamp on the camera clock)
  |- model_input ---------------> pose (YOLOv8 pose + hailotracker on the Hailo-8) -> person_poses -> people
  |- depth, imu, calibration ---> odometry (dora-depth-inertial-odometry) -> odom_pose -> people, link
- '- depth, calibration --------> people (dora-people-3d) -> people_tracks (odom frame) -> link
-link: listens on :7447, publishes rig/people_tracks and rig/odom_pose
+ |- depth, calibration --------> people (dora-people-3d) -> people_tracks (odom frame, with skeleton_3d) -> link
+ '- depth, imu, calibration, color (only the frames it names on request_color)
+                               -> keyframes (dora-keyframe-picker) -> keyframe, imu (one per keyframe) -> link
+link: listens on :7447, publishes rig/people_tracks, rig/odom_pose, rig/keyframe and rig/imu
 ```
 
-The older camera dataflow, `nodes/dora-realsense-keyframes/examples/camera-dataflow.yml`, opens the D455 itself and
-publishes `rig/keyframe` and `rig/imu` (depth aligned to 1280x720 colour, a keyframe at least once a second and
-sooner on a turn). The two cannot run at once: both open the camera and listen on :7447.
+Measured on the Pi 5 in a 75 s run with the camera at rest and one person in view (top over 5 s, % of one core):
+dora-realsense 40, Zenoh link 33, pose (python) 19, odometry 13, dora daemon 11, keyframe picker 6, dora-people-3d 5;
+about 1.3 of the Pi's 4 cores. Pose at 30 frames/s, every frame matched to its depth; odometry 30 poses/s, 299-300
+of every 300 corrected by the depth cloud; a keyframe a second (align 23 ms, JPEG 18 ms); the skeleton fit 0.66 ms
+per person per frame. The person kept one id for the whole run.
+
+`nodes/dora-realsense-keyframes` (its own camera-dataflow.yml, which opens the D455 itself) is superseded by the
+keyframe picker and can retire.
 
 GPU machine, `nodes/dora-depth-perception/examples/live-dataflow.yml`: SAM 3 segments, scene concepts and geometry
 from `rig/keyframe`; publishes `rig/segments`.
@@ -54,8 +61,8 @@ link: connects to the camera machine; subscribes rig/keyframe, rig/imu, rig/segm
  '- people_tracks -> spatial_agent (dora-world-agent: SQLite world store, MCP tools, spatial agents)
 ```
 
-So today a live run gives either people and odometry (pose-dataflow) or localization and mapping
-(camera-dataflow), never both, and `rig/odom_pose` has no subscriber on the server.
+The camera machine now publishes everything the server subscribes to, but the server does not yet subscribe to
+`rig/odom_pose` (Next, 1).
 
 ## People in the world store
 
@@ -92,8 +99,9 @@ the two. The library is `nodes/dora-depth-perception/depth-inertial-odometry`; i
 three local maps it can use and how they compare for accuracy and for speed on a Pi 5, and its limits. The node
 runs the voxel-plane map.
 
-- It has run on the simulator only: the library on simulated drives, the node on simulated camera messages. It has
-  not run in a dora dataflow or on a camera.
+- It has run live once, on the Pi in `pose-dataflow.yml` with the camera at rest on a bench for about 70 s: it
+  started 2 s after the calibration, kept pace at 30 poses/s, and crept about 1 cm in y over 30 s (position sigma
+  1-2 mm). It has not yet run on a moving camera.
 - The node publishes nothing until it has the camera's calibration and the robot has rested for 2 s. It stops,
   rather than guess, when a calibration changes, time goes back, the IMU is more than 10 ms behind a depth frame,
   or a silent stream leaves it holding more than 1 s of samples (see the node's README).
@@ -103,41 +111,34 @@ runs the voxel-plane map.
 
 ## Next
 
-In order; the first two are what it takes for people to reach the world store in a live run.
+In order; the first is what it takes for people to reach the world store in a live run.
 
-1. One camera dataflow (approved by robert, with robert-27). Keyframes and their imu messages come from a node fed
-   by dora-realsense's outputs inside `pose-dataflow.yml`, and its link also publishes `keyframe=rig/keyframe` and
-   `imu=rig/imu`. dora-realsense stays the only node that opens the camera; the server's subscriptions do not
-   change. This also puts keyframes and `odom_pose` on one camera clock from one camera session, which
-   `map_to_odom` needs. Each of these goes to robert as a proposal before it is built:
-   - reusing `rgbd-keyframes` (the picker and gravity estimate, which build without librealsense), and whether
-     dora-realsense-keyframes retires;
-   - aligning depth to colour from the calibration message's intrinsics and `depth_to_color`;
-   - colour through dora-realsense's `request_color` for the picked frame only, holding its depth until it arrives;
-   - one imu message per keyframe holding every sample since the previous keyframe, sent before it, keeping
-     dora-realsense's `frame_id` and camera time;
-   - `KEYFRAME_RECORD_PATH` and `IMU_RECORD_PATH` recordings for `dora-keyframe-replay`.
-2. Wire odometry on the server. The `odom_pose` input and `map_to_odom` output of the localizer are commented out in
+1. Wire odometry on the server. The `odom_pose` input and `map_to_odom` output of the localizer are commented out in
    `spatial-server-dataflow.yml`, as is the `map_to_odom` input of `spatial_agent`: subscribe
    `rig/odom_pose=odom_pose` on the link, add an `[odometry]` section to the localizer settings, and uncomment them.
+2. Run the camera dataflow and the server together and check people reach the world store.
 
 Also open:
 
-- dora-people-3d gains `skeleton_3d`: joints fitted to a skeleton with fixed bone lengths. Whether the world store
-  records joints from `skeleton_3d` instead of `keypoints_3d` is for robert to decide.
+- Whether the world store records joints from `skeleton_3d` instead of `keypoints_3d` is for robert to decide
+  (recommended: `skeleton_3d` when filled, no joints otherwise, never a mix).
 - `camera_in_imu_m` in the localizer's `[odometry]` settings is set by hand. It could be read from the camera's
   calibration message instead, if robert agrees.
+- The Zenoh link costs a third of a core on the Pi, more than the pose node; find out why.
+- The keyframe picker's alignment leaves out lens distortion.
 - A sighting's time is when the server received it, not when the camera captured it.
 - clippy warns on `room-map/src/grid.rs:85` (a loop that only indexes an array).
+- 3d-perception's uncommitted IMU calibration change to dora-realsense-keyframes sits in the main clone
+  (`~/src/dora-robot-nodes`, branch depth-perception); dora-realsense applies the same correction. Keep or discard
+  is robert's call.
 
 Odometry, in order:
 
-1. Run dora-depth-inertial-odometry on the Pi from the live D455 with the robot at rest, beside the camera and pose
-   nodes. This shows whether the node's dora message handling works, whether each imu message arrives within 10 ms
-   of its depth frame, what a frame costs, and whether the 1 s backlog and the queue sizes in its dataflow hold.
+1. Find the 1 cm per 30 s creep at rest seen on the Pi's first live run.
 2. Record a walk with every depth frame, the imu messages and the calibration, starting and ending at the same
    spot, and replay it through the odometry. The gap between the first and last pose is the first accuracy number
-   from a real camera. The same recording can feed map building.
+   from a real camera. The same recording can feed map building. No node records every depth frame yet; the
+   keyframe picker records only keyframes and their imu messages.
 3. Fix what the walk shows. Known before it starts:
    - height drifts when the floor is out of view; a measurement that holds the robot to the floor is not written,
      and whether to add one is for robert to decide;

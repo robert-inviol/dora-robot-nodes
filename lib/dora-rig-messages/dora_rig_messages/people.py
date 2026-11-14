@@ -59,6 +59,7 @@ PERSON_TRACK_TYPE = pa.struct(
         pa.field("position", POINT_TYPE),
         pa.field("velocity", VELOCITY_TYPE),
         _required("keypoints_3d", _list_of(POINT_TYPE, nullable_items=True)),
+        _required("skeleton_3d", _list_of(POINT_TYPE, nullable_items=True)),
     ]
 )
 
@@ -199,10 +200,15 @@ class PersonTrack:
     velocity: Velocity | None
     # In keypoint order; None where depth has no reading or the keypoint is not trusted.
     keypoints_3d: tuple[Point | None, ...]
+    # In keypoint order: the body joints (shoulders to ankles) the pose model saw this frame, fitted to a skeleton
+    # with the person's own bone lengths, so a joint depth missed or misread still has a place. None for the face
+    # and for joints not seen.
+    skeleton_3d: tuple[Point | None, ...]
 
     def __post_init__(self) -> None:
         _keypoints(self.keypoints)
         _keypoints(self.keypoints_3d)
+        _keypoints(self.skeleton_3d)
 
 
 @dataclass(frozen=True)
@@ -235,6 +241,7 @@ class PeopleTracks:
                         "position": optional(track.position),
                         "velocity": optional(track.velocity),
                         "keypoints_3d": [optional(point) for point in track.keypoints_3d],
+                        "skeleton_3d": [optional(point) for point in track.skeleton_3d],
                     }
                     for track in self.tracks
                 ],
@@ -266,6 +273,7 @@ class PeopleTracks:
                     position=point(track["position"]),
                     velocity=None if track["velocity"] is None else Velocity(**track["velocity"]),
                     keypoints_3d=tuple(point(p) for p in track["keypoints_3d"]),
+                    skeleton_3d=tuple(point(p) for p in track["skeleton_3d"]),
                 )
                 for track in row["tracks"]
             ),
@@ -300,10 +308,11 @@ FIXTURE_EXAMPLES: dict[str, PersonPoses | PeopleTracks] = {
                 position=Point(-0.25, 0.125, 2.5),
                 velocity=Velocity(0.5, 0.0, -0.25),
                 keypoints_3d=(Point(-0.25, -0.625, 2.5),) * 16 + (None,),
+                skeleton_3d=(None,) * 5 + (Point(-0.25, -0.5, 2.625),) * 12,
             ),
             PersonTrack(
                 TrackId(9), TrackState.LOST, 0.5, PixelBox(900.5, 200.25, 90.0, 300.0), _EXAMPLE_KEYPOINTS,
-                position=None, velocity=None, keypoints_3d=(None,) * 17,
+                position=None, velocity=None, keypoints_3d=(None,) * 17, skeleton_3d=(None,) * 17,
             ),
         ),
     ),
