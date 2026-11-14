@@ -76,6 +76,18 @@ fn send(node: &mut DoraNode, outputs: &Outputs, handled: Handled, started: Insta
         tracing::warn!(camera_ns = time.0, "odometry pose left out: the camera faces too near straight up or down to have a heading");
     }
     if let Some(estimate) = handled.estimate {
+        let (fitness, inlier_rmse_m) = estimate.registration.map_or((None, None), |r| (Some(r.fitness), Some(r.inlier_rmse_m)));
+        tracing::info!(
+            frame_id = estimate.frame_id.0,
+            tracking = estimate.tracking.wire_name(),
+            ?fitness,
+            ?inlier_rmse_m,
+            x_m = estimate.pose.translation.x,
+            y_m = estimate.pose.translation.y,
+            yaw_deg = estimate.pose.yaw_rad.to_degrees(),
+            submap = estimate.submap.len(),
+            "keyframe localised"
+        );
         let mut parameters = MetadataParameters::default();
         parameters.insert("localize_ms".to_owned(), Parameter::Float(started.elapsed().as_secs_f64() * 1e3));
         node.send_output(outputs.keyframe_pose.clone(), parameters, encode_keyframe_pose(&estimate.to_message()))?;
