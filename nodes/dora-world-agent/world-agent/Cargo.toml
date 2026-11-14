@@ -1,0 +1,45 @@
+[package]
+name = "world-agent"
+version = "0.1.0"
+description = "Spatial question answering with Claude Code over stream-json: fan-out, reconciliation, goals and room names"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+readme = "README.md"
+default-run = "world-agent"
+
+[[bin]]
+name = "world-agent"
+path = "src/main.rs"
+
+# A stand-in for the claude CLI that speaks the stream-json protocol and calls the MCP tools, for the tests.
+[[bin]]
+name = "fake-claude"
+path = "testing/fake_claude.rs"
+test = false
+doc = false
+
+[dependencies]
+perception-wire = { path = "../../dora-depth-perception/perception-wire" }
+world-model = { path = "../world-model" }
+thiserror.workspace = true
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+base64 = "0.22"
+http = "1"
+nix = { version = "0.30", features = ["signal"] }
+png = "0.17"
+rand = "0.9"
+rmcp = { version = "=3.10.0", features = ["server", "macros", "transport-streamable-http-server"] }
+schemars = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "io-std", "sync", "time", "net"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+toml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"

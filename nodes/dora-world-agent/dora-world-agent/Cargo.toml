@@ -1,0 +1,31 @@
+[package]
+name = "dora-world-agent"
+version = "0.1.0"
+description = "dora node that answers space questions from the world store with several Claude Code models and sends their nav goals"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+readme = "README.md"
+default-run = "dora-world-agent"
+
+# The fake-claude of world-agent, built here too so the node's tests can drive it.
+[[bin]]
+name = "node-fake-claude"
+path = "../world-agent/testing/fake_claude.rs"
+test = false
+doc = false
+
+[dependencies]
+perception-wire = { path = "../../dora-depth-perception/perception-wire" }
+world-agent = { path = "../world-agent" }
+world-store = { path = "../world-store" }
+serde_json = "1"
+dora-node-api.workspace = true
+eyre.workspace = true
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+glam = "0.29"
+tempfile = "3"
