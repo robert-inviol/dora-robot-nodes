@@ -6,7 +6,7 @@
 use std::fs::File;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use dora_keyframe_picker::picking::KeyframeAssembler;
+use dora_keyframe_picker::picking::{KeyframeAssembler, Picked};
 use dora_node_api::arrow::array::{Array, AsArray, RecordBatch, StructArray, UInt64Array};
 use dora_node_api::arrow::datatypes::{Schema, UInt16Type, UInt8Type};
 use dora_node_api::arrow::ipc::writer::FileWriter;
@@ -86,6 +86,26 @@ fn encode_jpeg(rgb: &[u8], width: u16, height: u16) -> Result<Vec<u8>> {
     Ok(jpeg)
 }
 
+/// Sends a picked frame's imu message, then its keyframe, recording each when asked to.
+fn send_picked(node: &mut DoraNode, picked: Picked, imu_recorder: &mut Option<Recorder>, keyframe_recorder: &mut Option<Recorder>) -> Result<()> {
+    let output = |name: &str| DataId::from(name.to_owned());
+    // The imu message goes first, so a consumer has the samples before the keyframe they lead up to.
+    let imu_message = encode_imu(&picked.imu);
+    if let Some(recorder) = imu_recorder.as_mut() {
+        recorder.write(&imu_message)?;
+    }
+    let mut imu_parameters = MetadataParameters::default();
+    imu_parameters.insert("accel_samples".to_owned(), Parameter::Integer(picked.imu.accel_camera_ns.len() as i64));
+    imu_parameters.insert("gyro_samples".to_owned(), Parameter::Integer(picked.imu.gyro_camera_ns.len() as i64));
+    node.send_output(output(IMU_OUTPUT), imu_parameters, imu_message)?;
+    let keyframe_message = encode_keyframe(&picked.keyframe);
+    if let Some(recorder) = keyframe_recorder.as_mut() {
+        recorder.write(&keyframe_message)?;
+    }
+    node.send_output(output(KEYFRAME_OUTPUT), MetadataParameters::default(), keyframe_message)?;
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let (mut node, mut events) = DoraNode::init_from_env()?;
     let mut assembler = KeyframeAssembler::new(KeyframeSettings::default());
@@ -97,7 +117,14 @@ fn main() -> Result<()> {
         match event {
             Event::Input { id, metadata, data } => match id.as_str() {
                 CALIBRATION_INPUT => calibration = Some(decode_camera_calibration(data.as_ref()).wrap_err("reading the calibration")?),
-                IMU_INPUT => assembler.add_imu(&decode_imu(data.as_ref()).wrap_err("reading an imu message")?),
+                IMU_INPUT => {
+                    assembler.add_imu(&decode_imu(data.as_ref()).wrap_err("reading an imu message")?);
+                    if let Some(calibration) = calibration.as_ref() {
+                        for picked in assembler.take_ready(calibration) {
+                            send_picked(&mut node, picked, &mut imu_recorder, &mut keyframe_recorder)?;
+                        }
+                    }
+                }
                 DEPTH_INPUT => {
                     let parameters = &metadata.parameters;
                     let frame_id = integer(parameters, DEPTH_INPUT, "frame_id")? as u64;
@@ -120,30 +147,11 @@ fn main() -> Result<()> {
                     let rgb = data.as_primitive_opt::<UInt8Type>().ok_or_else(|| eyre!("colour is {:?}, not u8", data.data_type()))?;
                     let started = Instant::now();
                     let jpeg = encode_jpeg(rgb.values(), width as u16, height as u16)?;
-                    let jpeg_ms = started.elapsed().as_secs_f64() * 1e3;
-                    let started = Instant::now();
-                    let picked = assembler.complete(frame_id, jpeg, calibration).expect("waiting for this frame");
-                    let align_ms = started.elapsed().as_secs_f64() * 1e3;
-
-                    // The imu message goes first, so a consumer has the samples before the keyframe they lead up to.
-                    let imu_message = encode_imu(&picked.imu);
-                    if let Some(recorder) = imu_recorder.as_mut() {
-                        recorder.write(&imu_message)?;
+                    eprintln!("[keyframes] keyframe {frame_id}: jpeg {:.1} ms", started.elapsed().as_secs_f64() * 1e3);
+                    assembler.add_color(frame_id, jpeg);
+                    for picked in assembler.take_ready(calibration) {
+                        send_picked(&mut node, picked, &mut imu_recorder, &mut keyframe_recorder)?;
                     }
-                    let mut imu_parameters = MetadataParameters::default();
-                    imu_parameters.insert("accel_samples".to_owned(), Parameter::Integer(picked.imu.accel_camera_ns.len() as i64));
-                    imu_parameters.insert("gyro_samples".to_owned(), Parameter::Integer(picked.imu.gyro_camera_ns.len() as i64));
-                    node.send_output(output(IMU_OUTPUT), imu_parameters, imu_message)?;
-
-                    let keyframe_message = encode_keyframe(&picked.keyframe);
-                    if let Some(recorder) = keyframe_recorder.as_mut() {
-                        recorder.write(&keyframe_message)?;
-                    }
-                    let mut keyframe_parameters = MetadataParameters::default();
-                    keyframe_parameters.insert("align_ms".to_owned(), Parameter::Float(align_ms));
-                    keyframe_parameters.insert("jpeg_ms".to_owned(), Parameter::Float(jpeg_ms));
-                    node.send_output(output(KEYFRAME_OUTPUT), keyframe_parameters, keyframe_message)?;
-                    eprintln!("[keyframes] keyframe {frame_id}: align {align_ms:.1} ms, jpeg {jpeg_ms:.1} ms");
                 }
                 other => bail!("unexpected input {other}"),
             },

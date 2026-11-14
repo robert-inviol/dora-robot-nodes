@@ -1,5 +1,9 @@
 //! Picking keyframes from a stream of camera frames: which depth frames become keyframes, what is held while their
 //! colour is fetched, and which IMU samples each keyframe carries.
+//!
+//! A keyframe's imu message carries every sample since the previous keyframe's, up to and including the first gyro
+//! sample at or after the keyframe's time, so the gyro covers the keyframe's whole span. That sample usually arrives
+//! with the next frame's imu message, so a keyframe goes out once its colour and that sample have both arrived.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -12,12 +16,13 @@ use rgbd_keyframes::{KeyframePicker, KeyframeSettings};
 
 use crate::align::align_depth_to_color;
 
-/// A picked depth frame waiting for its colour.
+/// A picked depth frame waiting for its colour and for the gyro to pass its time.
 struct Held {
     camera_ns: i64,
     captured_unix_ns: i64,
     gravity_reaction: Vec3,
     depth_mm: Vec<u16>,
+    color_jpeg: Option<Vec<u8>>,
 }
 
 /// One picked frame, ready to send: its imu message goes out before the keyframe.
@@ -71,33 +76,53 @@ impl KeyframeAssembler {
         if !self.picker.take(Duration::from_nanos((camera_ns - first).max(0) as u64)) {
             return false;
         }
-        self.held.insert(frame_id, Held { camera_ns, captured_unix_ns, gravity_reaction, depth_mm: depth_mm.to_vec() });
+        self.held.insert(frame_id, Held { camera_ns, captured_unix_ns, gravity_reaction, depth_mm: depth_mm.to_vec(), color_jpeg: None });
         true
     }
 
     /// Whether `frame_id` is picked and waiting for its colour.
     pub fn is_waiting_for(&self, frame_id: u64) -> bool {
-        self.held.contains_key(&frame_id)
+        self.held.get(&frame_id).is_some_and(|held| held.color_jpeg.is_none())
     }
 
-    /// Completes a picked frame with its colour image, encoded as `color_jpeg`.
-    pub fn complete(&mut self, frame_id: u64, color_jpeg: Vec<u8>, calibration: &CameraCalibration) -> Option<Picked> {
-        let held = self.held.remove(&frame_id)?;
-        let (accel_camera_ns, accel_m_s2) = take_until(&mut self.samples.accel, held.camera_ns);
-        let (gyro_camera_ns, gyro_rad_s) = take_until(&mut self.samples.gyro, held.camera_ns);
-        let imu = Imu { frame_id, keyframe_camera_ns: held.camera_ns, accel_camera_ns, accel_m_s2, gyro_camera_ns, gyro_rad_s };
-        let color = calibration.color;
-        let keyframe = Keyframe {
-            frame_id,
-            captured_unix_ns: held.captured_unix_ns,
-            width: color.width as usize,
-            height: color.height as usize,
-            intrinsics: CameraIntrinsics { fx: color.fx, fy: color.fy, ppx: color.ppx, ppy: color.ppy },
-            gravity_reaction: held.gravity_reaction,
-            depth_mm: align_depth_to_color(&held.depth_mm, calibration).into(),
-            color_jpeg,
-        };
-        Some(Picked { imu, keyframe })
+    /// Gives a picked frame its colour image, encoded as `color_jpeg`. Returns false for a frame not waiting for one.
+    pub fn add_color(&mut self, frame_id: u64, color_jpeg: Vec<u8>) -> bool {
+        match self.held.get_mut(&frame_id) {
+            Some(held) if held.color_jpeg.is_none() => {
+                held.color_jpeg = Some(color_jpeg);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The picked frames now complete, oldest first: each has its colour, and the gyro has reached its time.
+    pub fn take_ready(&mut self, calibration: &CameraCalibration) -> Vec<Picked> {
+        let mut ready = Vec::new();
+        while let Some(entry) = self.held.first_entry() {
+            let held = entry.get();
+            let Some(&(covered_to_ns, _)) = self.samples.gyro.iter().find(|(t, _)| *t >= held.camera_ns) else { break };
+            if held.color_jpeg.is_none() {
+                break;
+            }
+            let (frame_id, held) = entry.remove_entry();
+            let (accel_camera_ns, accel_m_s2) = take_until(&mut self.samples.accel, covered_to_ns);
+            let (gyro_camera_ns, gyro_rad_s) = take_until(&mut self.samples.gyro, covered_to_ns);
+            let imu = Imu { frame_id, keyframe_camera_ns: held.camera_ns, accel_camera_ns, accel_m_s2, gyro_camera_ns, gyro_rad_s };
+            let color = calibration.color;
+            let keyframe = Keyframe {
+                frame_id,
+                captured_unix_ns: held.captured_unix_ns,
+                width: color.width as usize,
+                height: color.height as usize,
+                intrinsics: CameraIntrinsics { fx: color.fx, fy: color.fy, ppx: color.ppx, ppy: color.ppy },
+                gravity_reaction: held.gravity_reaction,
+                depth_mm: align_depth_to_color(&held.depth_mm, calibration).into(),
+                color_jpeg: held.color_jpeg.expect("checked above"),
+            };
+            ready.push(Picked { imu, keyframe });
+        }
+        ready
     }
 }
 
@@ -164,10 +189,12 @@ mod tests {
     fn each_keyframe_carries_every_sample_since_the_last_one_and_none_after_it() {
         let mut assembler = KeyframeAssembler::new(KeyframeSettings::default());
         assert_eq!(run(&mut assembler, 0..32, 0.0), vec![0, 31]);
-        let first = assembler.complete(0, vec![1], &calibration()).unwrap();
+        assert!(assembler.add_color(0, vec![1]) && assembler.add_color(31, vec![2]));
+        let mut picked = assembler.take_ready(&calibration()).into_iter();
+        let first = picked.next().unwrap();
         assert_eq!((first.imu.frame_id, first.imu.keyframe_camera_ns), (0, 0));
         assert_eq!(first.imu.gyro_camera_ns, vec![-FRAME_NS / 2, 0]);
-        let second = assembler.complete(31, vec![2], &calibration()).unwrap();
+        let second = picked.next().unwrap();
         assert_eq!(second.imu.gyro_camera_ns.len(), 62);
         assert_eq!(second.imu.accel_camera_ns.len(), 31);
         assert_eq!(*second.imu.gyro_camera_ns.last().unwrap(), 31 * FRAME_NS);
@@ -179,6 +206,23 @@ mod tests {
     fn colour_for_a_frame_not_picked_completes_nothing() {
         let mut assembler = KeyframeAssembler::new(KeyframeSettings::default());
         run(&mut assembler, 0..3, 0.0);
-        assert!(assembler.complete(1, vec![], &calibration()).is_none());
+        assert!(!assembler.add_color(1, vec![]));
+    }
+
+    #[test]
+    fn a_keyframe_waits_for_the_gyro_to_pass_its_time_and_carries_that_sample() {
+        // The camera's gyro runs a little behind its depth frames: each frame's imu message ends 2 ms before it.
+        let late = |frame: u64| {
+            let end = frame as i64 * FRAME_NS;
+            Imu { frame_id: frame, keyframe_camera_ns: end, gyro_camera_ns: vec![end - 2_000_000], gyro_rad_s: vec![Vec3::ZERO], ..Imu::default() }
+        };
+        let mut assembler = KeyframeAssembler::new(KeyframeSettings::default());
+        assembler.add_imu(&late(0));
+        assert!(assembler.add_depth(0, 0, 0, Some(Vec3::new(0.0, -9.8, 0.0)), &[1000; 12]));
+        assert!(assembler.add_color(0, vec![1]));
+        assert!(assembler.take_ready(&calibration()).is_empty(), "the gyro has not reached the keyframe yet");
+        assembler.add_imu(&late(1));
+        let picked = assembler.take_ready(&calibration());
+        assert_eq!(picked[0].imu.gyro_camera_ns, vec![-2_000_000, FRAME_NS - 2_000_000]);
     }
 }

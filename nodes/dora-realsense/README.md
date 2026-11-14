@@ -36,7 +36,9 @@ read them. `frame_id` counts frames from 0 and is the same across every output o
 `dora-keyframe-picker`, in this workspace, picks keyframes from this node's frames without librealsense. It follows
 `imu` and `depth`, picks a frame at least once a second and sooner when the camera turns 10 degrees (never closer
 than 200 ms), and asks for that frame's colour on `request_color`. It then sends the `imu` and `keyframe` messages of
-`dora-rig-messages`: an `imu` message with every sample since the previous keyframe, then the keyframe. The keyframe
+`dora-rig-messages`: an `imu` message with every sample since the previous keyframe, up to and including the first
+gyro sample at or after the keyframe's time (so the gyro covers its whole span; that sample comes with the next
+frame's imu, about 33 ms later), then the keyframe. The keyframe
 holds depth redrawn onto the colour image from the calibration (each depth pixel painted over the colour pixels it
 covers, nearest wins, lens distortion not modelled), the colour as JPEG, and the camera's gravity estimate. Frames are
 not picked until the camera has a gravity estimate. Keyframe and imu `frame_id`s are this node's frame ids, so they

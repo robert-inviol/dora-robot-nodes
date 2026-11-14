@@ -119,8 +119,11 @@ runs the voxel-plane map.
 
 ## Next
 
-1. Run the camera dataflow on the Pi and the spatial server on strixen together, and check that people reach the
-   world store with their joints.
+People reach the world store in a live run: the Pi's `pose-dataflow.yml` with the server's
+`spatial-server-dataflow.yml` on strixen (`ZENOH_CONNECT` set to the Pi, a token file in the agent's settings)
+recorded 3 tracks, 74 torso poses and 615 fitted joints in about 90 s with the camera at rest.
+
+1. The localizer flips between tracking and lost every few seconds with the camera still on a bench; find out why.
 
 Also open:
 
