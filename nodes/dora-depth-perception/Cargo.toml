@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["depth-perception", "perception-wire", "dora-depth-perception", "dora-keyframe-replay", "room-map"]
+members = ["depth-perception", "perception-wire", "dora-depth-perception", "dora-keyframe-replay", "room-map", "map-localizer", "dora-map-localizer"]
 
 [workspace.package]
 edition = "2021"

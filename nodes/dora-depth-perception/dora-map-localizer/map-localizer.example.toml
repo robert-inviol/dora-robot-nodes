@@ -1,0 +1,60 @@
+# Settings for dora-map-localizer, named by MAP_LOCALIZER_CONFIG. Every key is optional; these are the defaults.
+
+[cloud]
+# Every this-many-th depth pixel each way is back-projected, then thinned to one point per voxel.
+stride_px = 4
+voxel_m = 0.05
+
+[submap]
+# Each keyframe registers against the map: the map keyframes within radius_m of its seed, however long ago
+# they were seen, at most max_keyframes of them, nearest first, each at its current optimised pose.
+radius_m = 4.0
+max_keyframes = 12
+
+[tracking]
+# Share of points within the inlier distance of the map at which a registration is accepted.
+accept_fitness = 0.25
+max_step_m = 0.8
+# How strongly registration is held to the gyro's heading.
+gyro_yaw_weight = 2000.0
+max_gyro_disagreement_deg = 5.0
+# A keyframe with fewer points is not registered.
+min_points = 500
+
+[loops]
+# Keyframes older than skip_latest_keyframes within radius_m of a tracked keyframe are matched against it.
+skip_latest_keyframes = 30
+radius_m = 2.5
+attempt_every_keyframes = 3
+min_fitness = 0.4
+max_rmse_m = 0.03
+max_correction_m = 1.0
+max_correction_deg = 20.0
+
+[relocalise]
+radius_m = 3.0
+min_fitness = 0.35
+# After this many lost keyframes in a row, one with enough points restarts tracking where dead reckoning puts it.
+restart_after_lost = 3
+
+[graph]
+optimise_interval_s = 1.0
+# An optimisation moving any past keyframe further than either starts a new map version.
+version_move_m = 0.05
+version_turn_deg = 1.0
+
+[gyro]
+# IMU samples are kept this long; it bounds the gap between keyframes whose turn the gyro can give.
+buffer_s = 60.0
+# The gyro gives no turn until it has seen this much still time in all, to measure its bias.
+min_still_s = 1.0
+# A keyframe whose turn the gyro cannot give (bias not measured yet, a gap in the samples):
+#   "refuse": the keyframe is reported lost, logged at error level; the heading stays unknown until a later
+#             keyframe relocalises against the map.
+#   "search": every heading is searched for, logged at warn level for each such keyframe. For recordings
+#             without a usable IMU.
+heading_without_gyro = "refuse"
+# "present": the dataflow wires the imu input, and a keyframe waits for the imu message that carries its camera time.
+# "absent": no imu input (a recording made without an IMU); keyframes are timed by their capture time. Needs
+#           heading_without_gyro = "search".
+imu = "present"
