@@ -1,0 +1,19 @@
+[package]
+name = "dora-dense-map"
+version = "0.1.0"
+description = "dora node that fuses depth into the dense map and publishes free space, topology and keep-out zones"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+dense-map = { path = "../dense-map" }
+perception-wire = { path = "../perception-wire" }
+dora-node-api.workspace = true
+eyre.workspace = true
+toml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+glam = "0.29"

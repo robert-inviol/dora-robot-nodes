@@ -1,0 +1,46 @@
+# The dense map on its own, fed over Zenoh: keyframes from the camera machine, keyframe poses from the localizer and
+# object updates from the object map. Free space, topology and keep-out zones go back out on rig/*.
+# Paths are relative to this file. Build with `cargo build --release` in nodes/dora-depth-perception first.
+# ZENOH_CONNECT is the address of the machine whose Zenoh router the others publish to.
+nodes:
+  - id: link
+    path: ../../dora-zenoh-bridge/target/release/dora-zenoh-bridge
+    env:
+      ZENOH_CONNECT: tcp/192.0.2.10:7447
+      ZENOH_SUBSCRIBE: rig/keyframe=keyframe,rig/keyframe_pose=keyframe_pose,rig/object_update=object_update
+      ZENOH_PUBLISH: free_space=rig/free_space,topology=rig/topology,keep_out=rig/keep_out
+    inputs:
+      tick: dora/timer/millis/5
+      free_space: dense_map/free_space
+      topology: dense_map/topology
+      keep_out: dense_map/keep_out
+    outputs:
+      - keyframe
+      - keyframe_pose
+      - object_update
+
+  - id: dense_map
+    path: ../target/release/dora-dense-map
+    env:
+      # Optional: a TOML file of settings (see dense-map-settings.toml); without it the defaults apply.
+      DENSE_MAP_SETTINGS: dense-map-settings.toml
+      # Rebuilds and missing floor are logged at info; debug adds each integration and slice time.
+      RUST_LOG: info
+    inputs:
+      # The localizer poses only some keyframes, seconds later; keyframes wait here for their pose, so these
+      # queues must not drop them first.
+      keyframe:
+        source: link/keyframe
+        queue_size: 32
+      keyframe_pose:
+        source: link/keyframe_pose
+        queue_size: 32
+      object_update:
+        source: link/object_update
+        queue_size: 64
+      # Lands background rebuilds and sends free space at most once a second (free_space.period_s).
+      tick: dora/timer/millis/250
+    outputs:
+      - free_space
+      - topology
+      - keep_out
