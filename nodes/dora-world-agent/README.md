@@ -17,6 +17,8 @@ seen in them.
 | `free_space` | The clearance grid (space_map), for clearances between places |
 | `object_update` | An object appeared, updated, moved, disappeared or merged (objects) |
 | `keyframe_pose` | The robot's map pose (localization); a pose taken while the localizer is lost is not recorded, so the robot pose goes stale in the digest |
+| `map_to_odom` | The localizer's correction from odometry to the map (localization), which places people tracks |
+| `people_tracks` | The people tracker's confirmed people with their 17 joints (people). Only odometry-frame tracks are placed, once a `map_to_odom` has arrived; a person is recorded at most every 0.25 s, timed by when the frame arrived. Camera-frame tracks are not placed, so people tracking goes stale in the digest |
 
 | Output | What it carries |
 |---|---|
@@ -42,6 +44,8 @@ input that does not decode stops the node.
     free_space: dense_map/free_space
     object_update: objects/object_update
     keyframe_pose: localizer/keyframe_pose
+    map_to_odom: localizer/map_to_odom
+    people_tracks: people/people_tracks
   outputs:
     - space_answer
     - nav_goal

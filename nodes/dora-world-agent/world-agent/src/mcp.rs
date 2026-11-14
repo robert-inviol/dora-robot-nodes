@@ -502,7 +502,7 @@ impl<W: WorldModel, G: GoalSink> WorldTools<W, G> {
         answer(self.context.route(params).await)
     }
 
-    #[tool(description = "Where and when a people track or an object was last seen, with the heading and the doorways ahead for a person.")]
+    #[tool(description = "Where and when a people track or an object was last seen. For a person: the heading, the doorways ahead, and each of their 17 joints (nose, eyes, ears, shoulders, elbows, wrists, hips, knees, ankles) that depth placed, with its map position and height above the floor.")]
     async fn last_seen(&self, Extension(parts): Extension<http::request::Parts>, Parameters(params): Parameters<LastSeenParams>) -> Result<CallToolResult, ErrorData> {
         caller(&parts)?;
         answer(self.context.last_seen(params).await)

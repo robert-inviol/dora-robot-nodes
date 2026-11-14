@@ -59,6 +59,13 @@ fn send(node: &mut DoraNode, outputs: &Outputs, handled: Handled, started: Insta
     for unjoined in &handled.unjoined {
         tracing::warn!(frame_id = unjoined.frame_id.0, problem = %unjoined.problem, "keyframe left out of map_to_odom: no odometry at its camera time");
     }
+    if let Some(restart) = handled.odometry_restarted {
+        tracing::warn!(
+            previous_start_camera_ns = restart.previous_start.0,
+            start_camera_ns = restart.start.0,
+            "odometry started again in a new odom frame; map_to_odom waits for a keyframe in it"
+        );
+    }
     if let Some(time) = handled.headingless_odometry {
         tracing::warn!(camera_ns = time.0, "odometry pose left out: the camera faces too near straight up or down to have a heading");
     }

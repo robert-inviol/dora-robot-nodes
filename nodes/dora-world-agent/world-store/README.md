@@ -29,6 +29,13 @@ footprints and heights whenever an object appears, updates or moves. Every appea
 sent, goal status and room rename is appended to `event`. Map coordinates are stored as received: a later map
 correction does not rewrite stored objects.
 
+People are recorded by `WorldWriter::record_people`, one call per people tracks frame, already placed in the map: a
+row in `track_pose` for the torso centre and one in `track_joint` for each joint placed, at most once per person per
+`TrackBounds::record_every` (250 ms by default). A person heads where they walk at 0.2 m/s or more, otherwise where
+their shoulders (or failing those their hips) face; with neither, the heading is NULL. A person is live for
+`TrackBounds::live` after their last recorded sighting, and stays in the snapshot for `forget`. `last_seen` for a
+person gives every joint of that sighting with its height above the floor of the room it is in.
+
 Rooms are named by `WorldWriter::name_room`; until then a room goes by `room<N>`. The snapshot gives each room its id
 and its centroid: the centroid of its floor polygon, or the mean position of its objects for objects in a room the
 current topology no longer has. Objects with no room polygon to

@@ -2,4 +2,5 @@
 //! the node feeds from its inputs.
 
 pub mod node;
+pub mod people;
 pub mod world;

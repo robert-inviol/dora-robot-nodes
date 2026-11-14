@@ -1,10 +1,10 @@
-//! What the store is told, in domain types: object updates, the map's topology and free space, robot poses, goals
-//! and room names. All positions are in the map frame, metres.
+//! What the store is told, in domain types: object updates, the map's topology and free space, robot poses, people,
+//! goals and room names. All positions are in the map frame, metres.
 
 use std::fmt;
 
-use perception_wire::navigation::{MapPose, MapVersion, NavGoal, ObjectId, PlaceId, UnixNanos};
-use world_model::{Point, RoomName, Size};
+use perception_wire::navigation::{MapPose, MapVersion, NavGoal, ObjectId, PlaceId, TrackId, UnixNanos};
+use world_model::{Joint, Point, RoomName, Size};
 
 pub use perception_wire::localization::FrameId;
 pub use perception_wire::space_map::{DoorwayId, RoomId};
@@ -257,6 +257,41 @@ pub struct RobotPoseSample {
     pub pose: MapPose,
 }
 
+/// How fast something moves across the floor, in the map frame.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FloorVelocity {
+    pub vx_m_s: f32,
+    pub vy_m_s: f32,
+}
+
+impl FloorVelocity {
+    pub fn speed_m_s(self) -> f32 {
+        self.vx_m_s.hypot(self.vy_m_s)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct JointPlacement {
+    pub joint: Joint,
+    pub position: Position3,
+}
+
+/// A person the people tracker has confirmed, as seen in one camera frame and placed in the map.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PersonSighting {
+    pub track: TrackId,
+    /// When the store received the frame: people tracks are timed on the camera's clock, which the server does not
+    /// share.
+    pub seen: UnixNanos,
+    pub map_version: MapVersion,
+    /// The torso centre.
+    pub torso: Position3,
+    /// Absent until the tracker has measured it.
+    pub velocity: Option<FloorVelocity>,
+    /// Each joint depth placed, at most once each.
+    pub joints: Vec<JointPlacement>,
+}
+
 /// The agent slot that sent a goal.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentName(pub String);
@@ -289,10 +324,12 @@ pub enum InputSource {
     Objects,
     Topology,
     FreeSpace,
+    People,
 }
 
 impl InputSource {
-    pub const ALL: [InputSource; 4] = [InputSource::RobotPose, InputSource::Objects, InputSource::Topology, InputSource::FreeSpace];
+    pub const ALL: [InputSource; 5] =
+        [InputSource::RobotPose, InputSource::Objects, InputSource::Topology, InputSource::FreeSpace, InputSource::People];
 
     pub fn name(self) -> &'static str {
         match self {
@@ -300,6 +337,7 @@ impl InputSource {
             InputSource::Objects => "object map",
             InputSource::Topology => "topology",
             InputSource::FreeSpace => "free space",
+            InputSource::People => "people tracking",
         }
     }
 }

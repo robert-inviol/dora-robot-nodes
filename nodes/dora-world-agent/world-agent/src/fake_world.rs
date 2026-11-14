@@ -10,8 +10,8 @@ use perception_wire::navigation::{GoalTarget, LookTarget, MapPose, MapVersion, O
 use crate::clock;
 use crate::room_names::{RoomNameSink, RoomNameSinkError};
 use crate::world::{
-    Change, ChangeKind, Clearance, Doorway, EntityRef, FindQuery, FoundObject, Landmark, ObjectDescription,
-    ObjectSummary, PersonTrack, Placement, PlaceSummary, Point, PngImage, ReadOnlySql, Relation, RobotState,
+    Change, ChangeKind, Clearance, Doorway, EntityRef, FindQuery, FoundObject, Joint, JointPosition, Landmark,
+    ObjectDescription, ObjectSummary, PersonTrack, Placement, PlaceSummary, Point, PngImage, ReadOnlySql, Relation, RobotState,
     RoomName, RoomSummary, Route, Sighting, Size, SqlRows, Stamp, TrackLiveness, ViewKind, ViewRequest, WorldError,
     WorldModel, WorldSnapshot,
 };
@@ -177,7 +177,7 @@ impl FakeWorld {
                 id: TrackId(7),
                 room: room("living_room"),
                 position: point(8.1, 2.0),
-                heading_deg: 180.0,
+                heading_deg: Some(180.0),
                 speed_m_s: 0.6,
                 last_seen: ago(0),
                 liveness: TrackLiveness::Live,
@@ -186,7 +186,7 @@ impl FakeWorld {
                 id: TrackId(3),
                 room: room("hallway"),
                 position: point(5.0, 4.2),
-                heading_deg: 90.0,
+                heading_deg: Some(90.0),
                 speed_m_s: 0.8,
                 last_seen: ago(120),
                 liveness: TrackLiveness::Lost,
@@ -553,7 +553,7 @@ impl WorldModel for FakeWorld {
         match subject {
             EntityRef::Track(id) => {
                 let track = self.track(id)?;
-                let heading = track.heading_deg.to_radians();
+                let heading = track.heading_deg.expect("every person in the house has a heading").to_radians();
                 let (hx, hy) = (heading.cos(), heading.sin());
                 let mut ahead: Vec<&Place> = self
                     .places
@@ -568,8 +568,9 @@ impl WorldModel for FakeWorld {
                     position: track.position,
                     at: track.last_seen,
                     seconds_ago: clock::seconds_between(track.last_seen, self.now),
-                    heading_deg: Some(track.heading_deg),
+                    heading_deg: track.heading_deg,
                     exits_ahead: ahead.iter().map(|p| format!("{} ({})", p.id, p.name)).collect(),
+                    joints: if id == TrackId(7) { standing_skeleton(track.position) } else { Vec::new() },
                 })
             }
             EntityRef::Object(id) => {
@@ -582,6 +583,7 @@ impl WorldModel for FakeWorld {
                     seconds_ago: clock::seconds_between(summary.last_seen, self.now),
                     heading_deg: None,
                     exits_ahead: Vec::new(),
+                    joints: Vec::new(),
                 })
             }
             EntityRef::Robot | EntityRef::Place(_) => Err(WorldError::Unsupported("say when the robot or a place was last seen")),
@@ -635,6 +637,32 @@ fn landmark_ref(landmark: Landmark) -> EntityRef {
         Landmark::Object(id) => EntityRef::Object(id),
         Landmark::Place(id) => EntityRef::Place(id),
     }
+}
+
+/// A person standing facing -x at `at`, as joints with heights above the floor.
+fn standing_skeleton(at: Point) -> Vec<JointPosition> {
+    let joint = |joint: Joint, forward_m: f32, left_m: f32, height_m: f32| JointPosition {
+        joint,
+        position: Point { x_m: at.x_m - forward_m, y_m: at.y_m - left_m },
+        height_above_floor_m: Some(height_m),
+    };
+    vec![
+        joint(Joint::Nose, 0.1, 0.0, 1.62),
+        joint(Joint::LeftEye, 0.08, 0.03, 1.66),
+        joint(Joint::RightEye, 0.08, -0.03, 1.66),
+        joint(Joint::LeftShoulder, 0.0, 0.2, 1.42),
+        joint(Joint::RightShoulder, 0.0, -0.2, 1.42),
+        joint(Joint::LeftElbow, 0.0, 0.24, 1.12),
+        joint(Joint::RightElbow, 0.0, -0.24, 1.12),
+        joint(Joint::LeftWrist, 0.05, 0.25, 0.85),
+        joint(Joint::RightWrist, 0.05, -0.25, 0.85),
+        joint(Joint::LeftHip, 0.0, 0.15, 0.95),
+        joint(Joint::RightHip, 0.0, -0.15, 0.95),
+        joint(Joint::LeftKnee, 0.02, 0.15, 0.5),
+        joint(Joint::RightKnee, 0.02, -0.15, 0.5),
+        joint(Joint::LeftAnkle, 0.0, 0.15, 0.08),
+        joint(Joint::RightAnkle, 0.0, -0.15, 0.08),
+    ]
 }
 
 #[cfg(test)]

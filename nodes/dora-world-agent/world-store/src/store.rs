@@ -13,7 +13,8 @@ use perception_wire::navigation::{GoalTarget, LookTarget, MapPose, MapVersion, O
 use rusqlite::{params, params_from_iter, Connection, OpenFlags, OptionalExtension, Row};
 use world_model::clock::seconds_between;
 use world_model::{
-    Change, ChangeKind, Clearance, Doorway, EntityRef, FindQuery, FoundObject, Landmark, ObjectDescription, ObjectSummary,
+    Change, ChangeKind, Clearance, Doorway, EntityRef, FindQuery, FoundObject, Joint, JointPosition, Landmark, ObjectDescription,
+    ObjectSummary,
     PersonTrack, PlaceSummary, Placement, PngImage, Point, ReadOnlySql, Relation, RobotState, RoomName, RoomSummary, Route,
     Sighting, Size, SqlRows, StaleSource, Stamp, TrackLiveness, ViewKind, ViewRequest, WorldError, WorldModel, WorldSnapshot,
 };
@@ -45,6 +46,7 @@ pub struct StalenessBounds {
     pub objects: Duration,
     pub topology: Duration,
     pub free_space: Duration,
+    pub people: Duration,
 }
 
 impl StalenessBounds {
@@ -54,15 +56,18 @@ impl StalenessBounds {
             InputSource::Objects => self.objects,
             InputSource::Topology => self.topology,
             InputSource::FreeSpace => self.free_space,
+            InputSource::People => self.people,
         }
     }
 }
 
-/// How long a people track counts as live, and how long a lost one stays in the snapshot.
+/// How long a people track counts as live, how long a lost one stays in the snapshot, and how often a person's
+/// sighting is recorded.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TrackBounds {
     pub live: Duration,
     pub forget: Duration,
+    pub record_every: Duration,
 }
 
 /// Where and how often the store copies itself with `VACUUM INTO`.
@@ -104,8 +109,13 @@ impl StoreConfig {
                 objects: Duration::from_secs(60),
                 topology: Duration::from_secs(300),
                 free_space: Duration::from_secs(300),
+                people: Duration::from_secs(2),
             },
-            tracks: TrackBounds { live: Duration::from_secs(2), forget: Duration::from_secs(600) },
+            tracks: TrackBounds {
+                live: Duration::from_secs(2),
+                forget: Duration::from_secs(600),
+                record_every: Duration::from_millis(250),
+            },
             recent_changes: 10,
             find_limit: NonZeroUsize::new(5).expect("five is not zero"),
             clock: Clock::System,
@@ -308,7 +318,7 @@ impl WorldStore {
         let readers = (0..config.readers.get()).map(|_| open_reader(&path).map(Mutex::new)).collect::<rusqlite::Result<Vec<_>>>()?;
         let sql = Mutex::new(open_guarded(&path)?);
         let stop_backups = config.backup.clone().map(|backup| start_backups(path.clone(), backup)).transpose()?;
-        let writer = WorldWriter::start(connection, map.clone(), arrivals.clone(), config.clock.clone(), config.batch_interval)?;
+        let writer = WorldWriter::start(connection, map.clone(), arrivals.clone(), config.clock.clone(), config.batch_interval, config.tracks.record_every)?;
         let opened = config.clock.now();
         let inner = Inner {
             path,
@@ -496,7 +506,7 @@ fn on_floor(pose: MapPose) -> Point {
 struct TrackRow {
     id: TrackId,
     position: Point,
-    heading_rad: f32,
+    heading_rad: Option<f32>,
     speed_m_s: f32,
     last_seen: UnixNanos,
 }
@@ -511,8 +521,30 @@ fn read_track(row: &Row<'_>) -> rusqlite::Result<TrackRow> {
     })
 }
 
-const TRACK_QUERY: &str = "SELECT t.track_id, p.captured_unix_ns, p.x_m, p.y_m, p.heading_rad, p.speed_m_s
-    FROM track t JOIN track_pose p ON p.track_id = t.track_id AND p.captured_unix_ns = t.last_seen_unix_ns";
+const TRACK_QUERY: &str = "SELECT t.track_id, p.seen_unix_ns, p.x_m, p.y_m, p.heading_rad, p.speed_m_s
+    FROM track t JOIN track_pose p ON p.track_id = t.track_id AND p.seen_unix_ns = t.last_seen_unix_ns";
+
+/// The joints placed when a person was seen, in joint order, with their heights above the floor of the room each
+/// is in.
+fn joints_at(connection: &Connection, map: &MapState, id: TrackId, seen: UnixNanos) -> Result<Vec<JointPosition>, WorldError> {
+    let mut statement = connection
+        .prepare_cached("SELECT joint, x_m, y_m, z_m FROM track_joint WHERE track_id = ?1 AND seen_unix_ns = ?2")
+        .map_err(store)?;
+    let rows = statement
+        .query_map(params![id.0 as i64, seen.0], |r| Ok((r.get::<_, String>(0)?, Point { x_m: r.get(1)?, y_m: r.get(2)? }, r.get::<_, f32>(3)?)))
+        .map_err(store)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(store)?;
+    let mut joints = rows
+        .into_iter()
+        .map(|(name, position, z_m)| {
+            let joint = Joint::from_name(&name).ok_or_else(|| WorldError::Store(format!("track_joint holds an unknown joint {name}")))?;
+            Ok(JointPosition { joint, position, height_above_floor_m: map.floor_at(position).map(|floor| z_m - floor) })
+        })
+        .collect::<Result<Vec<_>, WorldError>>()?;
+    joints.sort_by_key(|j| j.joint);
+    Ok(joints)
+}
 
 fn track(connection: &Connection, id: TrackId) -> Result<TrackRow, WorldError> {
     connection
@@ -540,7 +572,7 @@ fn people(inner: &Inner, connection: &Connection, map: &MapState, now: UnixNanos
             id: t.id,
             room: map.room_name(map.room_at(t.position)),
             position: t.position,
-            heading_deg: t.heading_rad.to_degrees(),
+            heading_deg: t.heading_rad.map(f32::to_degrees),
             speed_m_s: t.speed_m_s,
             last_seen: t.last_seen,
             liveness: liveness(inner, t.last_seen, now),
@@ -929,6 +961,7 @@ fn last_seen(inner: &Inner, connection: &Connection, map: &MapState, subject: En
         seconds_ago: seconds_between(at, now),
         heading_deg: heading_rad.map(f32::to_degrees),
         exits_ahead: heading_rad.map_or_else(Vec::new, |h| exits_ahead(map, position, h)),
+        joints: Vec::new(),
     };
     match subject {
         EntityRef::Object(id) => {
@@ -942,7 +975,8 @@ fn last_seen(inner: &Inner, connection: &Connection, map: &MapState, subject: En
         }
         EntityRef::Track(id) => {
             let track = track(connection, id)?;
-            Ok(sighting(map.room_name(map.room_at(track.position)), track.position, track.last_seen, Some(track.heading_rad)))
+            let joints = joints_at(connection, map, id, track.last_seen)?;
+            Ok(Sighting { joints, ..sighting(map.room_name(map.room_at(track.position)), track.position, track.last_seen, track.heading_rad) })
         }
         EntityRef::Place(_) => Err(WorldError::Unsupported("say when a place was last seen: places do not move")),
     }

@@ -10,12 +10,13 @@ use dora_node_api::arrow::array::StructArray;
 use dora_world_agent::node::{Outputs, SpatialNode, SPACE_QUESTION_INPUT};
 use dora_world_agent::world::{SqliteWorld, StoreInput};
 use glam::{Vec2, Vec3};
-use perception_wire::localization::{encode_keyframe_pose, FrameId, KeyframePose, Pose4, Tracking};
+use perception_wire::localization::{encode_keyframe_pose, encode_map_to_odom, CameraNanos, FrameId, KeyframePose, MapToOdom, Pose4, Tracking};
 use perception_wire::navigation::{
     encode_goal_status, encode_space_question, Asker, GoalState, GoalStatus, MapVersion, NavGoal, NonNegative, ObjectId,
-    PlaceId, QuestionId, Reference, Referent, RoomId, SpaceAnswer, SpaceQuestion, UnixNanos,
+    PlaceId, QuestionId, Reference, Referent, RoomId, SpaceAnswer, SpaceQuestion, TrackId, UnixNanos,
 };
 use perception_wire::objects::{encode_object_update, ObjectExtent, ObjectUpdate, ObjectUpdateKind};
+use perception_wire::people::{self, encode_people_tracks, Keypoint, PeopleTracks, PersonTrack, PixelBox, PositionFrame, TrackState};
 use perception_wire::space_map::{
     encode_free_space, encode_topology, Doorway, DoorwayId, FreeSpace, HeightBand, Place, PlaceEdge, Topology, TopologyRoom,
 };
@@ -24,7 +25,7 @@ use world_agent::config::{
     AnswererConfig, AnswererRole, AnsweringConfig, ClaudeConfig, ClaudeCredentials, CompositionChange, Effort, GoalDefaults, McpConfig, ModelName,
     ModelProfile, RoomNamerConfig, SpatialConfig, SystemPrompt, WatchdogConfig, WorldStoreSettings,
 };
-use world_agent::world::SqlValue;
+use world_agent::world::{EntityRef, Joint, SqlValue, WorldModel};
 use world_store::StoreConfig;
 
 const FAST: &str = "fast-model";
@@ -277,5 +278,65 @@ async fn an_input_that_does_not_decode_is_an_error() {
     assert!(format!("{error:#}").contains("decoding a topology"), "{error:#}");
     let error = spatial.on_input("keep_out", &free_space(clock::now())).await.unwrap_err();
     assert!(error.to_string().contains("unexpected input keep_out"), "{error}");
+    spatial.shutdown().await.unwrap();
+}
+
+/// One confirmed person in the odometry frame at (1, 0), every joint 1.5 m up, and one tentative person.
+fn people_tracks(position_frame: PositionFrame) -> StructArray {
+    let at = |z_m: f32| Some(people::Point { x_m: 1.0, y_m: 0.0, z_m });
+    let person = |track_id: u64, state: TrackState| PersonTrack {
+        track_id,
+        state,
+        score: 0.9,
+        bbox: PixelBox { x_px: 10.0, y_px: 10.0, w_px: 100.0, h_px: 300.0 },
+        keypoints: vec![Keypoint { x_px: 50.0, y_px: 50.0, score: 0.9 }; 17],
+        position: at(1.1),
+        velocity: None,
+        keypoints_3d: vec![at(1.5); 17],
+    };
+    encode_people_tracks(&PeopleTracks {
+        frame_id: 8,
+        captured_camera_ns: 1_000,
+        width: 1280,
+        height: 720,
+        position_frame,
+        gravity_reaction: None,
+        tracks: vec![person(7, TrackState::Confirmed), person(8, TrackState::Tentative)],
+    })
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn people_in_odometry_are_placed_once_the_localizer_sends_its_correction() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = config(dir.path());
+    let mut store_config = StoreConfig::at(&config.world_store.path);
+    store_config.batch_interval = Duration::from_millis(20);
+    let world = SqliteWorld::open_with(store_config).unwrap();
+    let (spatial, _outputs) = SpatialNode::start(&config, world.clone()).await.unwrap();
+    let now = clock::now();
+    spatial.on_input(StoreInput::Topology.input_id(), &topology(now)).await.unwrap();
+    let people = StoreInput::PeopleTracks.input_id();
+    spatial.on_input(people, &people_tracks(PositionFrame::Odom)).await.unwrap();
+    spatial.on_input(people, &people_tracks(PositionFrame::Camera)).await.unwrap();
+    let correction = MapToOdom {
+        map_version: VERSION,
+        valid_from: CameraNanos(0),
+        correction: Pose4 { x_m: 1.0, y_m: 1.0, z_m: 0.0, yaw_rad: 0.0 },
+        sigma_xy_m: 0.02,
+        sigma_z_m: 0.01,
+        sigma_yaw_rad: 0.01,
+    };
+    spatial.on_input(StoreInput::MapToOdom.input_id(), &encode_map_to_odom(&correction)).await.unwrap();
+    spatial.on_input(people, &people_tracks(PositionFrame::Odom)).await.unwrap();
+    let placed = eventually("the person being recorded", || async {
+        let placed = rows(&world, "SELECT track_id, x_m, y_m FROM track_pose").await;
+        (!placed.is_empty()).then_some(placed)
+    })
+    .await;
+    assert_eq!(placed, [vec![SqlValue::Integer(7), SqlValue::Real(2.0), SqlValue::Real(1.0)]], "only the confirmed person, once");
+    let sighting = world.last_seen(EntityRef::Track(TrackId(7))).await.unwrap();
+    assert_eq!(sighting.room, world_store::unnamed_room_name(KITCHEN), "the unnamed kitchen");
+    assert_eq!(sighting.joints.len(), Joint::ALL.len());
+    assert_eq!(sighting.joints[0].height_above_floor_m, Some(1.5));
     spatial.shutdown().await.unwrap();
 }

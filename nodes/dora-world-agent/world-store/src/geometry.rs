@@ -1,6 +1,11 @@
 //! Plane geometry on floor outlines: containment, distances and the gap between two outlines.
 
-use world_model::Point;
+use world_model::{Joint, Point};
+
+use crate::types::{FloorVelocity, JointPlacement};
+
+/// A person walking at least this fast heads where they walk; slower, where they face.
+pub const WALKING_M_S: f32 = 0.2;
 
 fn point(x_m: f32, y_m: f32) -> Point {
     Point { x_m, y_m }
@@ -124,6 +129,23 @@ pub fn square_around(centre: Point, side_m: f32, yaw_rad: f32) -> [Point; 4] {
         .map(|(u, v)| point(centre.x_m + u * cos - v * sin, centre.y_m + u * sin + v * cos))
 }
 
+/// The direction a person faces, from a pair of left and right joints placed: square to the line from right to left.
+fn facing(joints: &[JointPlacement], left: Joint, right: Joint) -> Option<f32> {
+    let at = |joint: Joint| joints.iter().find(|j| j.joint == joint).map(|j| j.position.on_floor());
+    let (left, right) = (at(left)?, at(right)?);
+    let (across_x, across_y) = (left.x_m - right.x_m, left.y_m - right.y_m);
+    (across_x.hypot(across_y) > f32::EPSILON).then(|| (-across_x).atan2(across_y))
+}
+
+/// A person's heading in radians anticlockwise from x: where they walk when walking, otherwise where their
+/// shoulders, or failing those their hips, face; `None` when none of those is known.
+pub fn person_heading(velocity: Option<FloorVelocity>, joints: &[JointPlacement]) -> Option<f32> {
+    match velocity {
+        Some(v) if v.speed_m_s() >= WALKING_M_S => Some(v.vy_m_s.atan2(v.vx_m_s)),
+        _ => facing(joints, Joint::LeftShoulder, Joint::RightShoulder).or_else(|| facing(joints, Joint::LeftHip, Joint::RightHip)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -172,5 +194,22 @@ mod tests {
         assert!((distance_to_polygon(&rect(0.0, 0.0, 1.0, 1.0), point(1.0, 3.0)) - 2.0).abs() < 1e-6);
         let (gap, _) = gap_between(&[point(3.0, 0.5)], &rect(0.0, 0.0, 1.0, 1.0));
         assert!((gap - 2.0).abs() < 1e-6);
+    }
+
+    fn placed(joint: Joint, x_m: f32, y_m: f32) -> JointPlacement {
+        JointPlacement { joint, position: crate::types::Position3 { x_m, y_m, z_m: 1.4 } }
+    }
+
+    #[test]
+    fn a_walking_person_heads_where_they_walk_and_a_standing_one_where_their_shoulders_face() {
+        let facing_y = [placed(Joint::LeftShoulder, -0.2, 0.0), placed(Joint::RightShoulder, 0.2, 0.0)];
+        let walking_x = FloorVelocity { vx_m_s: 0.8, vy_m_s: 0.0 };
+        assert_eq!(person_heading(Some(walking_x), &facing_y), Some(0.0));
+        let standing = FloorVelocity { vx_m_s: 0.05, vy_m_s: 0.0 };
+        let heading = person_heading(Some(standing), &facing_y).unwrap();
+        assert!((heading - std::f32::consts::FRAC_PI_2).abs() < 1e-6, "{heading}");
+        let hips_facing_x = [placed(Joint::LeftHip, 0.0, 0.15), placed(Joint::RightHip, 0.0, -0.15)];
+        assert_eq!(person_heading(None, &hips_facing_x), Some(0.0));
+        assert_eq!(person_heading(None, &[placed(Joint::LeftShoulder, 0.0, 0.2)]), None);
     }
 }

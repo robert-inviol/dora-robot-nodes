@@ -25,6 +25,11 @@ the IMU's. `camera_in_imu_m`, the colour camera's optical centre in IMU coordina
 camera's own IMU-to-colour extrinsic. A pose with the camera facing too near straight up or down has no heading and
 is left out with a warning. A keyframe that odometry has not reached within `retention_s`, or that falls before the
 odometry kept, is left out of the correction with a warning. Odometry going back in camera time stops the node.
+
+A pose whose `odom_started_camera_ns` is later than the last pose's is from odometry that started again in a new
+odom frame. The localizer warns, drops the old frame's poses and correction, and sends the next correction once a
+keyframe joins the new frame. A waiting keyframe from before the new start is left out with a warning. A start
+earlier than the frame in use stops the node, as does a camera time earlier than the last pose's across a restart.
 Odometry needs the imu input, which gives keyframes their camera time: an `[odometry]` section with
 `imu = "absent"` is refused.
 

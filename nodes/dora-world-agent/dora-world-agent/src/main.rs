@@ -1,5 +1,6 @@
 //! The spatial agent as a dora node: `space_question` in, `space_answer` and `nav_goal` out; `goal_status`,
-//! `topology`, `free_space`, `object_update` and `keyframe_pose` go to the world store the agent answers from.
+//! `topology`, `free_space`, `object_update`, `keyframe_pose` and `people_tracks` go to the world store the agent
+//! answers from, people placed in the map with `map_to_odom`.
 
 use std::path::PathBuf;
 

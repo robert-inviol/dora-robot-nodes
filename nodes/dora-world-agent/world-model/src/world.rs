@@ -33,6 +33,87 @@ impl Point {
     }
 }
 
+/// One of the 17 COCO body joints a pose model finds, in COCO order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Joint {
+    Nose,
+    LeftEye,
+    RightEye,
+    LeftEar,
+    RightEar,
+    LeftShoulder,
+    RightShoulder,
+    LeftElbow,
+    RightElbow,
+    LeftWrist,
+    RightWrist,
+    LeftHip,
+    RightHip,
+    LeftKnee,
+    RightKnee,
+    LeftAnkle,
+    RightAnkle,
+}
+
+impl Joint {
+    /// In COCO order: `ALL[i]` is keypoint `i`.
+    pub const ALL: [Joint; 17] = [
+        Joint::Nose,
+        Joint::LeftEye,
+        Joint::RightEye,
+        Joint::LeftEar,
+        Joint::RightEar,
+        Joint::LeftShoulder,
+        Joint::RightShoulder,
+        Joint::LeftElbow,
+        Joint::RightElbow,
+        Joint::LeftWrist,
+        Joint::RightWrist,
+        Joint::LeftHip,
+        Joint::RightHip,
+        Joint::LeftKnee,
+        Joint::RightKnee,
+        Joint::LeftAnkle,
+        Joint::RightAnkle,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Joint::Nose => "nose",
+            Joint::LeftEye => "left_eye",
+            Joint::RightEye => "right_eye",
+            Joint::LeftEar => "left_ear",
+            Joint::RightEar => "right_ear",
+            Joint::LeftShoulder => "left_shoulder",
+            Joint::RightShoulder => "right_shoulder",
+            Joint::LeftElbow => "left_elbow",
+            Joint::RightElbow => "right_elbow",
+            Joint::LeftWrist => "left_wrist",
+            Joint::RightWrist => "right_wrist",
+            Joint::LeftHip => "left_hip",
+            Joint::RightHip => "right_hip",
+            Joint::LeftKnee => "left_knee",
+            Joint::RightKnee => "right_knee",
+            Joint::LeftAnkle => "left_ankle",
+            Joint::RightAnkle => "right_ankle",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Joint> {
+        Joint::ALL.into_iter().find(|joint| joint.name() == name)
+    }
+}
+
+/// Where one of a person's joints was, on the map and above the floor of the room it was in.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+pub struct JointPosition {
+    pub joint: Joint,
+    pub position: Point,
+    /// Absent where the joint is outside every mapped room, whose floor heights the map knows.
+    pub height_above_floor_m: Option<f32>,
+}
+
 /// An object's footprint on the floor: its long and short sides and its height.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 pub struct Size {
@@ -130,7 +211,8 @@ pub struct PersonTrack {
     pub id: TrackId,
     pub room: RoomName,
     pub position: Point,
-    pub heading_deg: f32,
+    /// The direction they walk in, or face when standing; absent when neither is known.
+    pub heading_deg: Option<f32>,
     pub speed_m_s: f32,
     pub last_seen: UnixNanos,
     pub liveness: TrackLiveness,
@@ -307,6 +389,9 @@ pub struct Sighting {
     pub heading_deg: Option<f32>,
     /// Doorways ahead in the direction of travel, nearest first.
     pub exits_ahead: Vec<String>,
+    /// For a person, every joint placed when they were last seen; empty for anything else.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub joints: Vec<JointPosition>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

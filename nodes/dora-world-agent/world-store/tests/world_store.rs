@@ -10,13 +10,14 @@ use perception_wire::navigation::{
     TrackId, UnixNanos,
 };
 use world_model::{
-    ChangeKind, EntityRef, FindQuery, Landmark, Point, ReadOnlySql, RoomName, Size, SqlValue, ViewKind, ViewRequest,
-    WorldError, WorldModel,
+    ChangeKind, EntityRef, FindQuery, Joint, Landmark, Point, ReadOnlySql, RoomName, Size, SqlValue, TrackLiveness, ViewKind,
+    ViewRequest, WorldError, WorldModel,
 };
 use world_store::{
     AgentName, Caption, ClearanceMm, Clock, DoorwayId, DoorwaySpan, FrameId, FreeSpace, HeightBand, IngestError, IssuedGoal,
     JpegImage, ManualClock, ModelName, ObjectChange, ObjectUpdate, OpenError, PlaceEdge, PlaceNode, Position3, Footprint,
-    Rejection, RobotPoseSample, RoomId, RoomShape, StoreConfig, Topology, WorldStore, WorldWriter,
+    FloorVelocity, JointPlacement, PersonSighting, Rejection, RobotPoseSample, RoomId, RoomShape, StoreConfig, Topology,
+    WorldStore, WorldWriter,
 };
 
 const NOW: UnixNanos = UnixNanos(1_794_610_000_000_000_000);
@@ -470,8 +471,72 @@ async fn the_snapshot_holds_rooms_objects_changes_and_stale_sources() {
     assert!(snapshot.stale_sources.is_empty(), "{:?}", snapshot.stale_sources);
     clock.advance(Duration::from_secs(10));
     let later = store.snapshot().await.unwrap();
-    assert_eq!(later.stale_sources.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), vec!["robot pose"]);
+    assert_eq!(later.stale_sources.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), vec!["robot pose", "people tracking"]);
     assert_eq!(later.stale_sources[0].silent_s, 10.0);
+}
+
+/// Track 7 standing in the living room facing +y (north), every joint placed, at `seen`.
+fn standing(seen: UnixNanos, velocity: Option<FloorVelocity>) -> PersonSighting {
+    let height = |joint: Joint| match joint {
+        Joint::Nose | Joint::LeftEye | Joint::RightEye | Joint::LeftEar | Joint::RightEar => 1.62,
+        Joint::LeftShoulder | Joint::RightShoulder => 1.42,
+        Joint::LeftElbow | Joint::RightElbow => 1.12,
+        Joint::LeftWrist | Joint::RightWrist => 0.85,
+        Joint::LeftHip | Joint::RightHip => 0.95,
+        Joint::LeftKnee | Joint::RightKnee => 0.5,
+        Joint::LeftAnkle | Joint::RightAnkle => 0.08,
+    };
+    // Facing +y, a person's left is -x.
+    let side = |joint: Joint| if joint.name().starts_with("left") { -0.2 } else if joint.name().starts_with("right") { 0.2 } else { 0.0 };
+    PersonSighting {
+        track: TrackId(7),
+        seen,
+        map_version: VERSION,
+        torso: Position3 { x_m: 8.0, y_m: 2.0, z_m: 1.2 },
+        velocity,
+        joints: Joint::ALL
+            .into_iter()
+            .map(|joint| JointPlacement { joint, position: Position3 { x_m: 8.0 + side(joint), y_m: 2.0, z_m: height(joint) } })
+            .collect(),
+    }
+}
+
+#[tokio::test]
+async fn a_person_is_placed_in_their_room_with_every_joint_above_the_floor() {
+    let House { store, writer, clock, _dir } = house();
+    writer.record_people(vec![standing(NOW, Some(FloorVelocity { vx_m_s: 0.05, vy_m_s: 0.0 }))]).unwrap();
+    writer.flush().unwrap();
+    let snapshot = store.snapshot().await.unwrap();
+    assert_eq!(snapshot.people.len(), 1);
+    let person = &snapshot.people[0];
+    assert_eq!((person.id, &person.room, person.liveness), (TrackId(7), &room("living_room"), TrackLiveness::Live));
+    assert!((person.heading_deg.unwrap() - 90.0).abs() < 1e-3, "standing still, they head where their shoulders face: {:?}", person.heading_deg);
+    let sighting = store.last_seen(EntityRef::Track(TrackId(7))).await.unwrap();
+    assert_eq!(sighting.joints.iter().map(|j| j.joint).collect::<Vec<_>>(), Joint::ALL);
+    let nose = sighting.joints.iter().find(|j| j.joint == Joint::Nose).unwrap();
+    assert_eq!((nose.position, nose.height_above_floor_m), (p(8.0, 2.0), Some(1.62)));
+    clock.advance(Duration::from_secs(3));
+    let later = store.snapshot().await.unwrap();
+    assert_eq!(later.people[0].liveness, TrackLiveness::Lost);
+    assert!(later.stale_sources.iter().any(|s| s.name == "people tracking"));
+}
+
+#[tokio::test]
+async fn a_person_is_recorded_at_most_once_per_interval_and_heads_where_they_walk() {
+    let House { store, writer, _dir, .. } = house();
+    let walking = Some(FloorVelocity { vx_m_s: -0.8, vy_m_s: 0.0 });
+    for (ms, velocity) in [(0, None), (100, walking), (300, walking)] {
+        writer.record_people(vec![standing(UnixNanos(NOW.0 + ms * 1_000_000), velocity)]).unwrap();
+    }
+    writer.record_people(Vec::new()).unwrap();
+    writer.flush().unwrap();
+    let rows = store.query_text("SELECT seen_unix_ns, heading_rad FROM track_pose ORDER BY seen_unix_ns".to_owned(), NonZeroUsize::new(10).unwrap()).await.unwrap();
+    assert_eq!(rows.rows.len(), 2, "the sighting 100 ms after the first is dropped: {rows:?}");
+    let joints = store.query_text("SELECT count(*) FROM track_joint".to_owned(), NonZeroUsize::new(1).unwrap()).await.unwrap();
+    assert_eq!(joints.rows[0][0], SqlValue::Integer(2 * Joint::ALL.len() as i64));
+    let person = &store.snapshot().await.unwrap().people[0];
+    assert!((person.heading_deg.unwrap().abs() - 180.0).abs() < 1e-3, "walking west, not where they face: {:?}", person.heading_deg);
+    assert!((person.speed_m_s - 0.8).abs() < 1e-6);
 }
 
 #[tokio::test]

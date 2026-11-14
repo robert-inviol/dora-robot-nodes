@@ -12,6 +12,8 @@ node feeds from its inputs. It answers each `space_question` with several models
 | `free_space` | `set_free_space` |
 | `object_update` | `apply_object_update` |
 | `keyframe_pose` | `record_robot_pose` with the map pose (x, y, yaw), unless the localizer is lost |
+| `map_to_odom` | Kept: the latest correction places odometry-frame people tracks |
+| `people_tracks` | `record_people` with the frame's confirmed tracks that have a torso position, each with every joint depth placed, carried from odometry into the map by the latest `map_to_odom` (`people::place_people`). A frame in the camera frame, or in odometry before any correction, records nothing and is logged at warn when that reason first appears |
 
 | Output | What it carries |
 |---|---|

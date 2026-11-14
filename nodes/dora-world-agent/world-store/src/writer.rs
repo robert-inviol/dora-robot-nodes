@@ -12,12 +12,13 @@ use perception_wire::navigation::{GoalId, GoalStatus, GoalTarget, LookTarget, Ma
 use rusqlite::{named_params, params, Connection, OptionalExtension};
 use world_model::{Point, RoomName};
 
-use crate::geometry::bounds;
+use crate::geometry::{bounds, person_heading};
 use crate::inputs::{Arrivals, Clock};
 use crate::map::{parse_unnamed_room, MapState, UNMAPPED_ROOM};
 use crate::relations::{relation, Solid, NEXT_TO_M};
 use crate::types::{
-    Caption, FreeSpace, InputSource, IssuedGoal, JpegImage, ObjectChange, ObjectUpdate, RobotPoseSample, RoomId, Topology,
+    Caption, FreeSpace, InputSource, IssuedGoal, JpegImage, ObjectChange, ObjectUpdate, PersonSighting, RobotPoseSample, RoomId,
+    Topology,
 };
 
 /// How many crops of each object the store keeps, best first.
@@ -70,6 +71,7 @@ enum Command {
     Topology(Box<Topology>),
     FreeSpace(Box<FreeSpace>),
     RobotPose(RobotPoseSample),
+    People(Vec<PersonSighting>),
     Goal(Box<IssuedGoal>),
     GoalStatus(GoalStatus),
     NameRoom(RoomId, RoomName, Sender<Result<(), IngestError>>),
@@ -89,6 +91,8 @@ struct Shared {
     counters: Counters,
     arrivals: Arc<Arrivals>,
     clock: Clock,
+    /// A person is recorded at most once in this span; sightings in between are dropped.
+    record_people_every: Duration,
     thread: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -106,6 +110,7 @@ impl WorldWriter {
         arrivals: Arc<Arrivals>,
         clock: Clock,
         batch_interval: Duration,
+        record_people_every: Duration,
     ) -> std::io::Result<Self> {
         let (commands, receiver) = mpsc::channel();
         let shared = Arc::new(Shared {
@@ -113,6 +118,7 @@ impl WorldWriter {
             counters: Counters::default(),
             arrivals,
             clock,
+            record_people_every,
             thread: Mutex::new(None),
         });
         let thread_shared = shared.clone();
@@ -158,6 +164,16 @@ impl WorldWriter {
     pub fn record_robot_pose(&self, sample: RobotPoseSample) -> Result<(), IngestError> {
         self.arrived(InputSource::RobotPose);
         self.send(Command::RobotPose(sample))
+    }
+
+    /// Everyone the people tracker confirmed in one camera frame; an empty frame says tracking is running and
+    /// nobody is in view.
+    pub fn record_people(&self, sightings: Vec<PersonSighting>) -> Result<(), IngestError> {
+        self.arrived(InputSource::People);
+        if sightings.is_empty() {
+            return Ok(());
+        }
+        self.send(Command::People(sightings))
     }
 
     pub fn record_goal(&self, goal: IssuedGoal) -> Result<(), IngestError> {
@@ -264,7 +280,7 @@ fn write_batch(
             }
             command => {
                 let savepoint = transaction.savepoint()?;
-                match apply(&savepoint, map, command, now)? {
+                match apply(&savepoint, map, command, now, shared.record_people_every)? {
                     Ok(()) => savepoint.commit()?,
                     Err(rejection) => {
                         shared.counters.rejected.fetch_add(1, Ordering::SeqCst);
@@ -299,13 +315,14 @@ fn write_batch(
 
 type Applied = rusqlite::Result<Result<(), Rejection>>;
 
-fn apply(connection: &Connection, map: &RwLock<MapState>, command: Command, now: UnixNanos) -> Applied {
+fn apply(connection: &Connection, map: &RwLock<MapState>, command: Command, now: UnixNanos, record_people_every: Duration) -> Applied {
     match command {
         Command::Object(update) => apply_object(connection, map, &update, now),
         Command::Caption(object, caption, at) => set_caption(connection, object, &caption, at),
         Command::Topology(topology) => apply_topology(connection, map, *topology, now),
         Command::FreeSpace(free_space) => apply_free_space(connection, map, *free_space, now),
         Command::RobotPose(sample) => record_robot_pose(connection, map, sample, now),
+        Command::People(sightings) => record_people(connection, map, &sightings, now, record_people_every),
         Command::Goal(goal) => record_goal(connection, &goal),
         Command::GoalStatus(status) => record_goal_status(connection, status),
         Command::NameRoom(..) | Command::Flush(_) | Command::Shutdown => unreachable!("write_batch handles these itself"),
@@ -609,6 +626,49 @@ fn record_robot_pose(connection: &Connection, map: &RwLock<MapState>, sample: Ro
         "INSERT INTO robot_pose (captured_unix_ns, map_version, x_m, y_m, yaw_rad) VALUES (?1, ?2, ?3, ?4, ?5)",
         params![sample.captured.0, sample.map_version.0 as i64, sample.pose.x_m, sample.pose.y_m, sample.pose.yaw_rad],
     )?;
+    Ok(Ok(()))
+}
+
+fn record_people(
+    connection: &Connection,
+    map: &RwLock<MapState>,
+    sightings: &[PersonSighting],
+    now: UnixNanos,
+    every: Duration,
+) -> Applied {
+    let every_ns = i64::try_from(every.as_nanos()).expect("a recording interval shorter than 292 years");
+    for sighting in sightings {
+        let track = sighting.track.0 as i64;
+        let last: Option<i64> =
+            connection.query_row("SELECT max(seen_unix_ns) FROM track_pose WHERE track_id = ?1", [track], |r| r.get(0))?;
+        if last.is_some_and(|last| sighting.seen.0 - last < every_ns) {
+            continue;
+        }
+        note_version(connection, map, sighting.map_version, now)?;
+        connection.execute(
+            "INSERT INTO track VALUES (?1, ?2, ?2) ON CONFLICT (track_id) DO UPDATE SET last_seen_unix_ns = excluded.last_seen_unix_ns",
+            params![track, sighting.seen.0],
+        )?;
+        let torso = sighting.torso;
+        connection.execute(
+            "INSERT INTO track_pose VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                track,
+                sighting.seen.0,
+                sighting.map_version.0 as i64,
+                torso.x_m,
+                torso.y_m,
+                torso.z_m,
+                person_heading(sighting.velocity, &sighting.joints),
+                sighting.velocity.map_or(0.0, |v| v.speed_m_s()),
+            ],
+        )?;
+        let mut joint = connection.prepare_cached("INSERT INTO track_joint VALUES (?1, ?2, ?3, ?4, ?5, ?6)")?;
+        for placed in &sighting.joints {
+            let p = placed.position;
+            joint.execute(params![track, sighting.seen.0, placed.joint.name(), p.x_m, p.y_m, p.z_m])?;
+        }
+    }
     Ok(Ok(()))
 }
 

@@ -5,9 +5,10 @@ use std::sync::{Arc, Mutex};
 
 use dora_node_api::arrow::array::Array;
 use eyre::{eyre, Result, WrapErr};
-use perception_wire::localization::{decode_keyframe_pose, Tracking};
+use perception_wire::localization::{decode_keyframe_pose, decode_map_to_odom, MapToOdom, Tracking};
 use perception_wire::navigation::{decode_goal_status, GoalTarget, MapPose, ObjectId, RoomId, UnixNanos};
 use perception_wire::objects::decode_object_update;
+use perception_wire::people::decode_people_tracks;
 use perception_wire::space_map::{decode_free_space, decode_topology};
 use world_agent::config::WorldStoreSettings;
 use world_agent::room_names::{RoomContents, RoomNameSink, RoomNameSinkError};
@@ -19,6 +20,8 @@ use world_store::{
     BackupConfig, FreeSpace, IssuedGoal, ObjectUpdate, OpenError, RobotPoseSample, StoreConfig, Topology, WorldWriter,
 };
 
+use crate::people::{place_people, Unplaced};
+
 /// The world store's inputs, by their dora input ids.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StoreInput {
@@ -27,11 +30,20 @@ pub enum StoreInput {
     ObjectUpdate,
     KeyframePose,
     GoalStatus,
+    MapToOdom,
+    PeopleTracks,
 }
 
 impl StoreInput {
-    pub const ALL: [StoreInput; 5] =
-        [StoreInput::Topology, StoreInput::FreeSpace, StoreInput::ObjectUpdate, StoreInput::KeyframePose, StoreInput::GoalStatus];
+    pub const ALL: [StoreInput; 7] = [
+        StoreInput::Topology,
+        StoreInput::FreeSpace,
+        StoreInput::ObjectUpdate,
+        StoreInput::KeyframePose,
+        StoreInput::GoalStatus,
+        StoreInput::MapToOdom,
+        StoreInput::PeopleTracks,
+    ];
 
     pub fn input_id(self) -> &'static str {
         match self {
@@ -40,6 +52,8 @@ impl StoreInput {
             StoreInput::ObjectUpdate => "object_update",
             StoreInput::KeyframePose => "keyframe_pose",
             StoreInput::GoalStatus => "goal_status",
+            StoreInput::MapToOdom => "map_to_odom",
+            StoreInput::PeopleTracks => "people_tracks",
         }
     }
 
@@ -79,6 +93,10 @@ pub struct SqliteWorld {
     writer: WorldWriter,
     /// The localizer's tracking state at the last keyframe pose, to log when it changes.
     tracking: Arc<Mutex<Option<Tracking>>>,
+    /// The localizer's latest map to odom correction, which places odometry-frame people tracks.
+    correction: Arc<Mutex<Option<MapToOdom>>>,
+    /// Why the last people tracks frame was not placed, to log when it changes.
+    unplaced: Arc<Mutex<Option<Unplaced>>>,
 }
 
 impl SqliteWorld {
@@ -90,7 +108,7 @@ impl SqliteWorld {
 
     pub fn open_with(config: StoreConfig) -> Result<Self, OpenError> {
         let (store, writer) = world_store::WorldStore::open(config)?;
-        Ok(Self { store, writer, tracking: Arc::default() })
+        Ok(Self { store, writer, tracking: Arc::default(), correction: Arc::default(), unplaced: Arc::default() })
     }
 
     /// Runs SQL on the store's read-only connection, for checking what was written.
@@ -113,6 +131,26 @@ impl SqliteWorld {
         let sample = RobotPoseSample { captured: keyframe.captured, map_version: keyframe.map_version, pose };
         Ok(self.writer.record_robot_pose(sample)?)
     }
+
+    /// Places a people tracks frame's confirmed tracks in the map and records them. A frame that cannot be placed is
+    /// logged at warn when the reason first appears, and records nothing, so people tracking goes stale in the
+    /// digest.
+    fn record_people(&self, data: &dyn Array) -> Result<()> {
+        let frame = decode_people_tracks(data).wrap_err("decoding people tracks")?;
+        let correction = *self.correction.lock().expect("the correction lock is never poisoned");
+        let placed = place_people(&frame, correction.as_ref(), world_agent::clock::now())?;
+        let reason = placed.as_ref().err().copied();
+        let previous = std::mem::replace(&mut *self.unplaced.lock().expect("the unplaced lock is never poisoned"), reason);
+        match (previous, reason) {
+            (_, Some(reason)) if previous != Some(reason) => tracing::warn!(%reason, frame = frame.frame_id, "people tracks not placed in the map"),
+            (Some(_), None) => tracing::info!(frame = frame.frame_id, "people tracks are placed in the map again"),
+            _ => {}
+        }
+        match placed {
+            Ok(sightings) => Ok(self.writer.record_people(sightings)?),
+            Err(_) => Ok(()),
+        }
+    }
 }
 
 impl WorldStore for SqliteWorld {
@@ -132,6 +170,11 @@ impl WorldStore for SqliteWorld {
                 self.writer.apply_object_update(ObjectUpdate::try_from(update).wrap_err("an object update")?)?;
             }
             StoreInput::KeyframePose => self.record_keyframe_pose(data)?,
+            StoreInput::MapToOdom => {
+                let correction = decode_map_to_odom(data).wrap_err("decoding a map to odom correction")?;
+                *self.correction.lock().expect("the correction lock is never poisoned") = Some(correction);
+            }
+            StoreInput::PeopleTracks => self.record_people(data)?,
             StoreInput::GoalStatus => {
                 let status = decode_goal_status(data).wrap_err("decoding a goal status")?;
                 self.writer.record_goal_status(status)?;

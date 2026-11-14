@@ -108,6 +108,12 @@ impl MapState {
     }
 
     /// The room whose floor holds the point, or the nearest room when the point is just outside every outline.
+    /// The floor height of the room a point is in, in the map frame.
+    pub fn floor_at(&self, p: Point) -> Option<f32> {
+        let room = self.room_at(p)?;
+        self.topology.as_ref()?.rooms.iter().find(|r| r.id == room).map(|r| r.floor_m)
+    }
+
     pub fn room_at(&self, p: Point) -> Option<RoomId> {
         let rooms = &self.topology.as_ref()?.rooms;
         if let Some(room) = rooms.iter().find(|r| polygon_contains(&r.polygon, p)) {

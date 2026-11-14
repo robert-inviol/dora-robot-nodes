@@ -6,7 +6,7 @@
 use rusqlite::{Connection, Transaction};
 
 /// Each entry moves the schema from version `index` to `index + 1`.
-const MIGRATIONS: [&str; 1] = [r#"
+const MIGRATIONS: [&str; 2] = [r#"
 CREATE TABLE map_version (
     map_version INTEGER PRIMARY KEY,
     first_seen_unix_ns INTEGER NOT NULL
@@ -206,6 +206,41 @@ CREATE TABLE event (
     previous_room_name TEXT
 );
 CREATE INDEX event_time ON event (detected_unix_ns);
+"#, r#"
+DROP TABLE track_pose;
+DROP TABLE track;
+
+CREATE TABLE track (
+    track_id INTEGER PRIMARY KEY,
+    first_seen_unix_ns INTEGER NOT NULL,
+    last_seen_unix_ns INTEGER NOT NULL
+);
+
+-- One row per recorded sighting of a person: the torso centre. Seen times are when the store received the frame.
+CREATE TABLE track_pose (
+    track_id INTEGER NOT NULL REFERENCES track,
+    seen_unix_ns INTEGER NOT NULL,
+    map_version INTEGER NOT NULL,
+    x_m REAL NOT NULL,
+    y_m REAL NOT NULL,
+    z_m REAL NOT NULL,
+    -- The direction walked in, or faced when standing still; NULL when neither is known.
+    heading_rad REAL,
+    speed_m_s REAL NOT NULL,
+    PRIMARY KEY (track_id, seen_unix_ns)
+);
+
+-- The joints placed at a sighting, in the map frame.
+CREATE TABLE track_joint (
+    track_id INTEGER NOT NULL,
+    seen_unix_ns INTEGER NOT NULL,
+    joint TEXT NOT NULL CHECK (joint IN ('nose', 'left_eye', 'right_eye', 'left_ear', 'right_ear', 'left_shoulder', 'right_shoulder', 'left_elbow', 'right_elbow', 'left_wrist', 'right_wrist', 'left_hip', 'right_hip', 'left_knee', 'right_knee', 'left_ankle', 'right_ankle')),
+    x_m REAL NOT NULL,
+    y_m REAL NOT NULL,
+    z_m REAL NOT NULL,
+    PRIMARY KEY (track_id, seen_unix_ns, joint),
+    FOREIGN KEY (track_id, seen_unix_ns) REFERENCES track_pose
+);
 "#];
 
 pub const SCHEMA_VERSION: u32 = MIGRATIONS.len() as u32;
@@ -255,7 +290,7 @@ mod tests {
         for table in [
             "map_version", "topology", "room", "room_vertex", "room_name", "doorway", "place", "place_edge", "free_space",
             "object", "object_extent", "object_caption", "object_view", "object_relation", "robot_pose", "track",
-            "track_pose", "goal", "event",
+            "track_pose", "track_joint", "goal", "event",
         ] {
             assert!(names.iter().any(|n| n == table), "{table} missing from {names:?}");
         }

@@ -20,6 +20,7 @@ perception-wire = { path = "../../dora-depth-perception/perception-wire" }
 world-agent = { path = "../world-agent" }
 world-store = { path = "../world-store" }
 serde_json = "1"
+thiserror.workspace = true
 dora-node-api.workspace = true
 eyre.workspace = true
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }

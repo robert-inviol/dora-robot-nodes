@@ -11,6 +11,12 @@
 //! its camera time once odometry has reached that time, and the correction is sent after every keyframe and every
 //! odometry pose that joined one. A keyframe that waits longer than the retention, or that falls before the
 //! odometry kept, is left out and reported in `unjoined`.
+//!
+//! Each odometry pose names its odom frame by the camera time odometry started at. A pose with a later start is from
+//! odometry that started again in a new odom frame: the poses and correction of the old frame are dropped, a waiting
+//! keyframe from before the new start is reported in `unjoined`, no correction is sent until a keyframe joins the new
+//! frame, and the restart is reported in `odometry_restarted`.
+//! Odometry camera times keep increasing across a restart.
 
 pub mod config;
 
@@ -48,8 +54,17 @@ pub struct UnjoinedKeyframe {
 pub enum OdometryInputError {
     #[error("an odom_pose message arrived but the settings have no [odometry] section")]
     NotConfigured,
+    #[error("odometry started at camera time {received} ns, before the odom frame in use, started at {current} ns")]
+    StartWentBack { current: i64, received: i64 },
     #[error(transparent)]
     Odometry(#[from] OdomError),
+}
+
+/// Odometry that started again in a new odom frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OdometryRestart {
+    pub previous_start: CameraNanos,
+    pub start: CameraNanos,
 }
 
 /// What handling one input did.
@@ -63,11 +78,14 @@ pub struct Handled {
     pub unjoined: Vec<UnjoinedKeyframe>,
     /// An odometry pose left out because the camera faced too near straight up or down to have a heading.
     pub headingless_odometry: Option<CameraNanos>,
+    pub odometry_restarted: Option<OdometryRestart>,
 }
 
 /// Odometry, and the registered keyframes waiting for it to reach their camera time.
 struct OdometryLink {
     settings: OdometrySettings,
+    /// The camera time the odometry in use started at, and the camera time of its latest pose.
+    odom_frame: Option<(CameraNanos, CameraNanos)>,
     history: OdomHistory,
     estimator: MapToOdomEstimator,
     /// Oldest first.
@@ -77,11 +95,33 @@ struct OdometryLink {
 impl OdometryLink {
     fn new(settings: OdometrySettings) -> OdometryLink {
         OdometryLink {
+            odom_frame: None,
             history: OdomHistory::new(settings.retention_ns),
             estimator: MapToOdomEstimator::new(settings.estimator.clone()),
             settings,
             waiting: VecDeque::new(),
         }
+    }
+
+    /// Takes a pose's place in camera time and odom frame; a later start drops the old frame's poses and correction.
+    fn follow(&mut self, start: CameraNanos, time: CameraNanos) -> Result<Option<OdometryRestart>, OdometryInputError> {
+        let Some((current, last)) = self.odom_frame else {
+            self.odom_frame = Some((start, time));
+            return Ok(None);
+        };
+        if time <= last {
+            return Err(OdomError::OutOfOrder { last: last.0, received: time.0 }.into());
+        }
+        if start < current {
+            return Err(OdometryInputError::StartWentBack { current: current.0, received: start.0 });
+        }
+        self.odom_frame = Some((start, time));
+        if start == current {
+            return Ok(None);
+        }
+        self.history = OdomHistory::new(self.settings.retention_ns);
+        self.estimator = MapToOdomEstimator::new(self.settings.estimator.clone());
+        Ok(Some(OdometryRestart { previous_start: current, start }))
     }
 
     /// Joins the waiting keyframes odometry has reached; true when any joined.
@@ -154,11 +194,12 @@ impl LocalizerNode {
     pub fn on_odom_pose(&mut self, pose: &odometry::OdomPose) -> Result<Handled, OdometryInputError> {
         let link = self.odometry.as_mut().ok_or(OdometryInputError::NotConfigured)?;
         let time = CameraNanos(pose.camera_ns);
+        let odometry_restarted = link.follow(CameraNanos(pose.odom_started_camera_ns), time)?;
         let Some(floor) = link.settings.mount.floor_pose(pose.position_m, pose.orientation) else {
-            return Ok(Handled { headingless_odometry: Some(time), ..Handled::default() });
+            return Ok(Handled { headingless_odometry: Some(time), odometry_restarted, ..Handled::default() });
         };
         link.history.push(OdomPose { time, pose: floor })?;
-        let mut handled = Handled::default();
+        let mut handled = Handled { odometry_restarted, ..Handled::default() };
         if link.join(&mut handled.unjoined) {
             handled.map_to_odom = self.map_to_odom();
         }

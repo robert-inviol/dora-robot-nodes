@@ -54,15 +54,12 @@ fn at(p: Point) -> String {
 
 fn person(track: &PersonTrack, as_of: UnixNanos) -> String {
     let seen = age(clock::seconds_between(track.last_seen, as_of));
+    let heading = track.heading_deg.map_or(String::new(), |deg| format!(" heading {deg:.0}deg"));
     match track.liveness {
-        TrackLiveness::Live => format!(
-            "{} {} {} heading {:.0}deg {:.1}m/s seen {seen} ago",
-            track.id, track.room, at(track.position), track.heading_deg, track.speed_m_s
-        ),
-        TrackLiveness::Lost => format!(
-            "{} lost {seen} ago, last {} {} heading {:.0}deg",
-            track.id, track.room, at(track.position), track.heading_deg
-        ),
+        TrackLiveness::Live => {
+            format!("{} {} {}{heading} {:.1}m/s seen {seen} ago", track.id, track.room, at(track.position), track.speed_m_s)
+        }
+        TrackLiveness::Lost => format!("{} lost {seen} ago, last {} {}{heading}", track.id, track.room, at(track.position)),
     }
 }
 

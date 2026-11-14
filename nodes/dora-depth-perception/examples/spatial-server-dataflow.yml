@@ -10,7 +10,7 @@ nodes:
     path: ../../dora-zenoh-bridge/target/release/dora-zenoh-bridge
     env:
       ZENOH_CONNECT: tcp/192.0.2.10:7447
-      ZENOH_SUBSCRIBE: rig/keyframe=keyframe,rig/imu=imu,rig/segments=segments,rig/space_question=space_question,rig/goal_status=goal_status
+      ZENOH_SUBSCRIBE: rig/keyframe=keyframe,rig/imu=imu,rig/segments=segments,rig/space_question=space_question,rig/goal_status=goal_status,rig/people_tracks=people_tracks
       ZENOH_PUBLISH: keyframe_pose=rig/keyframe_pose,free_space=rig/free_space,topology=rig/topology,keep_out=rig/keep_out,object_update=rig/object_update,space_answer=rig/space_answer,nav_goal=rig/nav_goal
     inputs:
       tick: dora/timer/millis/5
@@ -27,6 +27,7 @@ nodes:
       - segments
       - space_question
       - goal_status
+      - people_tracks
 
   - id: localizer
     path: ../target/release/dora-map-localizer
@@ -106,6 +107,13 @@ nodes:
       keyframe_pose:
         source: localizer/keyframe_pose
         queue_size: 32
+      # People are placed in the map only in the odometry frame, with the localizer's map_to_odom; until the
+      # camera machine sends odometry-frame tracks and the localizer's map_to_odom is wired, they are logged and
+      # left out.
+      people_tracks:
+        source: link/people_tracks
+        queue_size: 8
+      # map_to_odom: localizer/map_to_odom
     outputs:
       - space_answer
       - nav_goal

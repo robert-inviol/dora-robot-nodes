@@ -1,6 +1,6 @@
 use depth_perception::synthetic::SyntheticRoom;
 use dora_map_localizer::config::{NodeSettings, OdometrySettings};
-use dora_map_localizer::{LocalizerNode, OdometryInputError};
+use dora_map_localizer::{LocalizerNode, OdometryInputError, OdometryRestart};
 use glam::{Mat3, Quat, Vec3};
 use map_localizer::map_to_odom::{CameraMount, MapToOdomSettings, OdomError};
 use map_localizer::synthetic::{ellipse_poses, render_walk};
@@ -17,14 +17,19 @@ fn with_odometry() -> NodeSettings {
     NodeSettings { odometry: Some(odometry), ..NodeSettings::default() }
 }
 
-/// The odometry message for a level camera whose floor frame is at `floor` in the odometry frame.
+/// The odometry message for a level camera whose floor frame is at `floor` in the odom frame started at camera time 0.
 fn odom_pose(camera_ns: i64, floor: Pose) -> OdomPose {
+    odom_pose_in(0, camera_ns, floor)
+}
+
+/// The odometry message for a level camera whose floor frame is at `floor` in the odom frame started at `started_ns`.
+fn odom_pose_in(started_ns: i64, camera_ns: i64, floor: Pose) -> OdomPose {
     let (sin, cos) = floor.yaw_rad.sin_cos();
     let forward = Vec3::new(-sin, cos, 0.0);
     let orientation = Quat::from_mat3(&Mat3::from_cols(forward.cross(Vec3::Z), Vec3::NEG_Z, forward));
     let pose = OdomPose {
         camera_ns,
-        odom_started_camera_ns: 0,
+        odom_started_camera_ns: started_ns,
         depth_frame_id: 0,
         position_m: floor.translation - orientation * MOUNT.camera_in_imu_m,
         orientation,
@@ -107,5 +112,52 @@ fn odometry_going_back_in_time_is_refused() {
     let mut node = LocalizerNode::new(with_odometry());
     node.on_odom_pose(&odom_pose(2_000, Pose::IDENTITY)).unwrap();
     let refused = node.on_odom_pose(&odom_pose(1_000, Pose::IDENTITY));
+    assert!(matches!(refused, Err(OdometryInputError::Odometry(OdomError::OutOfOrder { .. }))), "{refused:?}");
+}
+
+#[test]
+fn odometry_that_starts_again_in_a_new_frame_gives_the_correction_to_the_new_frame() {
+    let walk = render_walk(&SyntheticRoom::living_room(), &ellipse_poses(24, 1)[..12], 0..0, |_| Vec3::ZERO);
+    let first = Pose { yaw_rad: 0.6, translation: Vec3::new(1.5, -0.75, 0.05) };
+    let second = Pose { yaw_rad: -1.1, translation: Vec3::new(-0.4, 2.0, 0.0) };
+    const RESTART: usize = 6;
+    let restart_ns = walk.imu[RESTART].keyframe_camera_ns;
+    let mut node = LocalizerNode::new(with_odometry());
+    let mut restarts = Vec::new();
+    let mut after_restart: Vec<MapToOdom> = Vec::new();
+    for (index, (keyframe, imu)) in walk.keyframes.iter().zip(&walk.imu).enumerate() {
+        node.on_imu(imu);
+        node.on_keyframe(decode_keyframe(&encode_keyframe(keyframe)).unwrap());
+        let (started_ns, correction) = if index < RESTART { (0, first) } else { (restart_ns, second) };
+        let pose = odom_pose_in(started_ns, imu.keyframe_camera_ns, correction.inverse().compose(&walk.truth[index]));
+        let handled = node.on_odom_pose(&pose).unwrap();
+        restarts.extend(handled.odometry_restarted);
+        if index >= RESTART {
+            after_restart.extend(handled.map_to_odom);
+        }
+    }
+    assert_eq!(restarts, [OdometryRestart { previous_start: CameraNanos(0), start: CameraNanos(restart_ns) }]);
+    assert_eq!(after_restart.len(), walk.keyframes.len() - RESTART, "every keyframe from the restart joins the new frame");
+    for sent in &after_restart {
+        let c = sent.correction;
+        let position = (Vec3::new(c.x_m, c.y_m, c.z_m) - second.translation).length();
+        let heading = wrap_angle(c.yaw_rad - second.yaw_rad).abs().to_degrees();
+        assert!(position < 0.02 && heading < 0.5, "off by {position} m and {heading} deg: {sent:?}");
+    }
+}
+
+#[test]
+fn odometry_starting_before_the_frame_in_use_is_refused() {
+    let mut node = LocalizerNode::new(with_odometry());
+    node.on_odom_pose(&odom_pose_in(1_000, 2_000, Pose::IDENTITY)).unwrap();
+    let refused = node.on_odom_pose(&odom_pose_in(500, 3_000, Pose::IDENTITY));
+    assert!(matches!(refused, Err(OdometryInputError::StartWentBack { current: 1_000, received: 500 })), "{refused:?}");
+}
+
+#[test]
+fn odometry_going_back_in_time_across_a_restart_is_refused() {
+    let mut node = LocalizerNode::new(with_odometry());
+    node.on_odom_pose(&odom_pose_in(1_000, 2_000, Pose::IDENTITY)).unwrap();
+    let refused = node.on_odom_pose(&odom_pose_in(1_500, 1_800, Pose::IDENTITY));
     assert!(matches!(refused, Err(OdometryInputError::Odometry(OdomError::OutOfOrder { .. }))), "{refused:?}");
 }
