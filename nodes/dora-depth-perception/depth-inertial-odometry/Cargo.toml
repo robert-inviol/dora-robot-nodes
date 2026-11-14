@@ -1,0 +1,14 @@
+[package]
+name = "depth-inertial-odometry"
+version = "0.1.0"
+description = "Live 6-DoF odometry from a depth camera's point cloud and its IMU: IMU prediction, registration against a local map, an error-state Kalman filter"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+glam = "0.29"
+nalgebra = { version = "0.33", default-features = false, features = ["std"] }
+rand = { version = "0.8", default-features = false, features = ["small_rng"] }
+rayon = "1.10"
+rustc-hash = "2"

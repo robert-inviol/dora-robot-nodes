@@ -46,6 +46,11 @@ was recorded:
   past its threshold) is rejected. `examples/keyframe_gap_check.rs` compares tracking with and without that
   check.
 
+`depth-inertial-odometry` is live 6-DoF odometry from the depth cloud and the IMU: the IMU predicts, each
+cloud is registered against a local map, and an error-state Kalman filter blends them. It runs on a
+simulator; its [README](depth-inertial-odometry/README.md) compares its three maps for accuracy and for
+speed on a Raspberry Pi 5.
+
 `perception-wire` is the Rust side of the perception messages in `lib/dora-rig-messages`; its tests read
 that package's golden fixtures.
 
