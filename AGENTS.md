@@ -10,11 +10,17 @@ what is open.
   line in another session's file, ask them first.
 - Commit and push only when robert says so.
 - Build and test on strixen, the server (`ssh -i ~/.ssh/id_ed25519_robert-inviol robert_inviol@192.168.111.34`). Sync
-  the worktree to `~/spatial/base` with `rsync -az --exclude target --exclude .git`, then:
+  the worktree to `~/dora-robot-perception` there with `rsync -az --delete --exclude target --exclude .git --exclude
+  .venv --exclude imu-calibration.json`, then:
   - Rust: `cargo test -q --workspace` and `cargo clippy -q --workspace --all-targets` in each workspace you touched
     (`nodes/dora-depth-perception`, `nodes/dora-world-agent`, `nodes/dora-people-3d`, ...). Every test must pass.
   - Python: `~/.local/bin/uv run --with pytest pytest -q` at the repo root.
   - Some synthetic-walk timing tests in dora-depth-perception fail on a laptop and pass on strixen.
+- The Pi (`ssh raspai`, checkout `~/src/dora-robot-nodes-dev`, a plain copy) only runs. Its Rust nodes are
+  cross-built on strixen by `./pi-build.sh ~/pi-out` (the script lists what it needs there), then copied:
+  `rsync -a strixen:pi-out/ raspai:src/dora-robot-nodes-dev/` from a machine that reaches both (strixen has no key
+  for the Pi). Sync the source to the Pi too, for the dataflows and the Python pose node. The Pi's IMU calibration
+  is `~/imu-calibration/calibration.json`, copied to `nodes/dora-realsense/examples/imu-calibration.json`.
 - Messages between machines are single-row Arrow structs, defined in Python in `lib/dora-rig-messages` and mirrored
   in Rust in `nodes/dora-depth-perception/perception-wire`. A field change goes in both, with the fixtures in
   `lib/dora-rig-messages/dora_rig_messages/fixtures` regenerated.
