@@ -12,6 +12,7 @@ perception-wire = { path = "../perception-wire" }
 room-map = { path = "../room-map" }
 dora-node-api.workspace = true
 eyre.workspace = true
+glam = "0.29"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 toml = "0.9"
@@ -20,4 +21,3 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 depth-perception = { path = "../depth-perception" }
-glam = "0.29"

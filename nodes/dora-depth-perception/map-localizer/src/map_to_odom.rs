@@ -5,14 +5,37 @@
 //! inverse. The estimate averages the corrections of the latest keyframes, each recomputed from the keyframe's
 //! current map pose, so an optimisation of the map moves it too; their spread gives the standard deviations.
 //! Odometry poses describe the same body as keyframe poses: the camera's gravity-aligned floor frame.
+//! `CameraMount` turns the odometry's IMU body pose into that floor frame.
 
 use std::collections::VecDeque;
 
-use glam::Vec3;
+use glam::{Quat, Vec3};
 use perception_wire::localization::{CameraNanos, FrameId, MapToOdom, Pose4};
 use perception_wire::navigation::MapVersion;
 use room_map::pose::wrap_angle;
 use room_map::Pose;
+
+/// The shortest level part of the camera's forward direction that still gives its floor frame a heading.
+const MIN_LEVEL_FORWARD: f32 = 0.1;
+
+/// Where the colour camera sits on the IMU body, whose axes are the camera's (x right, y down, z forward).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CameraMount {
+    /// The camera's optical centre in IMU coordinates.
+    pub camera_in_imu_m: Vec3,
+}
+
+impl CameraMount {
+    /// The camera's floor frame in the odometry frame (z up), from the IMU body's pose there: at the camera, facing
+    /// its forward direction made level. `None` when the camera faces too near straight up or down to have a heading.
+    pub fn floor_pose(&self, imu_position: Vec3, imu_orientation: Quat) -> Option<Pose> {
+        let level_forward = (imu_orientation * Vec3::Z).truncate();
+        if level_forward.length() < MIN_LEVEL_FORWARD {
+            return None;
+        }
+        Some(Pose { yaw_rad: (-level_forward.x).atan2(level_forward.y), translation: imu_position + imu_orientation * self.camera_in_imu_m })
+    }
+}
 
 /// Where odometry puts the camera's floor frame at a camera time.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -29,6 +52,8 @@ pub enum OdomError {
     NotCovered { wanted: i64, first: i64, last: i64 },
     #[error("there is no odometry yet")]
     Empty,
+    #[error("odometry at camera time {time} ns has the camera facing too near straight up or down to have a heading")]
+    NoHeading { time: i64 },
 }
 
 /// Recent odometry poses in camera-time order.
@@ -155,6 +180,20 @@ mod tests {
 
     fn pose(x: f32, y: f32, yaw: f32) -> Pose {
         Pose { yaw_rad: yaw, translation: Vec3::new(x, y, 0.0) }
+    }
+
+    #[test]
+    fn the_floor_pose_faces_the_cameras_level_forward_and_sits_at_the_camera() {
+        let mount = CameraMount { camera_in_imu_m: Vec3::new(0.03, 0.0, 0.0) };
+        // The camera's optical axes (x right, y down, z forward) turned to face the odometry frame's +x, level.
+        let facing_x = Quat::from_mat3(&glam::Mat3::from_cols(Vec3::new(0.0, -1.0, 0.0), Vec3::new(0.0, 0.0, -1.0), Vec3::X));
+        let floor = mount.floor_pose(Vec3::new(1.0, 2.0, 0.5), facing_x).unwrap();
+        assert!(wrap_angle(floor.yaw_rad + std::f32::consts::FRAC_PI_2).abs() < 1e-5, "floor y (forward) is odometry +x: {}", floor.yaw_rad);
+        assert!((floor.translation - Vec3::new(1.0, 1.97, 0.5)).length() < 1e-5, "{:?}", floor.translation);
+        let tilted_down = facing_x * Quat::from_rotation_x(-0.5);
+        assert!(wrap_angle(mount.floor_pose(Vec3::ZERO, tilted_down).unwrap().yaw_rad - floor.yaw_rad).abs() < 1e-5, "tilt leaves the heading");
+        let straight_down = facing_x * Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2);
+        assert_eq!(mount.floor_pose(Vec3::ZERO, straight_down), None);
     }
 
     #[test]

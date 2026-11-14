@@ -10,7 +10,7 @@ gravity-aligned floor frame from `depth-perception`.
 | `gyro` | Buffers every IMU sample; the turn about the vertical between keyframes, with the gyro bias measured on still spans (`room-map::heading`); no turn until the bias has been measured; the `HeadingHint` for a keyframe |
 | `localizer` | Per keyframe: seed from the previous optimised pose plus the gyro turn, register (room-map's `register_near_yaw`) against the map (the keyframes nearest the seed, however old, at their optimised poses), add the odometry edge; match keyframes older than `loops.skip_latest_keyframes` around the new pose as loop closures; relocalise after loss |
 | `pose_graph` | Nodes (x, y, z, yaw) per keyframe, odometry, loop-closure and dead-reckoning edges; Levenberg-Marquardt on an envelope Cholesky of the sparse normal equations; Huber loss on loop closures, which are dropped when the optimised graph contradicts them |
-| `map_to_odom` | The odometry frame's correction from keyframes with both a map and an odometry pose, against a local `OdomPose` |
+| `map_to_odom` | The odometry frame's correction from keyframes with both a map and an odometry pose; `CameraMount` turns the odometry's IMU body pose into the camera's floor frame |
 | `synthetic` | Rendered walks through the synthetic living room with IMU messages and true poses, for tests |
 
 ## Tracking states

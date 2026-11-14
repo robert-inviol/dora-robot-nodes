@@ -30,7 +30,7 @@ cargo run --release --example profile_frame -- <frame dir> [repeats]
 |---|---|---|
 | `dora-depth-perception` | `keyframe`, `segments` | `structure`: planes and room as soon as a keyframe arrives; `scene`: the same plus object footprints when its segments arrive |
 | `dora-keyframe-replay` | `tick` | `keyframe`: the next keyframe of the Arrow IPC recording in `KEYFRAME_RECORDING`, restamped; `KEYFRAME_REPLAY_LOOP=true` starts again at the end. `imu`: with `IMU_RECORDING`, the imu message leading up to each keyframe, sent just before it, its camera times moved on by one recording span per loop |
-| [`dora-map-localizer`](dora-map-localizer/README.md) | `keyframe`, `imu` (`odom_pose` is reserved) | `keyframe_pose`: each keyframe's pose in the map, with the map version and tracking state |
+| [`dora-map-localizer`](dora-map-localizer/README.md) | `keyframe`, `imu`, `odom_pose` | `keyframe_pose`: each keyframe's pose in the map, with the map version and tracking state; `map_to_odom`: the correction from odometry to the map |
 | [`dora-dense-map`](dora-dense-map/README.md) | `keyframe`, `keyframe_pose`, `object_update`, `tick` | `free_space`, `topology`: rooms, doorways, places and their graph; `keep_out`: zones around glass and mirrors |
 | [`dora-object-map`](dora-object-map/README.md) | `keyframe`, `keyframe_pose`, `segments` | `object_update`: an object appeared, updated, moved, disappeared or merged |
 

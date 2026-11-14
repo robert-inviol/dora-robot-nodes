@@ -26,7 +26,10 @@ nodes:
       imu:
         source: replay/imu
         queue_size: 1000
-      # Reserved for the robot's odometry; the node sends map_to_odom from it once odom_pose is defined.
-      # odom_pose: <odometry node>/odom_pose
+      # With an [odometry] section in the settings, the robot's odometry, and the map_to_odom output below:
+      # odom_pose:
+      #   source: <odometry node>/odom_pose
+      #   queue_size: 1000
     outputs:
       - keyframe_pose
+      # - map_to_odom
