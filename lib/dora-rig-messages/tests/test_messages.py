@@ -106,3 +106,37 @@ def test_imu_samples_without_a_timestamp_each_are_rejected():
 
     with pytest.raises(ValueError, match="imu gyro has 1 timestamps"):
         Imu(0, 0, np.zeros(0, np.int64), np.zeros((0, 3), np.float32), np.zeros(1, np.int64), np.zeros((2, 3), np.float32))
+
+
+def test_an_odom_pose_vector_of_the_wrong_length_is_rejected():
+    from dataclasses import replace
+
+    from dora_rig_messages.odometry import OdomPose
+
+    pose = EXAMPLES["odom_pose"]
+    assert isinstance(pose, OdomPose)
+    with pytest.raises(ValueError, match="orientation_xyzw has 3 values, not 4"):
+        replace(pose, orientation_xyzw=(0.0, 0.0, 1.0))
+    wire = pose.to_arrow().to_pylist()[0] | {"position_m": [1.0, 2.0]}
+    with pytest.raises(ValueError, match="position_m has 2 values, not 3"):
+        OdomPose.from_arrow(pa.array([wire], type=pose.to_arrow().type))
+
+
+@pytest.mark.parametrize("lone", ["weakest_direction", "weakest_sigma_m"])
+def test_an_odom_pose_with_half_of_its_weakest_direction_is_rejected(lone):
+    from dora_rig_messages.odometry import ODOM_POSE_TYPE, OdomPose
+
+    half = EXAMPLES["odom_pose"].to_arrow().to_pylist()[0] | {"weakest_direction": None, "weakest_sigma_m": None}
+    half[lone] = [0.0, 1.0, 0.0] if lone == "weakest_direction" else 0.125
+
+    with pytest.raises(ValueError, match="one of weakest_direction and weakest_sigma_m without the other"):
+        OdomPose.from_arrow(pa.array([half], type=ODOM_POSE_TYPE))
+
+
+def test_an_odom_pose_missing_a_required_field_is_rejected():
+    from dora_rig_messages.odometry import ODOM_POSE_TYPE, OdomPose
+
+    unstamped = EXAMPLES["odom_pose"].to_arrow().to_pylist()[0] | {"camera_ns": None}
+
+    with pytest.raises(ValueError, match="missing camera_ns"):
+        OdomPose.from_arrow(pa.array([unstamped], type=ODOM_POSE_TYPE))

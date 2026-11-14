@@ -9,7 +9,10 @@ use glam::{DQuat, DVec3, Vec3};
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 
+use crate::depth_image::PinholeIntrinsics;
+use crate::imu_pairing::{AccelReading, GyroReading};
 use crate::odometry::ImuSample;
+use crate::thinning::SensorMount;
 
 /// An axis-aligned box in the world.
 #[derive(Clone, Copy, Debug)]
@@ -116,6 +119,58 @@ impl DepthCamera {
     }
 }
 
+/// A depth camera as a pinhole that writes raw depth images: millimetres along the optical axis, zero
+/// where there is no reading. Its optical frame has x right, y down and z forward.
+#[derive(Clone, Copy, Debug)]
+pub struct PinholeDepthCamera {
+    pub intrinsics: PinholeIntrinsics,
+    pub min_depth_m: f64,
+    pub max_depth_m: f64,
+    /// Depth error sigma per square metre of depth.
+    pub noise_per_square_m: f64,
+}
+
+impl PinholeDepthCamera {
+    /// The mount of a sensor that looks along a body whose x is forward, y left and z up, from the
+    /// body's origin: the depth-to-IMU rotation, column major.
+    pub const FACING_FORWARD: [f32; 9] = [0.0, -1.0, 0.0, 0.0, 0.0, -1.0, 1.0, 0.0, 0.0];
+
+    /// The D455's field of view and depth error at a width and height in pixels, with the optical
+    /// axis through the middle of the image.
+    pub fn d455(width: usize, height: usize) -> PinholeDepthCamera {
+        let focal = |pixels: usize, view_deg: f64| (pixels as f64 / 2.0 / (view_deg.to_radians() / 2.0).tan()) as f32;
+        let middle = |pixels: usize| (pixels as f32 - 1.0) / 2.0;
+        PinholeDepthCamera {
+            intrinsics: PinholeIntrinsics { width, height, fx: focal(width, 87.0), fy: focal(height, 58.0), ppx: middle(width), ppy: middle(height) },
+            min_depth_m: 0.4,
+            max_depth_m: 6.0,
+            noise_per_square_m: 0.005,
+        }
+    }
+
+    /// Fills `depth_mm` with the image the camera takes from a body pose through a mount, row major,
+    /// with depth noise.
+    pub fn image(&self, scene: &Scene, position: DVec3, rotation: DQuat, mount: &SensorMount, rng: &mut SmallRng, depth_mm: &mut Vec<u16>) {
+        let k = self.intrinsics;
+        let (origin, optical_to_world) = (position + rotation * mount.translation_m, rotation * mount.rotation);
+        depth_mm.clear();
+        depth_mm.reserve(k.width * k.height);
+        for row in 0..k.height {
+            for column in 0..k.width {
+                // The component along the optical axis is one, so the distance along the ray is the depth.
+                let ray = DVec3::new(((column as f32 - k.ppx) / k.fx) as f64, ((row as f32 - k.ppy) / k.fy) as f64, 1.0);
+                let depth = scene.first_hit(origin, optical_to_world * ray);
+                if depth < self.min_depth_m || depth > self.max_depth_m {
+                    depth_mm.push(0);
+                    continue;
+                }
+                let noisy = depth + self.noise_per_square_m * depth * depth * standard_normal(rng);
+                depth_mm.push((noisy * 1e3).round().clamp(1.0, u16::MAX as f64) as u16);
+            }
+        }
+    }
+}
+
 /// What the simulated IMU gets wrong.
 #[derive(Clone, Copy, Debug)]
 pub struct ImuErrors {
@@ -189,6 +244,18 @@ impl Walk {
         (gyro, accel)
     }
 
+    /// One sample of the gyro's own stream.
+    pub fn gyro_reading(&self, time: Duration, errors: &ImuErrors, rng: &mut SmallRng) -> GyroReading {
+        let (gyro, _) = self.true_imu(time.as_secs_f64());
+        GyroReading { time, rad_s: gyro + errors.gyro_bias_rad_s + noise(errors.gyro_noise_rad_s, rng) }
+    }
+
+    /// One sample of the accelerometer's own stream.
+    pub fn accel_reading(&self, time: Duration, errors: &ImuErrors, rng: &mut SmallRng) -> AccelReading {
+        let (_, accel) = self.true_imu(time.as_secs_f64());
+        AccelReading { time, m_s2: accel + errors.accel_bias_m_s2 + noise(errors.accel_noise_m_s2, rng) }
+    }
+
     pub fn imu_sample(&self, time: Duration, errors: &ImuErrors, rng: &mut SmallRng) -> ImuSample {
         let (gyro, accel) = self.true_imu(time.as_secs_f64());
         let noise = |sigma: f64, rng: &mut SmallRng| DVec3::new(standard_normal(rng), standard_normal(rng), standard_normal(rng)) * sigma;
@@ -200,8 +267,41 @@ impl Walk {
     }
 }
 
+/// When the gyro and the accelerometer take their samples: each at its own rate, the accelerometer's
+/// offset from the gyro's.
+#[derive(Clone, Copy, Debug)]
+pub struct ImuStreams {
+    pub gyro_period: Duration,
+    pub accel_period: Duration,
+    pub accel_offset: Duration,
+}
+
+impl ImuStreams {
+    /// A gyro at 400 Hz and an accelerometer at 200 Hz that never sample at the same instant.
+    pub fn d455() -> ImuStreams {
+        ImuStreams { gyro_period: Duration::from_micros(2500), accel_period: Duration::from_micros(5000), accel_offset: Duration::from_micros(1300) }
+    }
+
+    /// Every sample of both streams taken after `after` and up to `through`, oldest first: what a
+    /// camera hands over as one batch.
+    pub fn batch(&self, walk: &Walk, errors: &ImuErrors, after: Option<Duration>, through: Duration, rng: &mut SmallRng) -> (Vec<AccelReading>, Vec<GyroReading>) {
+        let times = |period: Duration, offset: Duration| {
+            let first = after.map_or(0, |after| after.saturating_sub(offset).as_nanos() / period.as_nanos() + u128::from(after >= offset));
+            (first as u32..).map(move |index| offset + period * index).take_while(move |&time| time <= through)
+        };
+        let gyro = times(self.gyro_period, Duration::ZERO).map(|time| walk.gyro_reading(time, errors, rng)).collect();
+        let accel = times(self.accel_period, self.accel_offset).map(|time| walk.accel_reading(time, errors, rng)).collect();
+        (accel, gyro)
+    }
+}
+
 pub fn seeded(seed: u64) -> SmallRng {
     SmallRng::seed_from_u64(seed)
+}
+
+/// Independent noise of one sigma on each axis.
+fn noise(sigma: f64, rng: &mut SmallRng) -> DVec3 {
+    DVec3::new(standard_normal(rng), standard_normal(rng), standard_normal(rng)) * sigma
 }
 
 /// A draw from the standard normal distribution (Box-Muller).
@@ -221,6 +321,32 @@ mod tests {
         let cloud = camera.cloud(&scene, DVec3::new(0.0, 0.0, 1.0), DQuat::IDENTITY, &mut seeded(1));
         let ahead = cloud.iter().filter(|p| p.y.abs() < 0.05 && p.z.abs() < 0.05).map(|p| p.x).fold(0.0f32, f32::max);
         assert!((ahead - 3.0).abs() < 1e-4, "{ahead}");
+    }
+
+    #[test]
+    fn a_level_pinhole_camera_images_the_wall_ahead_at_its_distance_in_millimetres() {
+        let scene = Scene { room: Cuboid { min: DVec3::new(-3.0, -2.5, 0.0), max: DVec3::new(3.0, 2.5, 2.4) }, furniture: Vec::new() };
+        let camera = PinholeDepthCamera { noise_per_square_m: 0.0, ..PinholeDepthCamera::d455(212, 120) };
+        let mount = SensorMount::from_depth_to_imu(PinholeDepthCamera::FACING_FORWARD, [0.0; 3]).expect("a rotation");
+        let mut depth_mm = Vec::new();
+        camera.image(&scene, DVec3::new(0.0, 0.0, 1.0), DQuat::IDENTITY, &mount, &mut seeded(1), &mut depth_mm);
+        assert_eq!(depth_mm.len(), 212 * 120);
+        // Depth is along the optical axis, so the whole wall ahead reads its distance.
+        assert_eq!(depth_mm[60 * 212 + 106], 3000);
+        assert_eq!(depth_mm[40 * 212 + 150], 3000);
+        // The bottom row looks down at the floor a metre below, nearer than the wall.
+        let floor = depth_mm[119 * 212 + 106];
+        assert!(floor > 1500 && floor < 2000, "{floor}");
+    }
+
+    #[test]
+    fn imu_batches_follow_on_without_a_gap_or_a_repeat() {
+        let (walk, errors, streams) = (Walk::carried(Duration::from_secs(2)), ImuErrors::consumer(), ImuStreams::d455());
+        let micros = |accel: &[AccelReading], gyro: &[GyroReading]| (accel.iter().map(|a| a.time.as_micros()).collect::<Vec<_>>(), gyro.iter().map(|g| g.time.as_micros()).collect::<Vec<_>>());
+        let (accel, gyro) = streams.batch(&walk, &errors, None, Duration::from_micros(7500), &mut seeded(1));
+        assert_eq!(micros(&accel, &gyro), (vec![1300, 6300], vec![0, 2500, 5000, 7500]));
+        let (accel, gyro) = streams.batch(&walk, &errors, Some(Duration::from_micros(7500)), Duration::from_micros(16300), &mut seeded(1));
+        assert_eq!(micros(&accel, &gyro), (vec![11300, 16300], vec![10000, 12500, 15000]));
     }
 
     #[test]

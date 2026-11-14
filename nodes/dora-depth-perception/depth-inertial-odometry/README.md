@@ -36,6 +36,52 @@ let outcome = odometry.add_cloud(time, &sensor_points)?; // every depth frame, a
 let (position, rotation) = odometry.state().levelled_pose();
 ```
 
+### From a camera's raw streams
+
+`PoseTracker` (`tracker`) is the same loop fed with what a camera gives: raw depth images and the IMU's
+two streams. It holds the pieces in between:
+
+- **Depth image to cloud** (`depth_image`). `DepthProjector` turns a row-major image of `u16`
+  millimetres (zero is no reading) and pinhole intrinsics into points in the depth stream's optical
+  frame: x right, y down, z forward. It reads every `stride`-th pixel of every `stride`-th row.
+- **Mount** (`SensorMount::from_depth_to_imu`). The camera's depth-to-IMU transform, a column-major 3x3
+  rotation and a translation, takes those points to the body frame, which is the IMU's.
+- **IMU pairing** (`imu_pairing`). The accelerometer and the gyro stamp their own samples at their own
+  rates. `ImuPairer` gives one sample per gyro sample with the accelerometer interpolated to its time,
+  and holds gyro samples newer than the latest accelerometer sample until the accelerometer passes them.
+- **Start.** The tracker collects `rest_for` of samples and starts with `StillStart`. A window in which
+  the body moved comes back as `TrackerError::NotAtRest`; collection has then begun again, so feeding on
+  tries the next window.
+
+```rust
+let mount = SensorMount::from_depth_to_imu(depth_to_imu_rotation, depth_to_imu_translation_m)?;
+let mut tracker = PoseTracker::new(depth_intrinsics, mount, PlaneVoxelMap::new(PlaneVoxelSettings::indoors()), TrackerSettings::d455())?;
+tracker.add_imu(&accel_readings, &gyro_readings)?;          // every batch, before the frame it leads up to
+match tracker.add_depth_frame(time, frame_id, &depth_mm)? { // every depth frame
+    DepthFrameOutcome::AwaitingStart => {}
+    DepthFrameOutcome::Posed(pose) => { /* a FramePose */ }
+}
+```
+
+A `FramePose` is the estimate at the frame's time in the level frame: position, orientation, velocity,
+one-sigma position along the level axes, one-sigma tilt and heading, whether the cloud corrected the
+estimate, how many points matched and the weakest direction. It carries every field of the `odom_pose`
+message in `lib/dora-rig-messages`. A frame whose cloud cannot correct still gets a pose, the IMU's
+prediction, marked `CloudUse::NotCorrected`. Pose times strictly increase: a frame not newer than the
+last posed one is refused.
+
+The sigmas come from the filter's covariance (`State::levelled_uncertainty`). Levelling depends on up,
+so a doubt in up reaches the level position (it swings the position about the start) and the tilt; tilt
+is the body's orientation error and the error in up taken together, about the level axis where it is
+known worst. They are sigmas against the odometry's own map and do not include its drift.
+
+A depth frame is handled at its own time: IMU samples up to it go in first, newer ones wait for the next
+frame. When the frame is ahead of the IMU, the gyro samples up to it are paired with the latest
+accelerometer reading and the newest reading is held over the rest of the gap; a frame more than
+`max_imu_lag` (10 ms) ahead of either stream is refused with `TrackerError::ImuBehind`.
+
+### The odometry alone
+
 `add_cloud` reports how many points matched and the direction the cloud pinned down least, with the
 one-sigma uncertainty the cloud alone leaves along it (`CloudOutcome::Corrected::weakest`). A cloud that
 cannot correct the estimate is an error (`OdometryError::NotCorrected`): the estimate keeps the IMU's
@@ -48,10 +94,12 @@ lidar's points against wall lines, or "the robot stands on the floor", have this
 ```
 cargo test --release -p depth-inertial-odometry
 cargo run --release -p depth-inertial-odometry --example simulated_walk -- 60
+cargo run --release -p depth-inertial-odometry --example depth_frame_cost
 ```
 
-The example drives the simulated room for the given number of seconds with each map and prints accuracy
-and time per cloud. It is the benchmark behind the tables below.
+`simulated_walk` drives the simulated room for the given number of seconds with each map and prints
+accuracy and time per cloud. `depth_frame_cost` times depth-to-points and thinning on one simulated
+848 x 480 frame. They are the benchmarks behind the tables below.
 
 ## The three maps
 
@@ -123,9 +171,20 @@ A frame period at 30 Hz is 33 ms, so voxel planes take about 8% of one core. The
 threads, which leaves the other cores free. On a Ryzen 9 9950X with 32 threads the medians are 0.95, 1.17
 and 1.10 ms.
 
-Not in these times: turning a depth image into points. The simulated cloud is a quarter of the D455's
-848 x 480 depth resolution; a full frame is about 400,000 readings, and thinning cost grows with the
-number of readings.
+The simulated cloud is a quarter of the D455's 848 x 480 depth resolution each way. On a full frame,
+the two steps before registration cost, by the stride the image is read at (Raspberry Pi 5, median of
+300 repeats on one simulated frame of the room; neither step uses more than one thread, and the times
+with `RAYON_NUM_THREADS=1` are the same):
+
+| Stride | Points | Depth image to points | `Thinner::thin` | Thinned points |
+|---|---|---|---|---|
+| 1 | 407,040 | 1.62 ms | 21.6 ms | 819 |
+| 2 | 101,760 | 0.42 to 0.56 ms | 5.6 ms | 788 |
+| 4 | 25,440 | 0.11 to 0.15 ms | 1.6 ms | 721 |
+
+Thinning costs about 55 ns per reading, so a full frame takes two thirds of a 33 ms frame period on one
+core and a stride of 4 takes 5%. `TrackerSettings::d455` reads at a stride of 4, which is the density
+the simulated drives run at and loses an eighth of the thinned points.
 
 ## What a depth camera needs that a lidar does not
 
@@ -159,11 +218,14 @@ Each of these is in the code because the simulated drive failed without it.
   independent between neighbouring pixels.
 - The tests bound drift at 0.10 m and 1 degree over a 30 s drive for voxel planes, and 0.15 m and 2.5
   degrees for the neighbour maps. A drift under 0.05 m over that drive is not reached by any map.
-- The D455's gyro and accelerometer arrive as two streams at different rates; `ImuSample` wants both at
-  one time, so the caller pairs them.
-- `SensorMount` (depth sensor to IMU) is identity in `OdometrySettings::d455`; the camera's own
-  calibration has to fill it.
+- The tracker does not bound how long the pairer holds gyro samples while the accelerometer is silent,
+  nor how many IMU samples wait for a depth frame.
+- The full-resolution depth image is only subsampled, not averaged, before thinning.
 - People and other moving things are not masked out of the cloud.
 - The neighbour maps report their planes as exact, which is the source of their overconfidence.
 - Map points carry no memory of how uncertain the pose was when they were inserted.
-- No dora node, no pose message.
+- No dora node. The `odom_pose` message exists (`lib/dora-rig-messages`, mirrored in `perception-wire`),
+  and `FramePose` has its fields. What is missing is a binary that subscribes to `depth`, `imu` and
+  `calibration`, builds a `PoseTracker` from the calibration's depth intrinsics and depth-to-IMU
+  transform, feeds it and publishes each `FramePose` as `odom_pose`. It waits on the camera's depth and
+  calibration messages.

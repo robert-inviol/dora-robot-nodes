@@ -11,6 +11,7 @@ import pyarrow as pa
 from .drive import DriveDemand
 import numpy as np
 
+from .odometry import OdomPose, WeakestDirection
 from .operator import DriveMode, OperatorCommand
 from .perception import (
     CameraIntrinsics, Concepts, Imu, Keyframe, Plane, Room, Scene, SceneObject, Segments, SurfaceKind,
@@ -86,6 +87,32 @@ EXAMPLES: dict[str, Message] = {
         room=None,
         room_problem="no ceiling plane found, cannot bound the room",
         objects=(),
+    ),
+    "odom_pose": OdomPose(
+        camera_ns=1_762_560_000_100_000_000,
+        depth_frame_id=42,
+        position_m=(1.25, -0.5, 0.25),
+        orientation_xyzw=(0.5, -0.5, 0.5, 0.5),
+        velocity_m_s=(0.375, 0.0, -0.0625),
+        position_sigma_m=(0.015625, 0.03125, 0.0078125),
+        tilt_sigma_rad=0.00390625,
+        heading_sigma_rad=0.0078125,
+        corrected=True,
+        matched_points=1234,
+        weakest=WeakestDirection(direction=(0.0, 1.0, 0.0), sigma_m=0.125),
+    ),
+    "odom_pose_predicted": OdomPose(
+        camera_ns=1_762_560_000_133_000_000,
+        depth_frame_id=43,
+        position_m=(1.5, -0.5, 0.25),
+        orientation_xyzw=(0.0, 0.0, 1.0, 0.0),
+        velocity_m_s=(0.375, 0.0, 0.0),
+        position_sigma_m=(0.03125, 0.0625, 0.015625),
+        tilt_sigma_rad=0.00390625,
+        heading_sigma_rad=0.015625,
+        corrected=False,
+        matched_points=0,
+        weakest=None,
     ),
 }
 

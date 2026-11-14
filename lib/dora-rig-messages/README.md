@@ -19,6 +19,7 @@ and read against those files, and a Rust node's tests can check against the same
 | concepts | `perception.py` | `model`; `frame_id`; `concepts`: object types named so far; `complete` |
 | segments | `perception.py` | `frame_id`; `width`, `height`; `labels`; `scores`; `segment_ids`: int16 per pixel, index into labels or -1, smaller masks winning overlaps |
 | scene | `perception.py` | `frame_id`; `captured_unix_ns`; `camera_forward`, `camera_up`; `planes`; `room` (null with a `room_problem` when it cannot be bounded); `objects` with footprints; all in the gravity-aligned floor frame (x right, y forward, z up, metres) |
+| odom pose | `odometry.py` | `camera_ns`: the depth frame's time on the camera's clock, strictly increasing from pose to pose; `depth_frame_id`; `position_m` of the IMU body and `orientation_xyzw` (body to odom) in the odom frame, fixed where the IMU rested at the start with z up; `velocity_m_s`; `position_sigma_m` along the odom axes, `tilt_sigma_rad`, `heading_sigma_rad`: one sigma against the odometry's own map, drift not included; `corrected`: whether the depth cloud corrected the pose; `matched_points`; `weakest_direction` with `weakest_sigma_m`: the direction the cloud pinned down least, both null when not corrected. For the pose at another camera time, interpolate between the two nearest rows on `camera_ns` |
 
 A drive demand says nothing about the robot underneath. Whatever drives the wheels or tracks
 mixes `forward` and `turn` for its own kinematics, and because the magnitudes sum to at most 1 no

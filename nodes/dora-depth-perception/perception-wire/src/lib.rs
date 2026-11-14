@@ -15,6 +15,8 @@ use dora_node_api::arrow::datatypes::{
 use eyre::{bail, eyre, Context, Result};
 use glam::Vec3;
 
+pub mod odometry;
+
 pub const NO_SEGMENT: i16 = -1;
 
 pub struct Keyframe {

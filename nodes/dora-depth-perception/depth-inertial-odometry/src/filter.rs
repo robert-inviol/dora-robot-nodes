@@ -11,7 +11,7 @@
 //! small rotation of it about the world's x and y axes.
 
 use glam::{DMat3, DQuat, DVec3};
-use nalgebra::{SMatrix, SVector};
+use nalgebra::{Matrix3, SMatrix, SVector};
 
 pub const ERROR_DIMENSIONS: usize = 17;
 pub type ErrorCovariance = SMatrix<f64, ERROR_DIMENSIONS, ERROR_DIMENSIONS>;
@@ -78,11 +78,84 @@ impl State {
         (levelling * self.position, levelling * self.rotation)
     }
 
+    /// Velocity in the level frame that [`Self::levelling`] turns the world frame into.
+    pub fn levelled_velocity(&self) -> DVec3 {
+        self.levelling() * self.velocity
+    }
+
     /// A body-frame point in the world.
     #[inline]
     pub fn to_world(&self, body_point: DVec3) -> DVec3 {
         self.rotation * body_point + self.position
     }
+
+    /// How an error in up turns the levelling: for each of the two numbers of an error in up, the
+    /// small rotation of the level frame it causes, as a rotation vector in the level frame.
+    fn levelling_turn_per_up_error(&self) -> [DVec3; 2] {
+        let levelling = self.levelling();
+        // The levelling is the shortest turn from up to z, so its axis stays level as up moves. That
+        // adds a turn about z, in proportion to the level turn across the levelling's axis and to the
+        // tangent of half the levelling's angle.
+        let about_z_per_level_turn = DVec3::new(self.up.x, self.up.y, 0.0) / (1.0 + self.up.z);
+        [DVec3::X, DVec3::Y].map(|axis| {
+            let undone = -(levelling * axis);
+            let level_turn = DVec3::new(undone.x, undone.y, 0.0);
+            level_turn + DVec3::Z * about_z_per_level_turn.dot(level_turn)
+        })
+    }
+
+    /// How an error-state step moves the levelled position, to first order.
+    fn levelled_position_per_error(&self) -> LevelledJacobian {
+        let levelling = self.levelling();
+        let mut jacobian = LevelledJacobian::zeros();
+        jacobian.fixed_view_mut::<3, 3>(0, POSITION).copy_from(&matrix3(DMat3::from_quat(levelling)));
+        // Turning the level frame swings the position about the origin.
+        for (index, turn) in self.levelling_turn_per_up_error().into_iter().enumerate() {
+            set_column(&mut jacobian, UP + index, turn.cross(levelling * self.position));
+        }
+        jacobian
+    }
+
+    /// How an error-state step turns the levelled rotation, to first order, as a rotation vector in
+    /// the level frame.
+    fn levelled_turn_per_error(&self) -> LevelledJacobian {
+        let mut jacobian = LevelledJacobian::zeros();
+        jacobian.fixed_view_mut::<3, 3>(0, ORIENTATION).copy_from(&matrix3(DMat3::from_quat(self.levelling() * self.rotation)));
+        for (index, turn) in self.levelling_turn_per_up_error().into_iter().enumerate() {
+            set_column(&mut jacobian, UP + index, turn);
+        }
+        jacobian
+    }
+
+    /// One-sigma uncertainty of [`Self::levelled_pose`] under a covariance of this state's error.
+    pub fn levelled_uncertainty(&self, covariance: &ErrorCovariance) -> LevelledUncertainty {
+        let position_per_error = self.levelled_position_per_error();
+        let turn_per_error = self.levelled_turn_per_error();
+        let position = position_per_error * covariance * position_per_error.transpose();
+        let turn = turn_per_error * covariance * turn_per_error.transpose();
+        let sigma = |variance: f64| variance.max(0.0).sqrt();
+        // The larger eigenvalue of the two level axes' block.
+        let (mean, half_gap, cross) = (0.5 * (turn[(0, 0)] + turn[(1, 1)]), 0.5 * (turn[(0, 0)] - turn[(1, 1)]), turn[(0, 1)]);
+        LevelledUncertainty {
+            position_sigma_m: DVec3::new(sigma(position[(0, 0)]), sigma(position[(1, 1)]), sigma(position[(2, 2)])),
+            tilt_sigma_rad: sigma(mean + half_gap.hypot(cross)),
+            heading_sigma_rad: sigma(turn[(2, 2)]),
+        }
+    }
+}
+
+type LevelledJacobian = SMatrix<f64, 3, ERROR_DIMENSIONS>;
+
+/// One-sigma uncertainty of a levelled pose. It is the filter's own view: how well the pose is known
+/// against the map, not how far the map has drifted.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LevelledUncertainty {
+    /// Along the level frame's x, y and z.
+    pub position_sigma_m: DVec3,
+    /// How far the body's lean against gravity may be off, about the level axis where it is known worst.
+    pub tilt_sigma_rad: f64,
+    /// How far the body's turn about up may be off.
+    pub heading_sigma_rad: f64,
 }
 
 /// How noisy the IMU is, as densities: the noise in one second of integration.
@@ -260,6 +333,11 @@ impl ErrorStateFilter {
         &self.covariance
     }
 
+    /// One-sigma uncertainty of the state's levelled pose.
+    pub fn levelled_uncertainty(&self) -> LevelledUncertainty {
+        self.state.levelled_uncertainty(&self.covariance)
+    }
+
     /// One-sigma position uncertainty along a world direction.
     pub fn position_sigma_m(&self, direction_world: DVec3) -> f64 {
         let d = SVector::<f64, 3>::new(direction_world.x, direction_world.y, direction_world.z);
@@ -387,6 +465,16 @@ fn set_vector(vector: &mut ErrorVector, start: usize, value: DVec3) {
     }
 }
 
+fn set_column(jacobian: &mut LevelledJacobian, column: usize, value: DVec3) {
+    for axis in 0..3 {
+        jacobian[(axis, column)] = value[axis];
+    }
+}
+
+fn matrix3(matrix: DMat3) -> Matrix3<f64> {
+    Matrix3::from_column_slice(&matrix.to_cols_array())
+}
+
 fn set_block(matrix: &mut ErrorCovariance, row: usize, column: usize, block: DMat3) {
     for c in 0..3 {
         for r in 0..3 {
@@ -497,6 +585,92 @@ mod tests {
         let (position, rotation) = state.levelled_pose();
         assert!((state.levelling() * state.up - DVec3::Z).length() < 1e-12);
         assert!((position.length() - state.position.length()).abs() < 1e-12 && rotation.angle_between(state.rotation) < 0.05);
+    }
+
+    #[test]
+    fn the_levelled_pose_jacobians_match_a_finite_difference() {
+        // Up far from the world's z, so the turn the levelling adds about z is large enough to check.
+        let state = State { up: DVec3::new(0.3, -0.2, 1.0).normalize(), ..in_motion() };
+        let (position, rotation) = state.levelled_pose();
+        let (position_per_error, turn_per_error) = (state.levelled_position_per_error(), state.levelled_turn_per_error());
+        for axis in 0..ERROR_DIMENSIONS {
+            let mut step = ErrorVector::zeros();
+            step[axis] = 1e-6;
+            let (moved_position, moved_rotation) = state.plus(&step).levelled_pose();
+            let numeric_position = (moved_position - position) / 1e-6;
+            let numeric_turn = (moved_rotation * rotation.conjugate()).to_scaled_axis() / 1e-6;
+            let column = |jacobian: &LevelledJacobian| DVec3::new(jacobian[(0, axis)], jacobian[(1, axis)], jacobian[(2, axis)]);
+            assert!((numeric_position - column(&position_per_error)).length() < 1e-5, "axis {axis}: position {numeric_position} against {}", column(&position_per_error));
+            assert!((numeric_turn - column(&turn_per_error)).length() < 1e-5, "axis {axis}: turn {numeric_turn} against {}", column(&turn_per_error));
+        }
+    }
+
+    fn with_variances(variances: &[(usize, f64)]) -> ErrorCovariance {
+        let mut covariance = ErrorCovariance::zeros();
+        for &(index, sigma) in variances {
+            covariance[(index, index)] = sigma * sigma;
+        }
+        covariance
+    }
+
+    fn close(a: f64, b: f64) -> bool {
+        (a - b).abs() < 1e-9
+    }
+
+    #[test]
+    fn position_sigmas_in_a_level_world_are_the_world_axes_sigmas() {
+        let state = at_rest(DQuat::from_rotation_z(0.7));
+        let found = state.levelled_uncertainty(&with_variances(&[(POSITION, 0.03), (POSITION + 1, 0.05), (POSITION + 2, 0.07)]));
+        assert!((found.position_sigma_m - DVec3::new(0.03, 0.05, 0.07)).length() < 1e-12, "{found:?}");
+        assert!(found.tilt_sigma_rad == 0.0 && found.heading_sigma_rad == 0.0, "{found:?}");
+    }
+
+    #[test]
+    fn position_sigmas_follow_the_levelling_of_a_tilted_world() {
+        // Up leans 30 degrees from the world's z towards minus y, so levelling turns the world 30
+        // degrees about x: a doubt along the world's y is shared between level y and z.
+        let lean = 30f64.to_radians();
+        let state = State { up: DVec3::new(0.0, -lean.sin(), lean.cos()), ..at_rest(DQuat::IDENTITY) };
+        let found = state.levelled_uncertainty(&with_variances(&[(POSITION, 0.02), (POSITION + 1, 0.1)]));
+        assert!((found.position_sigma_m - DVec3::new(0.02, 0.1 * lean.cos(), 0.1 * lean.sin())).length() < 1e-12, "{found:?}");
+    }
+
+    #[test]
+    fn an_orientation_doubt_about_a_body_axis_lands_on_the_level_axis_that_body_axis_lies_along() {
+        // The body is pitched a quarter turn nose down, so its x axis points along minus z, and yawed
+        // nowhere: a doubt about body x is a doubt of heading, one about body z is a doubt of tilt.
+        let state = at_rest(DQuat::from_rotation_y(std::f64::consts::FRAC_PI_2));
+        let about_body_x = state.levelled_uncertainty(&with_variances(&[(ORIENTATION, 0.04)]));
+        assert!(close(about_body_x.heading_sigma_rad, 0.04) && close(about_body_x.tilt_sigma_rad, 0.0), "{about_body_x:?}");
+        let about_body_z = state.levelled_uncertainty(&with_variances(&[(ORIENTATION + 2, 0.04)]));
+        assert!(close(about_body_z.heading_sigma_rad, 0.0) && close(about_body_z.tilt_sigma_rad, 0.04), "{about_body_z:?}");
+    }
+
+    #[test]
+    fn tilt_sigma_is_the_worse_of_the_two_level_axes() {
+        let found = at_rest(DQuat::IDENTITY).levelled_uncertainty(&with_variances(&[(ORIENTATION, 0.01), (ORIENTATION + 1, 0.03), (ORIENTATION + 2, 0.002)]));
+        assert!(close(found.tilt_sigma_rad, 0.03) && close(found.heading_sigma_rad, 0.002), "{found:?}");
+    }
+
+    #[test]
+    fn a_doubt_in_up_becomes_a_doubt_in_height_that_grows_with_distance_from_the_start() {
+        // Two metres along x from the start, with up unsure by 0.01 rad about y: the level frame may
+        // lean that far, which lifts or drops the body by two centimetres and leaves x and y alone.
+        let state = State { position: DVec3::new(2.0, 0.0, 0.0), ..at_rest(DQuat::IDENTITY) };
+        let found = state.levelled_uncertainty(&with_variances(&[(UP + 1, 0.01)]));
+        assert!((found.position_sigma_m - DVec3::new(0.0, 0.0, 0.02)).length() < 1e-12, "{found:?}");
+        assert!(close(found.tilt_sigma_rad, 0.01) && close(found.heading_sigma_rad, 0.0), "{found:?}");
+    }
+
+    #[test]
+    fn a_world_and_a_body_mislevelled_together_leave_the_tilt_known() {
+        // The same unknown turn about x in the body's orientation and in up: the body leans against
+        // true up exactly as estimated, however unsure each is alone.
+        let mut covariance = with_variances(&[(ORIENTATION, 0.02), (UP, 0.02)]);
+        covariance[(ORIENTATION, UP)] = 0.02 * 0.02;
+        covariance[(UP, ORIENTATION)] = 0.02 * 0.02;
+        let found = at_rest(DQuat::IDENTITY).levelled_uncertainty(&covariance);
+        assert!(close(found.tilt_sigma_rad, 0.0), "{found:?}");
     }
 
     #[test]
