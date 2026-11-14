@@ -22,6 +22,41 @@ what is open.
   primitives, then contracts, then error handling; comments describe the current state only; ASCII punctuation only.
   A design choice needs robert's approval before it is built.
 
+## The pipeline as built
+
+Three machines, joined by `dora-zenoh-bridge` on Zenoh keys `rig/*`.
+
+Camera machine (Pi with the D455 and a Hailo-8), `nodes/dora-realsense/examples/pose-dataflow.yml`:
+
+```
+dora-realsense (the only node that opens the D455; every stamp on the camera clock)
+ |- model_input ---------------> pose (YOLOv8 pose + hailotracker on the Hailo-8) -> person_poses -> people
+ |- depth, imu, calibration ---> odometry (dora-depth-inertial-odometry) -> odom_pose -> people, link
+ '- depth, calibration --------> people (dora-people-3d) -> people_tracks (odom frame) -> link
+link: listens on :7447, publishes rig/people_tracks and rig/odom_pose
+```
+
+The older camera dataflow, `nodes/dora-realsense-keyframes/examples/camera-dataflow.yml`, opens the D455 itself and
+publishes `rig/keyframe` and `rig/imu` (depth aligned to 1280x720 colour, a keyframe at least once a second and
+sooner on a turn). The two cannot run at once: both open the camera and listen on :7447.
+
+GPU machine, `nodes/dora-depth-perception/examples/live-dataflow.yml`: SAM 3 segments, scene concepts and geometry
+from `rig/keyframe`; publishes `rig/segments`.
+
+Server (strixen), `nodes/dora-depth-perception/examples/spatial-server-dataflow.yml`:
+
+```
+link: connects to the camera machine; subscribes rig/keyframe, rig/imu, rig/segments, rig/people_tracks,
+      rig/space_question, rig/goal_status
+ |- keyframe, imu -> localizer (dora-map-localizer) -> keyframe_pose -> dense_map, objects, spatial_agent
+ |- keyframe, keyframe_pose, object_update -> dense_map -> free_space -> spatial_agent
+ |- keyframe, keyframe_pose, segments -> objects (dora-object-map) -> object_update -> spatial_agent
+ '- people_tracks -> spatial_agent (dora-world-agent: SQLite world store, MCP tools, spatial agents)
+```
+
+So today a live run gives either people and odometry (pose-dataflow) or localization and mapping
+(camera-dataflow), never both, and `rig/odom_pose` has no subscriber on the server.
+
 ## People in the world store
 
 People tracks reach the spatial agent's world store this way:
@@ -49,11 +84,28 @@ dora-map-localizer joins each registered keyframe to the odometry pose at its ca
 odometry started again in a new frame: the localizer drops the old frame's poses and correction and re-anchors from
 the next keyframe in the new frame. A start that goes back, or a camera time that goes back, stops the node.
 
-## Open
+## Next
 
-- The `odom_pose` input and `map_to_odom` output of the localizer are commented out in
-  `spatial-server-dataflow.yml`, as is the `map_to_odom` input of `spatial_agent`. Wire them once the camera machine
-  publishes `rig/odom_pose`; until then no people reach the world store in a live run.
+In order; the first two are what it takes for people to reach the world store in a live run.
+
+1. One camera dataflow (approved by robert, with robert-27). Keyframes and their imu messages come from a node fed
+   by dora-realsense's outputs inside `pose-dataflow.yml`, and its link also publishes `keyframe=rig/keyframe` and
+   `imu=rig/imu`. dora-realsense stays the only node that opens the camera; the server's subscriptions do not
+   change. This also puts keyframes and `odom_pose` on one camera clock from one camera session, which
+   `map_to_odom` needs. Each of these goes to robert as a proposal before it is built:
+   - reusing `rgbd-keyframes` (the picker and gravity estimate, which build without librealsense), and whether
+     dora-realsense-keyframes retires;
+   - aligning depth to colour from the calibration message's intrinsics and `depth_to_color`;
+   - colour through dora-realsense's `request_color` for the picked frame only, holding its depth until it arrives;
+   - one imu message per keyframe holding every sample since the previous keyframe, sent before it, keeping
+     dora-realsense's `frame_id` and camera time;
+   - `KEYFRAME_RECORD_PATH` and `IMU_RECORD_PATH` recordings for `dora-keyframe-replay`.
+2. Wire odometry on the server. The `odom_pose` input and `map_to_odom` output of the localizer are commented out in
+   `spatial-server-dataflow.yml`, as is the `map_to_odom` input of `spatial_agent`: subscribe
+   `rig/odom_pose=odom_pose` on the link, add an `[odometry]` section to the localizer settings, and uncomment them.
+
+Also open:
+
 - dora-people-3d gains `skeleton_3d`: joints fitted to a skeleton with fixed bone lengths. Whether the world store
   records joints from `skeleton_3d` instead of `keypoints_3d` is for robert to decide.
 - `camera_in_imu_m` in the localizer's `[odometry]` settings is set by hand. It could be read from the camera's
