@@ -1,0 +1,20 @@
+[package]
+name = "dora-depth-inertial-odometry"
+version = "0.1.0"
+description = "dora node that tracks the camera's pose from its depth frames and IMU samples and sends it as odom_pose"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+depth-inertial-odometry = { path = "../depth-inertial-odometry" }
+perception-wire = { path = "../perception-wire" }
+dora-node-api.workspace = true
+eyre.workspace = true
+glam = "0.29"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+rand = { version = "0.8", default-features = false, features = ["small_rng"] }

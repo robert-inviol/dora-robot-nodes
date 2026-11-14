@@ -641,6 +641,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "dora-depth-inertial-odometry"
+version = "0.1.0"
+dependencies = [
+ "depth-inertial-odometry",
+ "dora-node-api",
+ "eyre",
+ "glam",
+ "perception-wire",
+ "rand",
+ "thiserror 2.0.21",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "dora-depth-perception"
 version = "0.1.0"
 dependencies = [

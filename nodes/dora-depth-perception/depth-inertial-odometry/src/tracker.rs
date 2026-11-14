@@ -33,6 +33,9 @@ pub struct TrackerSettings {
     /// How far a depth frame's time may be ahead of the newest sample of either IMU stream. Over that
     /// gap the newest reading is held.
     pub max_imu_lag: Duration,
+    /// The longest span of camera time over the samples held for what they wait on: one IMU stream's
+    /// samples for the other stream, or paired samples for a depth frame. A longer span is refused.
+    pub max_backlog: Duration,
 }
 
 impl TrackerSettings {
@@ -43,6 +46,7 @@ impl TrackerSettings {
             rest_for: Duration::from_secs(2),
             depth_stride: NonZeroUsize::new(4).expect("four is not zero"),
             max_imu_lag: Duration::from_millis(10),
+            max_backlog: Duration::from_secs(1),
         }
     }
 }
@@ -124,6 +128,23 @@ pub enum DepthFrameOutcome {
     Posed(FramePose),
 }
 
+/// What held IMU samples wait on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Awaited {
+    /// The stream whose samples the other stream's are paired with.
+    Imu(ImuStream),
+    DepthFrame,
+}
+
+impl std::fmt::Display for Awaited {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Awaited::Imu(stream) => write!(f, "{stream} sample"),
+            Awaited::DepthFrame => f.write_str("depth frame"),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum TrackerError {
     Imu(ImuOutOfOrder),
@@ -136,6 +157,9 @@ pub enum TrackerError {
     /// A depth frame further ahead of a stream's newest sample than the settings allow; `latest` is
     /// that sample's time, if the stream has given any. The frame is left out.
     ImuBehind { frame_at: Duration, stream: ImuStream, latest: Option<Duration> },
+    /// Samples spanning more camera time than the settings allow are held for something that has
+    /// not come. They stay held, so every later batch is refused the same way.
+    Backlog { waiting_for: Awaited, span: Duration },
     Odometry(OdometryError),
 }
 
@@ -148,6 +172,7 @@ impl std::fmt::Display for TrackerError {
             TrackerError::FrameOutOfOrder { at, previous } => write!(f, "depth frame at {at:?} is not newer than the last posed frame at {previous:?}"),
             TrackerError::ImuBehind { frame_at, stream, latest: Some(latest) } => write!(f, "depth frame at {frame_at:?} is too far ahead of the newest {stream} sample at {latest:?}"),
             TrackerError::ImuBehind { frame_at, stream, latest: None } => write!(f, "depth frame at {frame_at:?} arrived before any {stream} sample"),
+            TrackerError::Backlog { waiting_for, span } => write!(f, "IMU samples spanning {span:?} are held and no {waiting_for} has come for them"),
             TrackerError::Odometry(cause) => write!(f, "{cause}"),
         }
     }
@@ -212,9 +237,14 @@ impl<M: SurfaceMap> PoseTracker<M> {
     ///
     /// While resting, the samples fill a window of the configured length; when it is full, odometry
     /// starts if the body rested through it, and [`TrackerError::NotAtRest`] is returned if it did not.
+    /// Samples wait for the other stream to pair with and, once odometry has started, for a depth
+    /// frame; [`TrackerError::Backlog`] is returned when those held span more than the settings allow.
     pub fn add_imu(&mut self, accel: &[AccelReading], gyro: &[GyroReading]) -> Result<TrackerPhase, TrackerError> {
         self.paired.clear();
         self.pairer.add_batch(accel, gyro, &mut self.paired).map_err(TrackerError::Imu)?;
+        for (held, silent) in [(ImuStream::Gyro, ImuStream::Accelerometer), (ImuStream::Accelerometer, ImuStream::Gyro)] {
+            self.within_backlog(self.pairer.held_span(held), Awaited::Imu(silent))?;
+        }
         let mut refused = None;
         for &sample in &self.paired {
             match &mut self.phase {
@@ -240,7 +270,18 @@ impl<M: SurfaceMap> PoseTracker<M> {
                 }
             }
         }
+        if let Phase::Tracking { pending, .. } = &self.phase {
+            let span = pending.front().zip(pending.back()).map_or(Duration::ZERO, |(oldest, newest)| newest.time - oldest.time);
+            self.within_backlog(span, Awaited::DepthFrame)?;
+        }
         refused.map_or(Ok(self.phase()), |moving| Err(TrackerError::NotAtRest(moving)))
+    }
+
+    fn within_backlog(&self, span: Duration, waiting_for: Awaited) -> Result<(), TrackerError> {
+        if span > self.settings.max_backlog {
+            return Err(TrackerError::Backlog { waiting_for, span });
+        }
+        Ok(())
     }
 
     /// Takes a depth image taken at `time` on the camera's clock: row major, depth along the optical
@@ -465,6 +506,53 @@ mod tests {
         let refusal = bench.add_frame(ahead).expect_err("no IMU sample since the last frame");
         assert!(matches!(refusal, TrackerError::ImuBehind { frame_at, stream: ImuStream::Accelerometer, latest: Some(latest) } if frame_at == ahead && latest <= started + FRAME_PERIOD), "{refusal:?}");
         assert!(bench.posed(ahead).corrected(), "the frame is taken once its IMU samples are in");
+    }
+
+    #[test]
+    fn an_imu_stream_that_stays_silent_is_refused_once_the_other_stream_has_waited_past_the_bound() {
+        let max_backlog = TrackerSettings::d455().max_backlog;
+        for silent in [ImuStream::Accelerometer, ImuStream::Gyro] {
+            let mut bench = Bench::new();
+            let mut time = Duration::ZERO;
+            let refusal = loop {
+                let (mut accel, mut gyro) = bench.imu_batch(time);
+                match silent {
+                    ImuStream::Accelerometer => accel.clear(),
+                    ImuStream::Gyro => gyro.clear(),
+                }
+                match bench.tracker.add_imu(&accel, &gyro) {
+                    Ok(phase) => assert_eq!(phase, TrackerPhase::Resting { rested: Duration::ZERO }),
+                    Err(refusal) => break refusal,
+                }
+                time += FRAME_PERIOD;
+            };
+            assert!(matches!(refusal, TrackerError::Backlog { waiting_for: Awaited::Imu(stream), span } if stream == silent && span > max_backlog), "{refusal:?}");
+            assert!(time > max_backlog && time < max_backlog + 2 * FRAME_PERIOD, "refused at {time:?}");
+        }
+    }
+
+    #[test]
+    fn imu_samples_that_no_depth_frame_comes_for_are_refused_once_they_span_more_than_the_bound() {
+        let max_backlog = TrackerSettings::d455().max_backlog;
+        let mut bench = Bench::new();
+        let started = bench.rest_until_started();
+        bench.posed(started + FRAME_PERIOD);
+        let mut time = started + FRAME_PERIOD;
+        let refusal = loop {
+            time += FRAME_PERIOD;
+            if let Err(refusal) = bench.add_imu(time) {
+                break refusal;
+            }
+        };
+        assert!(matches!(refusal, TrackerError::Backlog { waiting_for: Awaited::DepthFrame, span } if span > max_backlog), "{refusal:?}");
+        let waited = time - (started + FRAME_PERIOD);
+        assert!(waited > max_backlog && waited < max_backlog + 2 * FRAME_PERIOD, "refused after {waited:?}");
+        // A frame every period keeps the samples held well under the bound.
+        let mut bench = Bench::new();
+        let started = bench.rest_until_started();
+        for frame in 1..=40 {
+            bench.posed(started + frame * FRAME_PERIOD);
+        }
     }
 
     #[test]

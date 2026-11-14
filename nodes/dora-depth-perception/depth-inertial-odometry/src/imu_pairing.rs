@@ -77,6 +77,16 @@ impl ImuPairer {
         }
     }
 
+    /// The span of camera time over the samples of `stream` that are held for the other stream to
+    /// reach them. It grows for as long as the other stream gives nothing.
+    pub fn held_span(&self, stream: ImuStream) -> Duration {
+        let span = |oldest: Option<Duration>, newest: Option<Duration>| oldest.zip(newest).map_or(Duration::ZERO, |(oldest, newest)| newest - oldest);
+        match stream {
+            ImuStream::Accelerometer => span(self.accel.front().map(|reading| reading.time), self.accel.back().map(|reading| reading.time)),
+            ImuStream::Gyro => span(self.held_gyro.front().map(|reading| reading.time), self.held_gyro.back().map(|reading| reading.time)),
+        }
+    }
+
     /// Takes every sample since the previous batch, each stream oldest first, and appends to `paired`
     /// the samples that can now be paired, in time order. A batch with a sample out of order is
     /// refused whole.
@@ -207,6 +217,21 @@ mod tests {
         pairer.add_batch(&[accel(10.0), accel(15.0)], &[], &mut paired).expect("in order");
         assert_eq!(times_ms(&paired), vec![5.0, 7.5, 10.0, 12.5]);
         assert!((paired[3].accel_m_s2.x - 12.5).abs() < 1e-9, "{:?}", paired[3]);
+    }
+
+    #[test]
+    fn the_span_held_of_a_stream_grows_while_the_other_stream_is_silent_and_falls_back_when_it_speaks() {
+        let mut pairer = ImuPairer::default();
+        let mut paired = Vec::new();
+        assert_eq!((pairer.held_span(ImuStream::Accelerometer), pairer.held_span(ImuStream::Gyro)), (Duration::ZERO, Duration::ZERO));
+        pairer.add_batch(&[accel(0.0)], &[gyro(2.5), gyro(5.0), gyro(7.5)], &mut paired).expect("in order");
+        pairer.add_batch(&[], &[gyro(10.0), gyro(12.5)], &mut paired).expect("in order");
+        assert_eq!((pairer.held_span(ImuStream::Accelerometer), pairer.held_span(ImuStream::Gyro)), (Duration::ZERO, ms(10.0)));
+        pairer.add_batch(&[accel(5.0), accel(10.0), accel(15.0), accel(20.0), accel(25.0)], &[], &mut paired).expect("in order");
+        assert_eq!(times_ms(&paired), vec![2.5, 5.0, 7.5, 10.0, 12.5]);
+        assert_eq!((pairer.held_span(ImuStream::Accelerometer), pairer.held_span(ImuStream::Gyro)), (ms(15.0), Duration::ZERO));
+        pairer.add_batch(&[], &[gyro(24.0)], &mut paired).expect("in order");
+        assert_eq!((pairer.held_span(ImuStream::Accelerometer), pairer.held_span(ImuStream::Gyro)), (ms(5.0), Duration::ZERO));
     }
 
     #[test]

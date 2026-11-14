@@ -2,8 +2,9 @@
 
 Live odometry for a depth camera with an IMU (built for an Intel RealSense D455 on a Raspberry Pi 5):
 where the camera is, how it is turned and how fast it moves, updated with every IMU sample and corrected
-with every depth cloud. A library with no dora dependency; it has run on a simulator only, not yet on
-recorded or live camera data.
+with every depth cloud. A library with no dora dependency; the node is
+[`dora-depth-inertial-odometry`](../dora-depth-inertial-odometry/README.md). It has run on a simulator
+only, not yet on recorded or live camera data.
 
 It follows the recipe of [FAST-LIO2](https://github.com/hku-mars/FAST_LIO), adapted from lidar to a
 depth camera:
@@ -79,6 +80,11 @@ A depth frame is handled at its own time: IMU samples up to it go in first, newe
 frame. When the frame is ahead of the IMU, the gyro samples up to it are paired with the latest
 accelerometer reading and the newest reading is held over the rest of the gap; a frame more than
 `max_imu_lag` (10 ms) ahead of either stream is refused with `TrackerError::ImuBehind`.
+
+Samples are held while they wait: one IMU stream's for the other stream to pair with, and paired samples
+for the next depth frame. A stream that goes silent would let them pile up, so `add_imu` refuses with
+`TrackerError::Backlog` once the samples held for one thing span more than `max_backlog` (1 s) of camera
+time. They stay held, so the refusal repeats; the tracker is then of no further use.
 
 ### The odometry alone
 
@@ -218,14 +224,9 @@ Each of these is in the code because the simulated drive failed without it.
   independent between neighbouring pixels.
 - The tests bound drift at 0.10 m and 1 degree over a 30 s drive for voxel planes, and 0.15 m and 2.5
   degrees for the neighbour maps. A drift under 0.05 m over that drive is not reached by any map.
-- The tracker does not bound how long the pairer holds gyro samples while the accelerometer is silent,
-  nor how many IMU samples wait for a depth frame.
 - The full-resolution depth image is only subsampled, not averaged, before thinning.
 - People and other moving things are not masked out of the cloud.
 - The neighbour maps report their planes as exact, which is the source of their overconfidence.
 - Map points carry no memory of how uncertain the pose was when they were inserted.
-- No dora node. The `odom_pose` message exists (`lib/dora-rig-messages`, mirrored in `perception-wire`),
-  and `FramePose` has its fields. What is missing is a binary that subscribes to `depth`, `imu` and
-  `calibration`, builds a `PoseTracker` from the calibration's depth intrinsics and depth-to-IMU
-  transform, feeds it and publishes each `FramePose` as `odom_pose`. It waits on the camera's depth and
-  calibration messages.
+- The node, [`dora-depth-inertial-odometry`](../dora-depth-inertial-odometry/README.md), has run on the
+  simulator's messages only.

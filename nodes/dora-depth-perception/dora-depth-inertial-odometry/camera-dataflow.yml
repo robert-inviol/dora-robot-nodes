@@ -1,0 +1,36 @@
+# On the camera's machine: the D455's depth and IMU into odometry. Paths are relative to this file.
+# Build `cargo build --release -p dora-realsense` in ../../dora-realsense and
+# `cargo build --release -p dora-depth-inertial-odometry` in the node directory before `dora start`.
+# Hold the camera still from the start until the odometry node logs that it started.
+nodes:
+  # The only node that opens the D455.
+  - id: camera
+    path: ../../dora-realsense/target/release/dora-realsense
+    env:
+      # This camera's calibration.json from librealsense's rs-imu-calibration.py, kept beside this file and out of git.
+      IMU_CALIBRATION_PATH: imu-calibration.json
+    inputs:
+      # Carries nothing; it keeps the node's events open so the dataflow can stop it.
+      tick: dora/timer/millis/500
+    outputs:
+      - depth
+      - imu
+      - calibration
+
+  - id: odometry
+    path: ../target/release/dora-depth-inertial-odometry
+    inputs:
+      # Every imu message is needed: the tracker integrates all of them.
+      imu:
+        source: camera/imu
+        queue_size: 1000
+      # Every frame is wanted, in order; a frame dropped here costs one pose.
+      depth:
+        source: camera/depth
+        queue_size: 4
+      # The same message every second; the first one starts the node.
+      calibration:
+        source: camera/calibration
+        queue_size: 1
+    outputs:
+      - odom_pose
