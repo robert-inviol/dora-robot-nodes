@@ -10,7 +10,7 @@ nodes:
     env:
       ZENOH_CONNECT: tcp/192.0.2.10:7447
       ZENOH_SUBSCRIBE: rig/keyframe=keyframe,rig/imu=imu
-      ZENOH_PUBLISH: structure=rig/structure,scene=rig/scene
+      ZENOH_PUBLISH: structure=rig/structure,scene=rig/scene,segments=rig/segments
     inputs:
       tick: dora/timer/millis/5
       structure:
@@ -19,6 +19,10 @@ nodes:
       scene:
         source: geometry/scene
         queue_size: 1
+      # For the spatial server's object map (spatial-server-dataflow.yml).
+      segments:
+        source: sam3/segments
+        queue_size: 4
     outputs:
       - keyframe
       - imu

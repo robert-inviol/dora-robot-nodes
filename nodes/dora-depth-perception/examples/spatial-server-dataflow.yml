@@ -1,0 +1,105 @@
+# The spatial server on the mapping machine (strixen): localizer, dense map, object map and the spatial agent,
+# fed live over Zenoh. Keyframes and IMU come from the camera machine's dataflow
+# (dora-realsense-keyframes/examples/camera-dataflow.yml); SAM 3 segments come from a GPU machine running the
+# perception dataflow with `segments` published to rig/segments; questions come from whichever agent asks them.
+# ZENOH_CONNECT is the camera machine's address.
+# Paths are relative to this file. Build with `cargo build --release` in nodes/dora-depth-perception,
+# nodes/dora-world-agent and nodes/dora-zenoh-bridge before `dora start`.
+nodes:
+  - id: link
+    path: ../../dora-zenoh-bridge/target/release/dora-zenoh-bridge
+    env:
+      ZENOH_CONNECT: tcp/192.0.2.10:7447
+      ZENOH_SUBSCRIBE: rig/keyframe=keyframe,rig/imu=imu,rig/segments=segments,rig/space_question=space_question,rig/goal_status=goal_status
+      ZENOH_PUBLISH: keyframe_pose=rig/keyframe_pose,free_space=rig/free_space,topology=rig/topology,keep_out=rig/keep_out,object_update=rig/object_update,space_answer=rig/space_answer,nav_goal=rig/nav_goal
+    inputs:
+      tick: dora/timer/millis/5
+      keyframe_pose: localizer/keyframe_pose
+      free_space: dense_map/free_space
+      topology: dense_map/topology
+      keep_out: dense_map/keep_out
+      object_update: objects/object_update
+      space_answer: spatial_agent/space_answer
+      nav_goal: spatial_agent/nav_goal
+    outputs:
+      - keyframe
+      - imu
+      - segments
+      - space_question
+      - goal_status
+
+  - id: localizer
+    path: ../target/release/dora-map-localizer
+    env:
+      MAP_LOCALIZER_CONFIG: ../dora-map-localizer/map-localizer.example.toml
+      RUST_LOG: info
+    inputs:
+      keyframe:
+        source: link/keyframe
+        queue_size: 1
+      imu:
+        source: link/imu
+        queue_size: 1000
+    outputs:
+      - keyframe_pose
+
+  - id: dense_map
+    path: ../target/release/dora-dense-map
+    env:
+      DENSE_MAP_SETTINGS: ../dora-dense-map/dense-map-settings.toml
+      RUST_LOG: info
+    inputs:
+      keyframe:
+        source: link/keyframe
+        queue_size: 32
+      keyframe_pose:
+        source: localizer/keyframe_pose
+        queue_size: 32
+      object_update:
+        source: objects/object_update
+        queue_size: 64
+      tick: dora/timer/millis/250
+    outputs:
+      - free_space
+      - topology
+      - keep_out
+
+  - id: objects
+    path: ../target/release/dora-object-map
+    env:
+      OBJECT_MAP_SETTINGS: ../dora-object-map/object-map-settings.toml
+      RUST_LOG: info
+    inputs:
+      keyframe:
+        source: link/keyframe
+        queue_size: 32
+      keyframe_pose:
+        source: localizer/keyframe_pose
+        queue_size: 32
+      segments:
+        source: link/segments
+        queue_size: 8
+    outputs:
+      - object_update
+
+  - id: spatial_agent
+    path: ../../dora-world-agent/target/release/dora-world-agent
+    env:
+      SPATIAL_AGENT_CONFIG: ../../dora-world-agent/world-agent/spatial-agent.example.toml
+      RUST_LOG: info
+    inputs:
+      space_question: link/space_question
+      goal_status: link/goal_status
+      topology: dense_map/topology
+      free_space:
+        source: dense_map/free_space
+        queue_size: 1
+      object_update:
+        source: objects/object_update
+        queue_size: 256
+      keyframe_pose:
+        source: localizer/keyframe_pose
+        queue_size: 32
+    outputs:
+      - space_answer
+      - nav_goal
