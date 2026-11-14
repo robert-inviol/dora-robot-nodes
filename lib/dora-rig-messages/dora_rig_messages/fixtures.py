@@ -10,7 +10,7 @@ import pyarrow as pa
 
 import numpy as np
 
-from . import localization, navigation, objects, space_map
+from . import camera, localization, navigation, objects, people, space_map
 from .drive import DriveDemand
 from .navigation import (
     GoalId, GoalKind, GoalReason, GoalState, GoalStatus, MapPose, MapVersion, NavGoal, ObjectId,
@@ -154,7 +154,7 @@ EXAMPLES: dict[str, Message] = {
     ),
 }
 
-for _area in (localization, navigation, objects, space_map):
+for _area in (camera, localization, navigation, objects, people, space_map):
     EXAMPLES.update(_area.FIXTURE_EXAMPLES)
 
 

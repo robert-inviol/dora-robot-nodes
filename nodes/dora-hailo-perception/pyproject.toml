@@ -12,6 +12,7 @@ requires-python = ">=3.11"
 # PyGObject (gi) and the hailo module come from the Pi's apt packages, not from pip.
 dependencies = [
     "dora-rs>=0.3.13",
+    "dora-rig-messages",
     "pyarrow>=22",
     "numpy",
     "aiohttp>=3.9",
@@ -21,6 +22,7 @@ dependencies = [
 
 [project.scripts]
 dora-hailo-perception = "dora_hailo_perception.node:main"
+dora-hailo-pose = "dora_hailo_perception.pose_node:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["dora_hailo_perception"]

@@ -50,9 +50,32 @@ second) and `GET /api/events`.
     - detections
 ```
 
+## Pose from another node's frames: `dora-hailo-pose`
+
+The package's second command runs YOLOv8 pose (`yolov8s_pose_h8.hef`) on frames another node sends, such as
+`dora-realsense`'s letterboxed `model_input`, instead of reading a camera itself. Frames enter the same kind of
+GStreamer pipeline through `appsrc`; Hailo's `libyolov8pose_post.so` decodes the 17 COCO keypoints and
+`hailotracker` numbers the people. Each frame's `frame_id` rides through the pipeline as its buffer timestamp.
+
+| Input | What it carries |
+|---|---|
+| `model_input` | A square `rgb8` frame with `dora-realsense`'s letterbox metadata (`frame_id`, `camera_ns`, `source_width`, `source_height`, `shrink`, `pad_x`, `pad_y`). Give it `queue_size: 1`: a frame waiting behind a newer one is already late |
+
+| Output | What it carries |
+|---|---|
+| `person_poses` | The `person_poses` message of `dora-rig-messages`, one per frame even when nobody is in view: each person's box and keypoints in the source image's pixels, and the tracker's id once it has numbered them. Metadata `people` is the count |
+
+| Variable | Meaning |
+|---|---|
+| `POSE_HEF` | Optional: the model, default `/usr/share/hailo-models/yolov8s_pose_h8.hef` |
+| `POSE_POST_PROCESS` | Optional: the post-process library, default TAPPAS's `libyolov8pose_post.so` |
+
+It also needs `dora-rig-messages`. On a Raspberry Pi 5 it keeps up with 30 fps using about 19% of one core.
+`dora-realsense`'s `examples/pose-dataflow.yml` runs it.
+
 ## Known problems
 
-- About one start in twenty, the node wedges in its first two minutes: the port accepts
+- About one start in twenty, the node (or `dora-hailo-pose`) wedges in its first two minutes: the port accepts
   connections but never answers, and `ps` hangs. The Hailo kernel driver (hailo_pci, up to at
   least 4.23) takes its board mutex and the process's memory-map lock in opposite orders in its
   `mmap` and buffer-map paths, and two threads of this node can meet there while the pipeline
