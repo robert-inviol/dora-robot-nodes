@@ -1,0 +1,12 @@
+[package]
+name = "world-model"
+version = "0.1.0"
+description = "The world model interface the spatial agents' tools read, and its value types"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+perception-wire = { path = "../../dora-depth-perception/perception-wire" }
+serde = { version = "1", features = ["derive"] }
+thiserror.workspace = true
