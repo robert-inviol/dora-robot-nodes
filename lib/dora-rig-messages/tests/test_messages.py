@@ -3,6 +3,9 @@ import pytest
 
 from dora_rig_messages.drive import STOPPED, DriveDemand, PowerCap
 from dora_rig_messages.fixtures import EXAMPLES, read_fixture
+from dora_rig_messages.navigation import (
+    NAV_GOAL_TYPE, GoalId, GoalKind, GoalReason, GoalState, GoalStatus, MapPose, MapVersion, NavGoal,
+)
 from dora_rig_messages.operator import DriveMode, OperatorCommand
 from dora_rig_messages.scan import SCAN_TYPE, Scan
 from dora_rig_messages.status import DriverStatus, PilotStatus
@@ -140,3 +143,48 @@ def test_an_odom_pose_missing_a_required_field_is_rejected():
 
     with pytest.raises(ValueError, match="missing camera_ns"):
         OdomPose.from_arrow(pa.array([unstamped], type=ODOM_POSE_TYPE))
+
+
+@pytest.mark.parametrize(
+    "kind, target_id, target_pose",
+    [
+        (GoalKind.OBJECT, None, None),
+        (GoalKind.OBJECT, 42, MapPose(1.0, 2.0, 0.0)),
+        (GoalKind.POSE, 42, None),
+        (GoalKind.LOOK_AT, None, None),
+        (GoalKind.STOP, 42, None),
+    ],
+)
+def test_a_goal_whose_target_does_not_fit_its_kind_is_rejected(kind, target_id, target_pose):
+    with pytest.raises(ValueError, match=f"a {kind.value} goal takes"):
+        NavGoal(GoalId(1), kind, target_id, target_pose, 0.5, 0.25, 0, MapVersion(1))
+
+
+@pytest.mark.parametrize("target_id, target_pose", [(42, None), (None, MapPose(1.0, 2.0, 0.0))])
+def test_a_look_at_goal_takes_an_object_or_a_point(target_id, target_pose):
+    goal = NavGoal(GoalId(1), GoalKind.LOOK_AT, target_id, target_pose, 0.0, 0.25, 0, MapVersion(1))
+
+    assert NavGoal.from_arrow(goal.to_arrow()) == goal
+
+
+@pytest.mark.parametrize("standoff_m, max_speed_m_s", [(-0.1, 0.25), (0.5, float("nan")), (0.5, -1.0)])
+def test_a_goal_with_a_negative_or_unknown_distance_or_speed_is_rejected(standoff_m, max_speed_m_s):
+    with pytest.raises(ValueError, match="expected a finite value of at least 0"):
+        NavGoal(GoalId(1), GoalKind.OBJECT, 42, None, standoff_m, max_speed_m_s, 0, MapVersion(1))
+
+
+def test_an_unknown_goal_kind_on_the_wire_is_rejected():
+    row = NavGoal.from_arrow(read_fixture("nav_goal_object")).to_arrow()[0].as_py()
+    unknown = pa.array([{**row, "kind": "teleport"}], type=NAV_GOAL_TYPE)
+
+    with pytest.raises(ValueError, match="teleport"):
+        NavGoal.from_arrow(unknown)
+
+
+@pytest.mark.parametrize(
+    "state, reason, message",
+    [(GoalState.BLOCKED, None, "needs"), (GoalState.FAILED, None, "needs"), (GoalState.SUCCEEDED, GoalReason.NO_PATH, "takes no")],
+)
+def test_a_goal_status_carries_a_reason_exactly_when_blocked_or_failed(state, reason, message):
+    with pytest.raises(ValueError, match=f"a {state.value} goal status {message} reason"):
+        GoalStatus(GoalId(1), state, reason, 0)

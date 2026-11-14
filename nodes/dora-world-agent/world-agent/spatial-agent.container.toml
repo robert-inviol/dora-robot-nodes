@@ -1,0 +1,88 @@
+# Settings for the spatial agent in the container image. Durations are in seconds.
+
+[claude]
+# The Claude Code CLI; pin its version (the container image does).
+executable = "claude"
+# Every claude process runs here. It must be empty or not exist yet.
+work_dir = "/var/lib/spatial-agent/claude"
+# A tool call that takes longer than this fails, and the agent sees the failure.
+mcp_tool_timeout_s = 5
+
+[answering]
+# A question gets its final message after this long, whatever is still running.
+deadline_s = 90
+system_prompt = """
+You answer one question about a small home robot's surroundings. The user message starts with a WORLD DIGEST: the \
+robot, the goal it is running, the people it can see, the rooms with their doors, places and objects, and recent \
+changes. Ids are stable: o for objects, p for places, t for people tracks, r for rooms. Answer from the digest when you can. Use \
+the world tools for distances, gaps, routes, searches and images; never work out geometry yourself. When the question \
+asks the robot to go somewhere or look at something, call send_goal by id. Name the ids you mean in your answer. \
+Answer in one or two short sentences.\
+"""
+
+# Every question goes to all of these at once. The fast one's answer goes out first and its goals move the robot at
+# once; a deliberate one's goals are proposals for the reconciler.
+[[answering.answerers]]
+model = "claude-haiku-5-5"
+effort = "low"
+role = "fast"
+
+[[answering.answerers]]
+model = "claude-opus-5-5"
+effort = "medium"
+role = "deliberate"
+
+[[answering.answerers]]
+model = "claude-fable-5-2"
+effort = "medium"
+role = "deliberate"
+
+[reconciler]
+model = "claude-haiku-5-5"
+effort = "low"
+system_prompt = """
+You reconcile answers to one question about a home robot's surroundings. The user message has the WORLD DIGEST, the \
+QUESTION, the ANSWER SENT with the goal it put the robot on, and a LATER ANSWER from a slower model with the goal it \
+proposes. Keep the sent answer unless the later one is clearly more correct or more useful. Reply with JSON only: \
+{"decision": "keep"}, or {"decision": "revise", "text": "<the answer to send now>", "goal": "sent"} where goal is \
+"sent" to keep the robot on the goal already sent, "proposed" to move it to the later answer's goal, or "none" to \
+stop it.\
+"""
+
+[room_namer]
+model = "claude-haiku-5-5"
+effort = "low"
+system_prompt = """
+You name the rooms of a house from the objects seen in them. Reply with the room's name only: one to three \
+lowercase words, such as kitchen or living room.\
+"""
+# A named room is named again once more than this share of its objects has changed.
+rename_after_change = 0.5
+
+[watchdog]
+# A model call with no event from claude for this long is interrupted; then SIGTERM, then SIGKILL, each after its grace.
+silent_turn_s = 30
+interrupt_grace_s = 3
+terminate_grace_s = 3
+# How long a new claude process may take to show it is up.
+startup_s = 30
+
+[goals]
+# Used when the agent does not say.
+standoff_m = 0.5
+max_speed_m_s = 0.3
+deadline_s = 120
+
+[mcp]
+# 127.0.0.1 only. 0 takes any free port.
+port = 0
+sql_row_limit = 200
+
+[world_store]
+# The dora node's world model; created on first start. Only one process may have it open. The console does not use it.
+path = "/var/lib/spatial-agent/world.sqlite"
+
+[world_store.backup]
+# A whole copy of the database, replaced every every_s.
+path = "/var/lib/spatial-agent/backup/world.sqlite"
+every_s = 600

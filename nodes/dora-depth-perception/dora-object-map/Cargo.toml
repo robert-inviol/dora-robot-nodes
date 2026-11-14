@@ -1,0 +1,19 @@
+[package]
+name = "dora-object-map"
+version = "0.1.0"
+description = "dora node that turns segments into persistent object updates"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+object-map = { path = "../object-map" }
+perception-wire = { path = "../perception-wire" }
+room-map = { path = "../room-map" }
+dora-node-api.workspace = true
+eyre.workspace = true
+glam = "0.29"
+toml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+

@@ -8,9 +8,13 @@ from typing import Protocol
 
 import pyarrow as pa
 
-from .drive import DriveDemand
 import numpy as np
 
+from . import localization, navigation, objects, space_map
+from .drive import DriveDemand
+from .navigation import (
+    GoalId, GoalKind, GoalReason, GoalState, GoalStatus, MapPose, MapVersion, NavGoal, ObjectId,
+)
 from .odometry import OdomPose, WeakestDirection
 from .operator import DriveMode, OperatorCommand
 from .perception import (
@@ -114,7 +118,44 @@ EXAMPLES: dict[str, Message] = {
         matched_points=0,
         weakest=None,
     ),
+    "nav_goal_object": NavGoal(
+        goal_id=GoalId(7),
+        kind=GoalKind.OBJECT,
+        target_id=ObjectId(42),
+        target_pose=None,
+        standoff_m=0.5,
+        max_speed_m_s=0.25,
+        deadline_unix_ns=1_762_560_060_000_000_000,
+        map_version=MapVersion(412),
+    ),
+    "nav_goal_pose": NavGoal(
+        goal_id=GoalId(8),
+        kind=GoalKind.POSE,
+        target_id=None,
+        target_pose=MapPose(x_m=3.25, y_m=-0.75, yaw_rad=1.5),
+        standoff_m=0.0,
+        max_speed_m_s=0.5,
+        deadline_unix_ns=1_762_560_090_000_000_000,
+        map_version=MapVersion(412),
+    ),
+    "nav_goal_stop": NavGoal(
+        goal_id=GoalId(9),
+        kind=GoalKind.STOP,
+        target_id=None,
+        target_pose=None,
+        standoff_m=0.0,
+        max_speed_m_s=0.0,
+        deadline_unix_ns=1_762_560_005_000_000_000,
+        map_version=MapVersion(412),
+    ),
+    "goal_status_active": GoalStatus(GoalId(7), GoalState.ACTIVE, reason=None, updated_unix_ns=1_762_560_001_500_000_000),
+    "goal_status_blocked": GoalStatus(
+        GoalId(7), GoalState.BLOCKED, reason=GoalReason.PERSON_IN_PATH, updated_unix_ns=1_762_560_004_250_000_000
+    ),
 }
+
+for _area in (localization, navigation, objects, space_map):
+    EXAMPLES.update(_area.FIXTURE_EXAMPLES)
 
 
 def fixture_path(name: str) -> Path:

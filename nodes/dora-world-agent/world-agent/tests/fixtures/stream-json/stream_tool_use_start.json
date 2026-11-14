@@ -1,0 +1,1 @@
+{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_01XRxkmYtNSQhVLHNd1U8JkT","name":"mcp__world__find","input":{},"caller":{"type":"direct"}}},"session_id":"6a743d16-accf-498a-b630-73a08c1cead2","parent_tool_use_id":null,"uuid":"9b0a7aed-4be4-4bda-9270-32596036bc40","api_message_id":"msg_011Ch1mXohu4Zq87h6R5E3ZR"}

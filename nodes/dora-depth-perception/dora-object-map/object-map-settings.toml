@@ -1,0 +1,34 @@
+# The object map's thresholds, all at their defaults. Every key is optional; an unknown key is an error.
+voxel_size_m = 0.05
+pending_frames = 32
+
+[detection]
+min_score = 0.3
+erosion_px = 6
+min_points = 200
+max_depth_gap_m = 0.1
+min_voxels = 4
+
+[association]
+min_overlap = 0.3
+
+[confirmation]
+sightings = 3
+window_s = 60.0
+
+[merge]
+min_overlap = 0.6
+interval_s = 10.0
+
+[absence]
+surface_margin_m = 0.15
+max_depth_m = 5.0
+min_judged_voxels = 10
+surface_fraction = 0.3
+seen_past_fraction = 0.7
+misses_to_disappear = 3
+moved_window_s = 600.0
+
+[crop]
+jpeg_quality = 85
+min_improvement = 1.2

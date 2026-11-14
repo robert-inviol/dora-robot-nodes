@@ -2,6 +2,8 @@
 
 Room geometry from one RGB-D frame of a depth camera with an accelerometer (built against an Intel
 RealSense D455), in a gravity-aligned floor frame: x right, y forward, z up, metres, origin at the camera.
+The workspace also holds the mapping crates and nodes, which place keyframes in one map and build the
+house's free space, rooms and objects from them (see Mapping).
 
 The `depth-perception` crate is the geometry, with no dora dependency:
 
@@ -28,6 +30,9 @@ cargo run --release --example profile_frame -- <frame dir> [repeats]
 |---|---|---|
 | `dora-depth-perception` | `keyframe`, `segments` | `structure`: planes and room as soon as a keyframe arrives; `scene`: the same plus object footprints when its segments arrive |
 | `dora-keyframe-replay` | `tick` | `keyframe`: the next keyframe of the Arrow IPC recording in `KEYFRAME_RECORDING`, restamped; `KEYFRAME_REPLAY_LOOP=true` starts again at the end. `imu`: with `IMU_RECORDING`, the imu message leading up to each keyframe, sent just before it, its camera times moved on by one recording span per loop |
+| [`dora-map-localizer`](dora-map-localizer/README.md) | `keyframe`, `imu` (`odom_pose` is reserved) | `keyframe_pose`: each keyframe's pose in the map, with the map version and tracking state |
+| [`dora-dense-map`](dora-dense-map/README.md) | `keyframe`, `keyframe_pose`, `object_update`, `tick` | `free_space`, `topology`: rooms, doorways, places and their graph; `keep_out`: zones around glass and mirrors |
+| [`dora-object-map`](dora-object-map/README.md) | `keyframe`, `keyframe_pose`, `segments` | `object_update`: an object appeared, updated, moved, disappeared or merged |
 
 `room-map` builds one map of a room from a keyframe recording: gravity-aligned 4-DoF ICP odometry, runs
 of trusted keyframes placed against the growing map, loop measurement against the start, and voxel
@@ -51,8 +56,19 @@ cloud is registered against a local map, and an error-state Kalman filter blends
 simulator; its [README](depth-inertial-odometry/README.md) compares its three maps for accuracy and for
 speed on a Raspberry Pi 5.
 
-`perception-wire` is the Rust side of the perception messages in `lib/dora-rig-messages`; its tests read
-that package's golden fixtures.
+`perception-wire` is the Rust side of the messages in `lib/dora-rig-messages`: perception, localization,
+space map, objects, navigation and odometry; its tests read that package's golden fixtures.
+
+## Mapping
+
+The map frame is z up, gravity aligned, metres. Three crates, with no dora dependency, build the map that
+the mapping nodes above wrap:
+
+| Crate | What it does |
+|---|---|
+| [`map-localizer`](map-localizer/README.md) | Places each keyframe in one map: 4-DoF registration against the map built so far, seeded by the gyro, with loop closures in a 4-DoF pose graph |
+| [`dense-map`](dense-map/README.md) | The dense map from posed depth keyframes: a TSDF, a free-space grid, rooms cut at doorways with a graph of places, and keep-out zones |
+| [`object-map`](object-map/README.md) | Persistent objects from SAM 3 masks: association, confirmation, absences, moves and merges, and each object's best view |
 
 ## Dataflows
 
@@ -60,3 +76,8 @@ that package's golden fixtures.
   object types, SAM 3, this node and the debug page on port 8090.
 - `examples/live-dataflow.yml`: the same, fed by the camera machine over `dora-zenoh-bridge`, with scenes
   sent back to it.
+- `examples/spatial-server-dataflow.yml`: the spatial server on the mapping machine: localizer, dense map,
+  object map and `dora-world-agent`, fed over `dora-zenoh-bridge` with keyframes and IMU from the camera
+  machine and segments from a GPU machine, sending poses, the map, objects, answers and nav goals back.
+- `dora-map-localizer/replay-dataflow.yml`, `dora-dense-map/dense-map-dataflow.yml` and
+  `dora-object-map/object-map-dataflow.yml` run one mapping node each.

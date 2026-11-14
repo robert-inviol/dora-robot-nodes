@@ -1,0 +1,16 @@
+[package]
+name = "dense-map"
+version = "0.1.0"
+description = "A block-sparse TSDF, its free-space grid, and rooms, doorways and places cut from it"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+depth-perception = { path = "../depth-perception" }
+perception-wire = { path = "../perception-wire" }
+glam = "0.29"
+rayon = "1.10"
+rustc-hash = "2"
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"

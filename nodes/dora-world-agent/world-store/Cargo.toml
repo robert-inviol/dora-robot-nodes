@@ -1,0 +1,23 @@
+[package]
+name = "world-store"
+version = "0.1.0"
+description = "The world model in SQLite: history of objects, rooms, places, events and goals, behind the WorldModel trait"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+world-model = { path = "../world-model" }
+perception-wire = { path = "../../dora-depth-perception/perception-wire" }
+thiserror.workspace = true
+glam = "0.29"
+jpeg-decoder = { version = "0.3", default-features = false }
+png = "0.17"
+rusqlite = { version = "0.37", features = ["bundled", "hooks"] }
+tokio = { version = "1", features = ["rt"] }
+tracing = "0.1"
+
+[dev-dependencies]
+jpeg-encoder = "0.6"
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }

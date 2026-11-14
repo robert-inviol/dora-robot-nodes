@@ -1,0 +1,23 @@
+[package]
+name = "dora-map-localizer"
+version = "0.1.0"
+description = "dora node that localizes keyframes in the map and sends the map to odom correction"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+map-localizer = { path = "../map-localizer" }
+perception-wire = { path = "../perception-wire" }
+room-map = { path = "../room-map" }
+dora-node-api.workspace = true
+eyre.workspace = true
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+toml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+depth-perception = { path = "../depth-perception" }
+glam = "0.29"

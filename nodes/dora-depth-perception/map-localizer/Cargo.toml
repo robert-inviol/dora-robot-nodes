@@ -1,0 +1,18 @@
+[package]
+name = "map-localizer"
+version = "0.1.0"
+description = "Registers keyframes against the map and keeps a 4-DoF pose graph"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+depth-perception = { path = "../depth-perception" }
+perception-wire = { path = "../perception-wire" }
+room-map = { path = "../room-map" }
+glam = "0.29"
+rayon = "1.10"
+thiserror = "2"
+
+[dev-dependencies]
+eyre.workspace = true

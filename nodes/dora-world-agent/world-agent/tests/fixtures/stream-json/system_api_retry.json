@@ -1,0 +1,1 @@
+{"type":"system","subtype":"api_retry","attempt":1,"max_retries":10,"retry_delay_ms":500,"error_status":401,"error":"authentication_failed","session_id":"6a743d16-accf-498a-b630-73a08c1cead2","uuid":"0b0c3f7e-2f4b-4a43-8a8c-31f1d1b5a001"}

@@ -1,0 +1,40 @@
+# The object map on its own, fed over Zenoh: keyframes from the camera machine, segments from the machine that runs
+# SAM 3, and keyframe poses from the localizer. Object updates go back out on rig/object_update.
+# Paths are relative to this file. Build with `cargo build --release` in nodes/dora-depth-perception first.
+# ZENOH_CONNECT is the address of the machine whose Zenoh router the others publish to.
+nodes:
+  - id: link
+    path: ../../dora-zenoh-bridge/target/release/dora-zenoh-bridge
+    env:
+      ZENOH_CONNECT: tcp/192.0.2.10:7447
+      ZENOH_SUBSCRIBE: rig/keyframe=keyframe,rig/keyframe_pose=keyframe_pose,rig/segments=segments
+      ZENOH_PUBLISH: object_update=rig/object_update
+    inputs:
+      tick: dora/timer/millis/5
+      object_update: objects/object_update
+    outputs:
+      - keyframe
+      - keyframe_pose
+      - segments
+
+  - id: objects
+    path: ../target/release/dora-object-map
+    env:
+      # Optional: a TOML file of thresholds (see object-map-settings.toml); without it the defaults apply.
+      OBJECT_MAP_SETTINGS: object-map-settings.toml
+      # Every identity decision is logged at info; debug adds each match, candidate and absence check.
+      RUST_LOG: info
+    inputs:
+      # Segments arrive seconds after their keyframe, at no fixed rate, and only for some keyframes; the node holds
+      # the last few keyframes and poses until their segments come, so these queues must not drop them first.
+      keyframe:
+        source: link/keyframe
+        queue_size: 32
+      keyframe_pose:
+        source: link/keyframe_pose
+        queue_size: 32
+      segments:
+        source: link/segments
+        queue_size: 8
+    outputs:
+      - object_update
