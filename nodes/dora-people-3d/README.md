@@ -1,4 +1,4 @@
-# dora-people-lift
+# dora-people-3d
 
 A [dora](https://dora-rs.ai) node that places the pose model's people in 3D with a depth camera and follows them as
 tracks. It joins each frame's `person_poses` with the same frame's raw depth and the camera's calibration, and sends
@@ -12,9 +12,12 @@ tracks. It joins each frame's `person_poses` with the same frame's raw depth and
   gets no point.
 - **Smoothing and velocity.** Each track's position goes through a One Euro filter; the velocity is the filtered
   rate of change of the raw positions.
-- **Track states.** The pose model's tracker numbers the people; untracked ones are left out. A track is
-  `tentative` until seen in 3 frames, then `confirmed`. A confirmed track the tracker drops is reported `lost` with its
-  last position for one second.
+- **Person ids.** The node numbers people itself and keeps the number while the pose model's tracker renumbers them.
+  The pose tracker matches people from frame to frame; people it does not track are left out. When it drops someone
+  and a new id of its turns up within 0.5 m of where that person was heading (last position plus last velocity times
+  the gap) within two seconds, the new id takes over that person. Otherwise it is a new person.
+- **Track states.** A person is `tentative` until seen in 3 frames, then `confirmed`. A confirmed person the pose
+  tracker drops is reported `lost` with their last position for two seconds.
 
 Positions are in the colour camera's frame (x right, y down, z forward, metres), with the frame's gravity estimate
 in `gravity_reaction`, until odometry is wired in.
@@ -30,6 +33,6 @@ in `gravity_reaction`, until odometry is wired in.
 | `people_tracks` | The `people_tracks` message of `dora-rig-messages`; metadata `depth_found` says whether the frame's depth was there |
 
 Once a second the node logs the pose frame rate, how many frames found their depth, how many people it placed and
-which track ids it saw.
+which person ids it saw.
 
 On a Raspberry Pi 5 it uses about 3% of one core with two people in view.

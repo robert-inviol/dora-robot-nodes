@@ -1,5 +1,8 @@
 //! People tracks in 3D: each tracked person's keypoints placed with depth, their torso as their position, smoothed
 //! over time, and held for a while as lost once the pose model's tracker stops reporting them.
+//!
+//! A person keeps the id this tracker gave them while the pose model's tracker renumbers them: a new pose-tracker id
+//! that turns up where a person it stopped reporting was heading takes over that person.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -27,8 +30,11 @@ pub struct TrackSettings {
     pub limb_spread_m: f32,
     /// Frames a track must be seen in before it is confirmed.
     pub confirm_after_frames: u32,
-    /// How long a track the tracker has dropped is still reported, as lost.
+    /// How long a person the pose tracker has dropped is still reported, as lost, and can be taken over by a new
+    /// pose-tracker id.
     pub keep_lost: Duration,
+    /// How far from where a dropped person was heading a new pose-tracker id may turn up and still take them over.
+    pub rejoin_radius_m: f32,
     pub smoothing: OneEuroSettings,
 }
 
@@ -39,7 +45,8 @@ impl Default for TrackSettings {
             torso_spread_m: 0.3,
             limb_spread_m: 0.8,
             confirm_after_frames: 3,
-            keep_lost: Duration::from_secs(1),
+            keep_lost: Duration::from_secs(2),
+            rejoin_radius_m: 0.5,
             smoothing: OneEuroSettings::default(),
         }
     }
@@ -52,6 +59,8 @@ pub struct DepthFrame<'a> {
 }
 
 struct Followed {
+    /// The pose tracker's current id for this person.
+    pose_track_id: TrackId,
     frames_seen: u32,
     last_seen_ns: i64,
     filter: OneEuro,
@@ -59,9 +68,24 @@ struct Followed {
     last: PersonTrack,
 }
 
+impl Followed {
+    /// Where this person would be at `now_ns`, carried on at their last velocity.
+    fn heading_to(&self, now_ns: i64) -> Option<Vec3> {
+        let position = self.last.position?;
+        let position = Vec3::new(position.x_m, position.y_m, position.z_m);
+        let gap_s = (now_ns - self.last_seen_ns) as f32 * 1e-9;
+        Some(match self.last.velocity {
+            Some(v) => position + Vec3::new(v.vx_m_s, v.vy_m_s, v.vz_m_s) * gap_s,
+            None => position,
+        })
+    }
+}
+
 pub struct PeopleTracker {
     settings: TrackSettings,
+    /// Keyed by this tracker's own person id.
     followed: HashMap<TrackId, Followed>,
+    next_id: TrackId,
 }
 
 fn point(v: Vec3) -> Point {
@@ -75,7 +99,7 @@ fn median(mut values: Vec<f32>) -> f32 {
 
 impl PeopleTracker {
     pub fn new(settings: TrackSettings) -> PeopleTracker {
-        PeopleTracker { settings, followed: HashMap::new() }
+        PeopleTracker { settings, followed: HashMap::new(), next_id: 1 }
     }
 
     /// The torso centre and every keypoint in 3D, colour camera coordinates; None where depth cannot say.
@@ -99,17 +123,63 @@ impl PeopleTracker {
         (centre, keypoints)
     }
 
+    /// The person id each pose-tracker id in this frame belongs to: the person it already follows, else a dropped
+    /// person it turns up close to where they were heading, else a new person.
+    fn assign_people(&mut self, seen: &[(TrackId, Option<Vec3>)], now_ns: i64) -> Vec<TrackId> {
+        let following: HashMap<TrackId, TrackId> = self.followed.iter().map(|(&id, f)| (f.pose_track_id, id)).collect();
+        let mut assigned: Vec<Option<TrackId>> = seen.iter().map(|(pose_id, _)| following.get(pose_id).copied()).collect();
+        let dropped: Vec<(TrackId, Vec3)> = self
+            .followed
+            .iter()
+            .filter(|(&id, f)| f.last_seen_ns < now_ns && !assigned.contains(&Some(id)))
+            .filter_map(|(&id, f)| Some((id, f.heading_to(now_ns)?)))
+            .collect();
+        let mut candidates: Vec<(f32, usize, TrackId)> = seen
+            .iter()
+            .enumerate()
+            .filter(|&(i, _)| assigned[i].is_none())
+            .filter_map(|(i, (_, centre))| Some((i, (*centre)?)))
+            .flat_map(|(i, centre)| dropped.iter().map(move |&(id, heading)| (centre.distance(heading), i, id)))
+            .filter(|&(distance, _, _)| distance <= self.settings.rejoin_radius_m)
+            .collect();
+        candidates.sort_by(|a, b| a.0.total_cmp(&b.0));
+        for (_, i, id) in candidates {
+            if assigned[i].is_none() && !assigned.contains(&Some(id)) {
+                assigned[i] = Some(id);
+            }
+        }
+        assigned
+            .into_iter()
+            .map(|id| {
+                id.unwrap_or_else(|| {
+                    self.next_id += 1;
+                    self.next_id - 1
+                })
+            })
+            .collect()
+    }
+
     /// The tracks for one pose frame. `depth` is None when its depth frame never arrived.
     pub fn update(&mut self, poses: &PersonPoses, depth: Option<&DepthFrame>, calibration: Option<&CameraCalibration>) -> PeopleTracks {
         let now_ns = poses.captured_camera_ns;
+        let lifted: Vec<(&PersonPose, TrackId, Option<Vec3>, Vec<Option<Vec3>>)> = poses
+            .people
+            .iter()
+            .filter_map(|person| {
+                let pose_id = person.track_id?;
+                let (centre, keypoints_3d) = match (depth, calibration) {
+                    (Some(depth), Some(calibration)) => self.lift(person, &depth.image, calibration),
+                    _ => (None, vec![None; person.keypoints.len()]),
+                };
+                Some((person, pose_id, centre, keypoints_3d))
+            })
+            .collect();
+        let seen: Vec<(TrackId, Option<Vec3>)> = lifted.iter().map(|(_, pose_id, centre, _)| (*pose_id, *centre)).collect();
+        let person_ids = self.assign_people(&seen, now_ns);
         let mut tracks = Vec::new();
-        for person in &poses.people {
-            let Some(track_id) = person.track_id else { continue };
-            let (centre, keypoints_3d) = match (depth, calibration) {
-                (Some(depth), Some(calibration)) => self.lift(person, &depth.image, calibration),
-                _ => (None, vec![None; person.keypoints.len()]),
-            };
+        for ((person, pose_track_id, centre, keypoints_3d), track_id) in lifted.into_iter().zip(person_ids) {
             let followed = self.followed.entry(track_id).or_insert_with(|| Followed {
+                pose_track_id,
                 frames_seen: 0,
                 last_seen_ns: now_ns,
                 filter: OneEuro::new(self.settings.smoothing),
@@ -125,6 +195,7 @@ impl PeopleTracker {
                     keypoints_3d: vec![],
                 },
             });
+            followed.pose_track_id = pose_track_id;
             followed.frames_seen += 1;
             followed.last_seen_ns = now_ns;
             let (position, velocity) = match centre {
@@ -242,14 +313,14 @@ mod tests {
     }
 
     #[test]
-    fn a_confirmed_person_the_tracker_drops_is_lost_for_a_second_then_gone() {
+    fn a_confirmed_person_the_tracker_drops_is_lost_for_two_seconds_then_gone() {
         let mut tracker = PeopleTracker::new(TrackSettings::default());
         for frame in 0..3 {
             tracker.update(&poses(frame, vec![standing_person(Some(7), 32.0)]), None, None);
         }
         let tracks = tracker.update(&poses(4, vec![]), None, None);
-        assert_eq!(tracks.tracks.iter().map(|t| (t.track_id, t.state)).collect::<Vec<_>>(), vec![(7, TrackState::Lost)]);
-        assert!(tracker.update(&poses(40, vec![]), None, None).tracks.is_empty());
+        assert_eq!(tracks.tracks.iter().map(|t| (t.track_id, t.state)).collect::<Vec<_>>(), vec![(1, TrackState::Lost)]);
+        assert!(tracker.update(&poses(70, vec![]), None, None).tracks.is_empty());
     }
 
     #[test]
@@ -257,5 +328,74 @@ mod tests {
         let mut tracker = PeopleTracker::new(TrackSettings::default());
         tracker.update(&poses(0, vec![standing_person(Some(7), 32.0)]), None, None);
         assert!(tracker.update(&poses(1, vec![]), None, None).tracks.is_empty());
+    }
+
+    /// The person ids and states in one frame's tracks.
+    fn ids(tracks: &PeopleTracks) -> Vec<(TrackId, TrackState)> {
+        tracks.tracks.iter().map(|t| (t.track_id, t.state)).collect()
+    }
+
+    #[test]
+    fn a_person_the_pose_tracker_renumbers_keeps_their_id_and_stays_confirmed() {
+        let depth_mm = wall(2500);
+        let depth = DepthFrame { image: DepthImage { width: 64, height: 48, depth_mm: &depth_mm }, gravity_reaction: None };
+        let mut tracker = PeopleTracker::new(TrackSettings::default());
+        for frame in 0..3 {
+            tracker.update(&poses(frame, vec![standing_person(Some(14), 32.0)]), Some(&depth), Some(&calibration()));
+        }
+        assert_eq!(ids(&tracker.update(&poses(3, vec![]), Some(&depth), Some(&calibration()))), vec![(1, TrackState::Lost)]);
+        let renumbered = tracker.update(&poses(10, vec![standing_person(Some(18), 32.0)]), Some(&depth), Some(&calibration()));
+        assert_eq!(ids(&renumbered), vec![(1, TrackState::Confirmed)]);
+    }
+
+    #[test]
+    fn a_walking_person_is_taken_over_where_they_were_heading() {
+        // Walking right at 1 m/s, 2.5 m away: 50 px focal length, so 20 px per metre, 2/3 px per frame.
+        let depth_mm = wall(2500);
+        let depth = DepthFrame { image: DepthImage { width: 64, height: 48, depth_mm: &depth_mm }, gravity_reaction: None };
+        let x_px = |frame: u64| 20.0 + frame as f32 * 20.0 / 30.0;
+        let mut tracker = PeopleTracker::new(TrackSettings::default());
+        for frame in 0..30 {
+            tracker.update(&poses(frame, vec![standing_person(Some(3), x_px(frame))]), Some(&depth), Some(&calibration()));
+        }
+        // Gone for a second, then back under a new pose-tracker id, 1 m on from where they were last seen.
+        let back = tracker.update(&poses(60, vec![standing_person(Some(9), x_px(60))]), Some(&depth), Some(&calibration()));
+        assert_eq!(ids(&back), vec![(1, TrackState::Confirmed)]);
+    }
+
+    #[test]
+    fn someone_who_turns_up_elsewhere_is_a_new_person() {
+        let depth_mm = wall(2500);
+        let depth = DepthFrame { image: DepthImage { width: 64, height: 48, depth_mm: &depth_mm }, gravity_reaction: None };
+        let mut tracker = PeopleTracker::new(TrackSettings::default());
+        for frame in 0..3 {
+            tracker.update(&poses(frame, vec![standing_person(Some(4), 12.0)]), Some(&depth), Some(&calibration()));
+        }
+        let tracks = tracker.update(&poses(5, vec![standing_person(Some(5), 52.0)]), Some(&depth), Some(&calibration()));
+        assert_eq!(ids(&tracks), vec![(2, TrackState::Tentative), (1, TrackState::Lost)]);
+    }
+
+    #[test]
+    fn two_renumbered_people_each_keep_their_own_id() {
+        let depth_mm = wall(2500);
+        let depth = DepthFrame { image: DepthImage { width: 64, height: 48, depth_mm: &depth_mm }, gravity_reaction: None };
+        let mut tracker = PeopleTracker::new(TrackSettings::default());
+        for frame in 0..3 {
+            let people = vec![standing_person(Some(4), 12.0), standing_person(Some(5), 52.0)];
+            tracker.update(&poses(frame, people), Some(&depth), Some(&calibration()));
+        }
+        let people = vec![standing_person(Some(8), 52.0), standing_person(Some(9), 12.0)];
+        let tracks = tracker.update(&poses(5, people), Some(&depth), Some(&calibration()));
+        assert_eq!(ids(&tracks), vec![(2, TrackState::Confirmed), (1, TrackState::Confirmed)]);
+    }
+
+    #[test]
+    fn a_person_still_tracked_is_never_taken_over() {
+        let depth_mm = wall(2500);
+        let depth = DepthFrame { image: DepthImage { width: 64, height: 48, depth_mm: &depth_mm }, gravity_reaction: None };
+        let mut tracker = PeopleTracker::new(TrackSettings::default());
+        tracker.update(&poses(0, vec![standing_person(Some(4), 32.0)]), Some(&depth), Some(&calibration()));
+        let tracks = tracker.update(&poses(1, vec![standing_person(Some(4), 32.0), standing_person(Some(6), 32.0)]), Some(&depth), Some(&calibration()));
+        assert_eq!(tracks.tracks.iter().map(|t| t.track_id).collect::<Vec<_>>(), vec![1, 2]);
     }
 }

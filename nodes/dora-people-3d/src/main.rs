@@ -8,8 +8,8 @@ use dora_node_api::arrow::array::{Array, AsArray};
 use dora_node_api::arrow::buffer::ScalarBuffer;
 use dora_node_api::arrow::datatypes::UInt16Type;
 use dora_node_api::{DoraNode, Event, MetadataParameters, Parameter};
-use dora_people_lift::depth::DepthImage;
-use dora_people_lift::tracks::{DepthFrame, PeopleTracker, TrackSettings};
+use dora_people_3d::depth::DepthImage;
+use dora_people_3d::tracks::{DepthFrame, PeopleTracker, TrackSettings};
 use eyre::{bail, eyre, Context, Result};
 use perception_wire::camera::decode_camera_calibration;
 use perception_wire::people::{decode_person_poses, encode_people_tracks};
@@ -87,7 +87,7 @@ fn main() -> Result<()> {
                     if frames == LOG_EVERY_FRAMES {
                         let first = tracks.tracks.first().map(|t| format!(", track {} {:?} at {:?}", t.track_id, t.state, t.position));
                         eprintln!(
-                            "[people-lift] {:.1} pose frames/s, {with_depth}/{frames} with depth, {placed} people placed, track ids {track_ids:?}{}",
+                            "[people-3d] {:.1} pose frames/s, {with_depth}/{frames} with depth, {placed} people placed, track ids {track_ids:?}{}",
                             frames as f64 / logged_at.elapsed().as_secs_f64(),
                             first.unwrap_or_default()
                         );

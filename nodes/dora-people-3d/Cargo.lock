@@ -531,7 +531,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "dora-people-lift"
+name = "dora-people-3d"
 version = "0.1.0"
 dependencies = [
  "dora-node-api",

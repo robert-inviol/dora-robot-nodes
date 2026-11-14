@@ -1,6 +1,6 @@
 # On the camera's machine: the D455 through YOLOv8 pose on the Hailo-8, and the people placed in 3D. Paths are
 # relative to this file. Build `cargo build --release -p dora-realsense` in dora-realsense and `cargo build --release`
-# in dora-people-lift here; the pose node needs the Pi's hailo-all and python3-gi.
+# in dora-people-3d here; the pose node needs the Pi's hailo-all and python3-gi.
 nodes:
   # The only node that opens the D455.
   - id: camera
@@ -32,7 +32,7 @@ nodes:
 
   # Keypoints and torso in 3D from the frame's depth, smoothed into tracks.
   - id: people
-    path: ../../dora-people-lift/target/release/dora-people-lift
+    path: ../../dora-people-3d/target/release/dora-people-3d
     inputs:
       person_poses: pose/person_poses
       depth: camera/depth

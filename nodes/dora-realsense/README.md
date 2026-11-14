@@ -34,7 +34,7 @@ read them. `frame_id` counts frames from 0 and is the same across every output o
 | `MODEL_INPUT_SIZE` | Optional: the side of the square `model_input`, default 640 |
 
 `examples/pose-dataflow.yml` runs the camera through YOLOv8 pose on a Hailo-8 (`dora-hailo-perception`'s
-`dora-hailo-pose`) and places the people in 3D (`dora-people-lift`).
+`dora-hailo-pose`) and places the people in 3D (`dora-people-3d`).
 
 On a Raspberry Pi 5 the node uses about 35% of one core with `model_input`, `depth`, `imu` and `calibration`
 listed; shrinking one frame into the model input takes about 5.3 ms.

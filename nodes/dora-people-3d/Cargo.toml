@@ -1,5 +1,5 @@
 [package]
-name = "dora-people-lift"
+name = "dora-people-3d"
 version = "0.1.0"
 description = "dora node that places the pose model's people in 3D with the depth camera and follows them as tracks"
 edition = "2021"
