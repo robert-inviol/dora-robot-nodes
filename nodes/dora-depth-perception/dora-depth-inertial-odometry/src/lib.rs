@@ -86,7 +86,8 @@ pub enum UnrepresentablePose {
 /// The odom pose message for a tracked frame. The tracker's level frame is the message's odom frame.
 pub fn odom_pose(pose: &FramePose) -> Result<OdomPose, UnrepresentablePose> {
     Ok(OdomPose {
-        camera_ns: i64::try_from(pose.time.as_nanos()).map_err(|_| UnrepresentablePose::Time(pose.time))?,
+        camera_ns: camera_ns(pose.time)?,
+        odom_started_camera_ns: camera_ns(pose.odometry_started)?,
         depth_frame_id: pose.frame_id.0,
         position_m: pose.position_m.as_vec3(),
         orientation: pose.orientation.as_quat(),
@@ -98,6 +99,10 @@ pub fn odom_pose(pose: &FramePose) -> Result<OdomPose, UnrepresentablePose> {
         matched_points: u32::try_from(pose.matched_points()).map_err(|_| UnrepresentablePose::MatchedPoints(pose.matched_points()))?,
         weakest: pose.weakest().map(|weakest| WeakestDirection { direction: weakest.direction.as_vec3(), sigma_m: weakest.sigma_m as f32 }),
     })
+}
+
+fn camera_ns(time: Duration) -> Result<i64, UnrepresentablePose> {
+    i64::try_from(time.as_nanos()).map_err(|_| UnrepresentablePose::Time(time))
 }
 
 /// The calibration odometry started with and a later one that differs from it.
@@ -310,6 +315,7 @@ mod tests {
     fn frame_pose(cloud: CloudUse) -> FramePose {
         FramePose {
             time: Duration::new(1_762_560, 133_000_001),
+            odometry_started: Duration::new(1_762_550, 7),
             frame_id: DepthFrameId(43),
             position_m: DVec3::new(1.25, -0.5, 0.25),
             orientation: DQuat::from_xyzw(0.5, -0.5, 0.5, 0.5),
@@ -325,6 +331,7 @@ mod tests {
         let message = odom_pose(&frame_pose(CloudUse::Corrected { matched_points: 1234, weakest })).unwrap();
         let expected = OdomPose {
             camera_ns: 1_762_560_133_000_001,
+            odom_started_camera_ns: 1_762_550_000_000_007,
             depth_frame_id: 43,
             position_m: Vec3::new(1.25, -0.5, 0.25),
             orientation: Quat::from_xyzw(0.5, -0.5, 0.5, 0.5),

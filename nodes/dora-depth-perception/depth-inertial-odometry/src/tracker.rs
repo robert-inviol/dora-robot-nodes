@@ -88,6 +88,8 @@ pub enum CloudUse {
 pub struct FramePose {
     /// When the depth frame was taken, on the camera's clock.
     pub time: Duration,
+    /// When odometry started and fixed the level frame, on the camera's clock.
+    pub odometry_started: Duration,
     pub frame_id: DepthFrameId,
     /// Where the body (the IMU) is.
     pub position_m: DVec3,
@@ -122,6 +124,8 @@ impl FramePose {
 
 /// What the tracker made of a depth frame.
 #[derive(Clone, Copy, Debug, PartialEq)]
+// One of these is returned per depth frame and none are kept, so the pose stays inline and the type `Copy`.
+#[allow(clippy::large_enum_variant)]
 pub enum DepthFrameOutcome {
     /// The frame was taken before odometry started; there is no pose for it.
     AwaitingStart,
@@ -290,7 +294,8 @@ impl<M: SurfaceMap> PoseTracker<M> {
     pub fn add_depth_frame(&mut self, time: Duration, frame_id: DepthFrameId, depth_mm: &[u16]) -> Result<DepthFrameOutcome, TrackerError> {
         self.projector.fits(depth_mm.len()).map_err(TrackerError::DepthImage)?;
         let Phase::Tracking { odometry, pending, started_at } = &mut self.phase else { return Ok(DepthFrameOutcome::AwaitingStart) };
-        if time < *started_at {
+        let odometry_started = *started_at;
+        if time < odometry_started {
             return Ok(DepthFrameOutcome::AwaitingStart);
         }
         if let Some(previous) = self.last_posed.filter(|&previous| time <= previous) {
@@ -327,6 +332,7 @@ impl<M: SurfaceMap> PoseTracker<M> {
         let (position_m, orientation) = state.levelled_pose();
         Ok(DepthFrameOutcome::Posed(FramePose {
             time,
+            odometry_started,
             frame_id,
             position_m,
             orientation,
@@ -454,6 +460,7 @@ mod tests {
         let first = bench.posed(started + FRAME_PERIOD);
         assert_eq!((first.cloud, first.corrected(), first.matched_points(), first.weakest()), (CloudUse::StartedMap, false, 0, None));
         let second = bench.posed(started + 2 * FRAME_PERIOD);
+        assert!(first.odometry_started == second.odometry_started && first.odometry_started <= started && first.odometry_started >= REST_FOR, "{first:?}");
         assert!(second.corrected() && second.matched_points() > 50, "{second:?}");
         let weakest = second.weakest().expect("a corrected frame has a weakest direction");
         assert!((weakest.direction.length() - 1.0).abs() < 1e-9 && weakest.sigma_m > 0.0 && weakest.sigma_m < 0.05, "{weakest:?}");

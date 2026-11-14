@@ -94,6 +94,7 @@ EXAMPLES: dict[str, Message] = {
     ),
     "odom_pose": OdomPose(
         camera_ns=1_762_560_000_100_000_000,
+        odom_started_camera_ns=1_762_559_990_000_000_000,
         depth_frame_id=42,
         position_m=(1.25, -0.5, 0.25),
         orientation_xyzw=(0.5, -0.5, 0.5, 0.5),
@@ -107,6 +108,7 @@ EXAMPLES: dict[str, Message] = {
     ),
     "odom_pose_predicted": OdomPose(
         camera_ns=1_762_560_000_133_000_000,
+        odom_started_camera_ns=1_762_559_990_000_000_000,
         depth_frame_id=43,
         position_m=(1.5, -0.5, 0.25),
         orientation_xyzw=(0.0, 0.0, 1.0, 0.0),

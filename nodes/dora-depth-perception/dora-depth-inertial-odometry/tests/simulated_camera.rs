@@ -153,6 +153,9 @@ fn a_camera_that_rests_and_then_drives_gives_an_odom_pose_for_every_frame_from_t
         worst_angle_deg = worst_angle_deg.max(pose.orientation.angle_between(true_rotation.as_quat()).to_degrees());
     }
     assert!(poses.windows(2).all(|pair| pair[0].camera_ns < pair[1].camera_ns), "camera_ns strictly increases");
+    let odom_started = poses[0].odom_started_camera_ns;
+    assert!(odom_started > camera_ns(Duration::ZERO) && odom_started <= poses[0].camera_ns, "odometry started at rest, by the first pose");
+    assert!(poses.iter().all(|pose| pose.odom_started_camera_ns == odom_started), "one run is one odom frame");
     assert!(worst_position_m < 0.10 && worst_angle_deg < 1.0, "strayed {worst_position_m:.3} m, {worst_angle_deg:.2} deg");
 
     // The first cloud becomes the map; every later one corrects the pose.

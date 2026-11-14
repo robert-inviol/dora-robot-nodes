@@ -12,7 +12,7 @@ the simulator's messages only, not yet on a camera.
 
 | Output | Message |
 |---|---|
-| `odom_pose` | `odom_pose` (lib/dora-rig-messages odometry): one for every depth frame tracked once odometry has started. The IMU body's position, orientation and velocity in the odom frame (z up, origin and zero heading where the IMU rested at the start), the sigmas, whether the frame's cloud corrected the pose, and the weakest direction. `camera_ns` is the depth frame's camera time and strictly increases |
+| `odom_pose` | `odom_pose` (lib/dora-rig-messages odometry): one for every depth frame tracked once odometry has started. The IMU body's position, orientation and velocity in the odom frame (z up, origin and zero heading where the IMU rested at the start), the sigmas, whether the frame's cloud corrected the pose, and the weakest direction. `camera_ns` is the depth frame's camera time and strictly increases. `odom_started_camera_ns` is the camera time at which odometry started: the same on every pose of one run, and later when the node starts again, which tells a consumer the odom frame is a new one |
 
 ## Starting up
 

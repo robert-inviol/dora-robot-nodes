@@ -27,11 +27,17 @@ pub struct WeakestDirection {
 /// `camera_ns` strictly increases from one pose to the next. A consumer that wants the pose at another camera time
 /// interpolates between the two rows nearest to it on `camera_ns`.
 ///
+/// `odom_started_camera_ns` names the odom frame: every pose of one odom frame carries the same value, and
+/// odometry that starts again carries a later one. Poses with different values are in different odom frames and
+/// cannot be combined.
+///
 /// The sigmas say how well the pose is known against the odometry's own map. They do not include that map's drift.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct OdomPose {
     /// The time the pose is for, on the camera's own clock in nanoseconds (not a unix time): its depth frame's.
     pub camera_ns: i64,
+    /// The camera time at which odometry started and fixed the odom frame this pose is in.
+    pub odom_started_camera_ns: i64,
     pub depth_frame_id: u64,
     /// The IMU body's position in the odom frame.
     pub position_m: Vec3,
@@ -59,6 +65,7 @@ const WEAKEST_SIGMA_M: &str = "weakest_sigma_m";
 fn odom_pose_fields() -> Fields {
     Fields::from(vec![
         field("camera_ns", DataType::Int64),
+        field("odom_started_camera_ns", DataType::Int64),
         field("depth_frame_id", DataType::UInt64),
         field("position_m", items(DataType::Float32)),
         field("orientation_xyzw", items(DataType::Float32)),
@@ -101,6 +108,7 @@ pub fn decode_odom_pose(array: &dyn Array) -> Result<OdomPose> {
     };
     Ok(OdomPose {
         camera_ns: scalar::<Int64Type>(row, "camera_ns"),
+        odom_started_camera_ns: scalar::<Int64Type>(row, "odom_started_camera_ns"),
         depth_frame_id: scalar::<UInt64Type>(row, "depth_frame_id"),
         position_m: Vec3::from_array(values(row, "position_m")?),
         orientation: Quat::from_array(values(row, "orientation_xyzw")?),
@@ -121,6 +129,7 @@ pub fn encode_odom_pose(pose: &OdomPose) -> StructArray {
     };
     let columns: Vec<ArrayRef> = vec![
         Arc::new(Int64Array::from(vec![pose.camera_ns])),
+        Arc::new(Int64Array::from(vec![pose.odom_started_camera_ns])),
         Arc::new(UInt64Array::from(vec![pose.depth_frame_id])),
         one_list(floats(pose.position_m.to_array())),
         one_list(floats(pose.orientation.to_array())),
@@ -162,6 +171,7 @@ mod tests {
         let pose = decode_odom_pose(&golden).unwrap();
         let expected = OdomPose {
             camera_ns: 1_762_560_000_100_000_000,
+            odom_started_camera_ns: 1_762_559_990_000_000_000,
             depth_frame_id: 42,
             position_m: Vec3::new(1.25, -0.5, 0.25),
             orientation: Quat::from_xyzw(0.5, -0.5, 0.5, 0.5),
@@ -181,7 +191,8 @@ mod tests {
     fn a_predicted_odom_pose_has_no_weakest_direction_and_encodes_back_to_its_fixture() {
         let golden = fixture("odom_pose_predicted");
         let pose = decode_odom_pose(&golden).unwrap();
-        assert_eq!((pose.camera_ns, pose.depth_frame_id, pose.corrected, pose.matched_points, pose.weakest), (1_762_560_000_133_000_000, 43, false, 0, None));
+        assert_eq!((pose.camera_ns, pose.odom_started_camera_ns, pose.depth_frame_id), (1_762_560_000_133_000_000, 1_762_559_990_000_000_000, 43));
+        assert_eq!((pose.corrected, pose.matched_points, pose.weakest), (false, 0, None));
         assert_eq!(pose.orientation, Quat::from_xyzw(0.0, 0.0, 1.0, 0.0));
         assert_eq!(encode_odom_pose(&pose), golden);
     }

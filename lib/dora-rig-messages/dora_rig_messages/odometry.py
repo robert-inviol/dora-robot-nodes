@@ -6,6 +6,10 @@ the robot travels. The body frame is the IMU's own axes (on the D455: x right, y
 `camera_ns` strictly increases from one pose to the next. A consumer that wants the pose at another camera time
 interpolates between the two rows nearest to it on `camera_ns`.
 
+`odom_started_camera_ns` names the odom frame: every pose of one odom frame carries the same value, and odometry
+that starts again carries a later one. Poses with different values are in different odom frames and cannot be
+combined.
+
 The sigmas say how well the pose is known against the odometry's own map. They do not include that map's drift.
 """
 
@@ -24,6 +28,8 @@ ODOM_POSE_TYPE = pa.struct(
     [
         # The time the pose is for, on the camera's own clock in nanoseconds (not a unix time): its depth frame's.
         ("camera_ns", pa.int64()),
+        # The camera time at which odometry started and fixed the odom frame this pose is in.
+        ("odom_started_camera_ns", pa.int64()),
         ("depth_frame_id", pa.uint64()),
         # The IMU body's position in the odom frame, x y z.
         ("position_m", _items(pa.float32())),
@@ -71,6 +77,7 @@ class OdomPose:
     """The pose at one depth frame. See the module docstring for the frames, interpolation and what the sigmas mean."""
 
     camera_ns: int
+    odom_started_camera_ns: int
     depth_frame_id: int
     position_m: tuple[float, float, float]
     orientation_xyzw: tuple[float, float, float, float]
@@ -90,6 +97,7 @@ class OdomPose:
         return one_row(
             {
                 "camera_ns": self.camera_ns,
+                "odom_started_camera_ns": self.odom_started_camera_ns,
                 "depth_frame_id": self.depth_frame_id,
                 "position_m": list(self.position_m),
                 "orientation_xyzw": list(self.orientation_xyzw),

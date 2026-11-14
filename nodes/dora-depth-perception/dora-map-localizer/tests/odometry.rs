@@ -24,6 +24,7 @@ fn odom_pose(camera_ns: i64, floor: Pose) -> OdomPose {
     let orientation = Quat::from_mat3(&Mat3::from_cols(forward.cross(Vec3::Z), Vec3::NEG_Z, forward));
     let pose = OdomPose {
         camera_ns,
+        odom_started_camera_ns: 0,
         depth_frame_id: 0,
         position_m: floor.translation - orientation * MOUNT.camera_in_imu_m,
         orientation,
