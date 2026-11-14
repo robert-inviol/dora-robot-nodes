@@ -84,6 +84,23 @@ dora-map-localizer joins each registered keyframe to the odometry pose at its ca
 odometry started again in a new frame: the localizer drops the old frame's poses and correction and re-anchors from
 the next keyframe in the new frame. A start that goes back, or a camera time that goes back, stops the node.
 
+## Odometry
+
+dora-depth-inertial-odometry gives the robot's pose at every depth frame from the D455's depth and IMU: the IMU
+predicts, each depth cloud is matched point to plane against a local map, and an error-state Kalman filter blends
+the two. The library is `nodes/dora-depth-perception/depth-inertial-odometry`; its README explains the method, the
+three local maps it can use and how they compare for accuracy and for speed on a Pi 5, and its limits. The node
+runs the voxel-plane map.
+
+- It has run on the simulator only: the library on simulated drives, the node on simulated camera messages. It has
+  not run in a dora dataflow or on a camera.
+- The node publishes nothing until it has the camera's calibration and the robot has rested for 2 s. It stops,
+  rather than guess, when a calibration changes, time goes back, the IMU is more than 10 ms behind a depth frame,
+  or a silent stream leaves it holding more than 1 s of samples (see the node's README).
+- The odom frame is z up, with its origin and zero heading where the IMU rested at the start. The body is the IMU.
+- The sigmas on `odom_pose` say how well the pose fits the odometry's own map. They leave out that map's drift and
+  are too small as a measure of where the robot is in the room.
+
 ## Next
 
 In order; the first two are what it takes for people to reach the world store in a live run.
@@ -112,3 +129,17 @@ Also open:
   calibration message instead, if robert agrees.
 - A sighting's time is when the server received it, not when the camera captured it.
 - clippy warns on `room-map/src/grid.rs:85` (a loop that only indexes an array).
+
+Odometry, in order:
+
+1. Run dora-depth-inertial-odometry on the Pi from the live D455 with the robot at rest, beside the camera and pose
+   nodes. This shows whether the node's dora message handling works, whether each imu message arrives within 10 ms
+   of its depth frame, what a frame costs, and whether the 1 s backlog and the queue sizes in its dataflow hold.
+2. Record a walk with every depth frame, the imu messages and the calibration, starting and ending at the same
+   spot, and replay it through the odometry. The gap between the first and last pose is the first accuracy number
+   from a real camera. The same recording can feed map building.
+3. Fix what the walk shows. Known before it starts:
+   - height drifts when the floor is out of view; a measurement that holds the robot to the floor is not written,
+     and whether to add one is for robert to decide;
+   - people and other moving things are not masked out of the depth cloud;
+   - the lidar is not used: the filter takes point-to-plane rows from any sensor, and none are written for it.

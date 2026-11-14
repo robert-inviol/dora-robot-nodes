@@ -227,6 +227,9 @@ Each of these is in the code because the simulated drive failed without it.
 - The full-resolution depth image is only subsampled, not averaged, before thinning.
 - People and other moving things are not masked out of the cloud.
 - The neighbour maps report their planes as exact, which is the source of their overconfidence.
+- The position sigmas are too small on every map, because the filter does not carry the map's own drift.
+  They say how well a pose fits the map, not how far the map has wandered from the room.
+- Height drifts when the floor is out of view. Nothing holds the body to the floor.
 - Map points carry no memory of how uncertain the pose was when they were inserted.
 - The node, [`dora-depth-inertial-odometry`](../dora-depth-inertial-odometry/README.md), has run on the
   simulator's messages only.
