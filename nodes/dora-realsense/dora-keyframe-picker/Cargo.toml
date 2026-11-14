@@ -8,7 +8,7 @@ license.workspace = true
 readme = "../README.md"
 
 [dependencies]
-rgbd-keyframes = { path = "../../dora-realsense-keyframes/rgbd-keyframes" }
+rgbd-keyframes = { path = "../rgbd-keyframes" }
 perception-wire = { path = "../../dora-depth-perception/perception-wire" }
 depth-perception = { path = "../../dora-depth-perception/depth-perception" }
 # The node API has to match the version of the dora CLI that runs the dataflow.

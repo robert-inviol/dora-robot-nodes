@@ -24,9 +24,11 @@ use std::collections::VecDeque;
 
 use map_localizer::cloud::registration_cloud;
 use map_localizer::gyro::{GyroHeading, KeyframeTiming};
-use map_localizer::map_to_odom::{MapToOdomEstimator, OdomError, OdomHistory, OdomPose};
+use glam::Vec3;
+use map_localizer::map_to_odom::{CameraMount, MapToOdomEstimator, OdomError, OdomHistory, OdomPose};
 use map_localizer::{HeadingWithoutGyro, KeyframeEstimate, Localizer, LocalizerInput};
 use perception_wire::localization::{CameraNanos, FrameId, MapToOdom, Tracking};
+use perception_wire::camera::CameraCalibration;
 use perception_wire::odometry;
 use perception_wire::navigation::UnixNanos;
 use perception_wire::{Imu, Keyframe};
@@ -54,6 +56,8 @@ pub struct UnjoinedKeyframe {
 pub enum OdometryInputError {
     #[error("an odom_pose message arrived but the settings have no [odometry] section")]
     NotConfigured,
+    #[error("the camera moved against its IMU: the colour camera was at {was:?} m in IMU coordinates and is now at {now:?} m")]
+    CameraMoved { was: [f32; 3], now: [f32; 3] },
     #[error("odometry started at camera time {received} ns, before the odom frame in use, started at {current} ns")]
     StartWentBack { current: i64, received: i64 },
     #[error(transparent)]
@@ -79,11 +83,15 @@ pub struct Handled {
     /// An odometry pose left out because the camera faced too near straight up or down to have a heading.
     pub headingless_odometry: Option<CameraNanos>,
     pub odometry_restarted: Option<OdometryRestart>,
+    /// An odometry pose left out because no calibration has said where the colour camera sits on the IMU yet.
+    pub odometry_before_calibration: Option<CameraNanos>,
 }
 
 /// Odometry, and the registered keyframes waiting for it to reach their camera time.
 struct OdometryLink {
     settings: OdometrySettings,
+    /// Where the colour camera sits on the IMU, from the camera's calibration message.
+    mount: Option<CameraMount>,
     /// The camera time the odometry in use started at, and the camera time of its latest pose.
     odom_frame: Option<(CameraNanos, CameraNanos)>,
     history: OdomHistory,
@@ -95,6 +103,7 @@ struct OdometryLink {
 impl OdometryLink {
     fn new(settings: OdometrySettings) -> OdometryLink {
         OdometryLink {
+            mount: None,
             odom_frame: None,
             history: OdomHistory::new(settings.retention_ns),
             estimator: MapToOdomEstimator::new(settings.estimator.clone()),
@@ -191,11 +200,30 @@ impl LocalizerNode {
         }
     }
 
+    /// Takes where the colour camera sits on the IMU from the camera's calibration. Without odometry it is not needed
+    /// and is ignored; a calibration that moves the camera against the IMU is an error.
+    pub fn on_calibration(&mut self, calibration: &CameraCalibration) -> Result<(), OdometryInputError> {
+        let Some(link) = self.odometry.as_mut() else { return Ok(()) };
+        let camera_in_imu_m = calibration.depth_to_imu.apply(calibration.depth_to_color.inverse().apply(Vec3::ZERO));
+        match link.mount {
+            Some(mount) if mount.camera_in_imu_m.distance(camera_in_imu_m) > 1e-4 => {
+                Err(OdometryInputError::CameraMoved { was: mount.camera_in_imu_m.to_array(), now: camera_in_imu_m.to_array() })
+            }
+            _ => {
+                link.mount = Some(CameraMount { camera_in_imu_m });
+                Ok(())
+            }
+        }
+    }
+
     pub fn on_odom_pose(&mut self, pose: &odometry::OdomPose) -> Result<Handled, OdometryInputError> {
         let link = self.odometry.as_mut().ok_or(OdometryInputError::NotConfigured)?;
         let time = CameraNanos(pose.camera_ns);
+        let Some(mount) = link.mount else {
+            return Ok(Handled { odometry_before_calibration: Some(time), ..Handled::default() });
+        };
         let odometry_restarted = link.follow(CameraNanos(pose.odom_started_camera_ns), time)?;
-        let Some(floor) = link.settings.mount.floor_pose(pose.position_m, pose.orientation) else {
+        let Some(floor) = mount.floor_pose(pose.position_m, pose.orientation) else {
             return Ok(Handled { headingless_odometry: Some(time), odometry_restarted, ..Handled::default() });
         };
         link.history.push(OdomPose { time, pose: floor })?;

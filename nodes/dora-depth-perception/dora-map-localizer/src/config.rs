@@ -1,5 +1,5 @@
-//! The node's settings: a TOML file named by `MAP_LOCALIZER_CONFIG`, defaults from the library. Every key is optional
-//! except `camera_in_imu_m` in an `[odometry]` section. `map-localizer.example.toml` lists every key with its default.
+//! The node's settings: a TOML file named by `MAP_LOCALIZER_CONFIG`, defaults from the library. Every key is optional.
+//! `map-localizer.example.toml` lists every key with its default.
 
 use std::path::{Path, PathBuf};
 
@@ -89,8 +89,6 @@ pub struct GyroSection {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OdometrySection {
-    /// The colour camera's optical centre in the IMU's coordinates (x right, y down, z forward), in metres.
-    pub camera_in_imu_m: [f32; 3],
     #[serde(default = "OdometrySection::default_retention_s")]
     pub retention_s: f64,
     #[serde(default = "OdometrySection::default_window_keyframes")]
@@ -126,7 +124,6 @@ impl OdometrySection {
 
     fn settings(&self) -> OdometrySettings {
         OdometrySettings {
-            mount: CameraMount { camera_in_imu_m: Vec3::from_array(self.camera_in_imu_m) },
             retention_ns: (self.retention_s * 1e9).round() as i64,
             estimator: MapToOdomSettings {
                 window_keyframes: self.window_keyframes,
@@ -141,7 +138,6 @@ impl OdometrySection {
 /// How the node turns odometry into `map_to_odom`.
 #[derive(Clone, Debug)]
 pub struct OdometrySettings {
-    pub mount: CameraMount,
     /// Odometry poses, and registered keyframes waiting for odometry to reach them, are kept this long.
     pub retention_ns: i64,
     pub estimator: MapToOdomSettings,
@@ -357,19 +353,18 @@ mod tests {
     }
 
     #[test]
-    fn an_odometry_section_needs_the_camera_offset_and_defaults_the_rest() {
-        let config = written("[odometry]\ncamera_in_imu_m = [0.03, 0.0, -0.01]\n").unwrap();
+    fn an_empty_odometry_section_takes_odometry_with_the_defaults() {
+        let config = written("[odometry]\n").unwrap();
         let odometry = config.settings().odometry.unwrap();
-        assert_eq!(odometry.mount.camera_in_imu_m, Vec3::new(0.03, 0.0, -0.01));
         assert_eq!(odometry.retention_ns, OdometrySettings::DEFAULT_RETENTION_NS);
         assert_eq!(format!("{:?}", odometry.estimator), format!("{:?}", MapToOdomSettings::default()));
-        let error = toml::from_str::<NodeConfig>("[odometry]\nretention_s = 5.0\n").unwrap_err();
-        assert!(error.to_string().contains("camera_in_imu_m"), "{error}");
+        let error = toml::from_str::<NodeConfig>("[odometry]\ncamera_in_imu_m = [0.0, 0.0, 0.0]\n").unwrap_err();
+        assert!(error.to_string().contains("camera_in_imu_m"), "the offset comes from the calibration message: {error}");
     }
 
     #[test]
     fn odometry_without_the_imu_is_refused() {
-        let refused = written("[gyro]\nimu = \"absent\"\nheading_without_gyro = \"search\"\n[odometry]\ncamera_in_imu_m = [0.0, 0.0, 0.0]\n");
+        let refused = written("[gyro]\nimu = \"absent\"\nheading_without_gyro = \"search\"\n[odometry]\n");
         assert!(matches!(refused, Err(ConfigError::OdometryNeedsImu { .. })));
     }
 

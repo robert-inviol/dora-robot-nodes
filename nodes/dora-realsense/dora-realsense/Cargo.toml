@@ -9,7 +9,7 @@ readme = "../README.md"
 
 [dependencies]
 rgbd-frames = { path = "../rgbd-frames" }
-rgbd-keyframes = { path = "../../dora-realsense-keyframes/rgbd-keyframes" }
+rgbd-keyframes = { path = "../rgbd-keyframes" }
 perception-wire = { path = "../../dora-depth-perception/perception-wire" }
 # The node API has to match the version of the dora CLI that runs the dataflow.
 dora-node-api = { version = "=0.3.13", default-features = false }

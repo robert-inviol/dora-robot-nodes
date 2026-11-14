@@ -1,0 +1,3 @@
+# dora-map-localizer's settings for the spatial server: the defaults, with odometry joined to keyframes for
+# map_to_odom. See ../dora-map-localizer/map-localizer.example.toml for every key.
+[odometry]

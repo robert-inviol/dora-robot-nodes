@@ -6,6 +6,7 @@ dora node that places every keyframe in the map with the `map-localizer` library
 |---|---|---|
 | `keyframe` | `keyframe` | `queue_size: 1` is fine: only the newest keyframe matters |
 | `imu` | `imu` | Must not be dropped; every gyro sample is integrated. A keyframe is localised once the imu message leading up to it has arrived |
+| `calibration` | `camera_calibration` (lib/dora-rig-messages camera), from dora-realsense: where the colour camera sits on the IMU. Needed with an `[odometry]` section, ignored without one |
 | `odom_pose` | `odom_pose` (lib/dora-rig-messages odometry) | Only with an `[odometry]` section; without one an `odom_pose` message stops the node. Every pose is needed, in camera-time order |
 
 | Output | Message |
@@ -21,10 +22,12 @@ reached that time. The correction averages the latest `window_keyframes` joined 
 optimised map pose, and its spread gives the sigmas, never below the `min_sigma_*` settings.
 
 Odometry gives the IMU body's pose; the keyframe's floor frame is the colour camera's, whose axes on the D455 are
-the IMU's. `camera_in_imu_m`, the colour camera's optical centre in IMU coordinates, has no default: it is the
-camera's own IMU-to-colour extrinsic. A pose with the camera facing too near straight up or down has no heading and
-is left out with a warning. A keyframe that odometry has not reached within `retention_s`, or that falls before the
-odometry kept, is left out of the correction with a warning. Odometry going back in camera time stops the node.
+the IMU's. Where the colour camera's optical centre sits in IMU coordinates comes from the camera's `calibration`
+message (its `depth_to_imu` after the inverse of `depth_to_color`). Odometry poses before the first calibration are
+left out with a warning, and a calibration that moves the camera against the IMU stops the node. A pose with the
+camera facing too near straight up or down has no heading and is left out with a warning. A keyframe that odometry
+has not reached within `retention_s`, or that falls before the odometry kept, is left out of the correction with a
+warning. Odometry going back in camera time stops the node.
 
 A pose whose `odom_started_camera_ns` is later than the last pose's is from odometry that started again in a new
 odom frame. The localizer warns, drops the old frame's poses and correction, and sends the next correction once a
@@ -55,7 +58,7 @@ the node.
 ## Settings
 
 `MAP_LOCALIZER_CONFIG` names a TOML file; without it the library defaults apply. Every key is optional and an
-unknown key is an error, and `[odometry] camera_in_imu_m` is required when that section is present. `map-localizer.example.toml` lists every key with its default.
+unknown key is an error. `map-localizer.example.toml` lists every key with its default.
 
 ## Running
 

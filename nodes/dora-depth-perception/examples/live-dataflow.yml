@@ -1,4 +1,4 @@
-# The perception pipeline fed live by the camera machine's dataflow (dora-realsense-keyframes/examples/camera-dataflow.yml).
+# The perception pipeline fed live by the camera machine's dataflow (dora-realsense/examples/pose-dataflow.yml).
 # ZENOH_CONNECT is the camera machine's address.
 # Paths are relative to this file. Build the Rust nodes with `cargo build --release` in the node
 # directory, and run `uv sync` in each Python node's directory, before `dora start`.

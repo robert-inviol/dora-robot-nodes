@@ -292,8 +292,8 @@ fn people_tracks(position_frame: PositionFrame) -> StructArray {
         keypoints: vec![Keypoint { x_px: 50.0, y_px: 50.0, score: 0.9 }; 17],
         position: at(1.1),
         velocity: None,
-        keypoints_3d: vec![at(1.5); 17],
-        skeleton_3d: vec![None; 17],
+        keypoints_3d: vec![None; 17],
+        skeleton_3d: vec![at(1.5); 17],
     };
     encode_people_tracks(&PeopleTracks {
         frame_id: 8,

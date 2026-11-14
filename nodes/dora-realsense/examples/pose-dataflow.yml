@@ -1,6 +1,6 @@
 # On the camera's machine, everything the spatial server needs from it: the D455 through YOLOv8 pose on the Hailo-8,
 # odometry from its depth and IMU, the people placed in 3D in the odom frame, and keyframes, published on
-# rig/people_tracks, rig/odom_pose, rig/keyframe and rig/imu. Paths are relative to this file. Build
+# rig/people_tracks, rig/odom_pose, rig/keyframe, rig/imu and rig/calibration. Paths are relative to this file. Build
 # `cargo build --release -p dora-realsense -p dora-keyframe-picker` in dora-realsense,
 # `cargo build --release -p dora-depth-inertial-odometry` in dora-depth-perception, and `cargo build --release` in
 # dora-people-3d and dora-zenoh-bridge; the pose node needs the Pi's hailo-all and python3-gi. Hold the camera still
@@ -97,11 +97,12 @@ nodes:
     path: ../../dora-zenoh-bridge/target/release/dora-zenoh-bridge
     env:
       ZENOH_LISTEN: tcp/0.0.0.0:7447
-      ZENOH_PUBLISH: people_tracks=rig/people_tracks,odom_pose=rig/odom_pose,keyframe=rig/keyframe,imu=rig/imu
+      ZENOH_PUBLISH: people_tracks=rig/people_tracks,odom_pose=rig/odom_pose,keyframe=rig/keyframe,imu=rig/imu,calibration=rig/calibration
     inputs:
       people_tracks: people/people_tracks
       odom_pose: odometry/odom_pose
       keyframe: keyframes/keyframe
+      calibration: camera/calibration
       imu:
         source: keyframes/imu
         queue_size: 100

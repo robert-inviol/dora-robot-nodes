@@ -60,11 +60,9 @@ heading_without_gyro = "refuse"
 #           heading_without_gyro = "search".
 imu = "present"
 
-# Without this section the node takes no odometry. With it, the dataflow wires odom_pose and map_to_odom:
+# Without this section the node takes no odometry. With it, the dataflow wires odom_pose, the camera's calibration
+# (which says where the colour camera sits on the IMU) and map_to_odom:
 # [odometry]
-# # Required: the colour camera's optical centre in the IMU's coordinates (x right, y down, z forward), in metres,
-# # from the camera's IMU-to-colour extrinsic.
-# camera_in_imu_m = [0.0, 0.0, 0.0]
 # # Odometry poses, and keyframes waiting for odometry to reach them, are kept this long.
 # retention_s = 10.0
 # # The correction averages this many of the latest keyframes joined to odometry.

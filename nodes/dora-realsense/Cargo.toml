@@ -1,8 +1,8 @@
 [workspace]
 resolver = "3"
-members = ["rgbd-frames", "dora-realsense", "dora-keyframe-picker"]
+members = ["rgbd-frames", "rgbd-keyframes", "dora-realsense", "dora-keyframe-picker"]
 # The node links librealsense2, which only the camera's machine has; everything else builds anywhere.
-default-members = ["rgbd-frames", "dora-keyframe-picker"]
+default-members = ["rgbd-frames", "rgbd-keyframes", "dora-keyframe-picker"]
 
 [workspace.package]
 edition = "2021"

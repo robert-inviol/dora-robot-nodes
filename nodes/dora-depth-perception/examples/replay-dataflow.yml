@@ -6,7 +6,7 @@ nodes:
   - id: replay
     path: ../target/release/dora-keyframe-replay
     env:
-      # A recording written by dora-realsense-keyframes (KEYFRAME_RECORD_PATH), relative to this file.
+      # A recording written by dora-keyframe-picker (KEYFRAME_RECORD_PATH), relative to this file.
       KEYFRAME_RECORDING: recordings/room.arrow
       KEYFRAME_REPLAY_LOOP: "true"
     inputs:

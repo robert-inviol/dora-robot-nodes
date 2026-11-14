@@ -1,6 +1,6 @@
 # The spatial server on the mapping machine (strixen): localizer, dense map, object map and the spatial agent,
-# fed live over Zenoh. Keyframes and IMU come from the camera machine's dataflow
-# (dora-realsense-keyframes/examples/camera-dataflow.yml); SAM 3 segments come from a GPU machine running the
+# fed live over Zenoh. Keyframes, their IMU, odometry, the camera's calibration and people come from the camera
+# machine's dataflow (dora-realsense/examples/pose-dataflow.yml); SAM 3 segments come from a GPU machine running the
 # perception dataflow with `segments` published to rig/segments; questions come from whichever agent asks them.
 # ZENOH_CONNECT is the camera machine's address.
 # Paths are relative to this file. Build with `cargo build --release` in nodes/dora-depth-perception,
@@ -10,7 +10,7 @@ nodes:
     path: ../../dora-zenoh-bridge/target/release/dora-zenoh-bridge
     env:
       ZENOH_CONNECT: tcp/192.0.2.10:7447
-      ZENOH_SUBSCRIBE: rig/keyframe=keyframe,rig/imu=imu,rig/segments=segments,rig/space_question=space_question,rig/goal_status=goal_status,rig/people_tracks=people_tracks
+      ZENOH_SUBSCRIBE: rig/keyframe=keyframe,rig/imu=imu,rig/segments=segments,rig/space_question=space_question,rig/goal_status=goal_status,rig/people_tracks=people_tracks,rig/odom_pose=odom_pose,rig/calibration=calibration
       ZENOH_PUBLISH: keyframe_pose=rig/keyframe_pose,free_space=rig/free_space,topology=rig/topology,keep_out=rig/keep_out,object_update=rig/object_update,space_answer=rig/space_answer,nav_goal=rig/nav_goal
     inputs:
       tick: dora/timer/millis/5
@@ -28,11 +28,13 @@ nodes:
       - space_question
       - goal_status
       - people_tracks
+      - odom_pose
+      - calibration
 
   - id: localizer
     path: ../target/release/dora-map-localizer
     env:
-      MAP_LOCALIZER_CONFIG: ../dora-map-localizer/map-localizer.example.toml
+      MAP_LOCALIZER_CONFIG: spatial-server-localizer.toml
       RUST_LOG: info
     inputs:
       keyframe:
@@ -41,14 +43,17 @@ nodes:
       imu:
         source: link/imu
         queue_size: 1000
-      # Once the camera machine publishes odometry: subscribe rig/odom_pose=odom_pose on the link, add an
-      # [odometry] section to the settings, wire this input and the map_to_odom output, and publish it.
-      # odom_pose:
-      #   source: link/odom_pose
-      #   queue_size: 1000
+      # Every pose is needed, in camera-time order.
+      odom_pose:
+        source: link/odom_pose
+        queue_size: 1000
+      # Where the colour camera sits on the IMU; the same message every second.
+      calibration:
+        source: link/calibration
+        queue_size: 1
     outputs:
       - keyframe_pose
-      # - map_to_odom
+      - map_to_odom
 
   - id: dense_map
     path: ../target/release/dora-dense-map
@@ -107,13 +112,12 @@ nodes:
       keyframe_pose:
         source: localizer/keyframe_pose
         queue_size: 32
-      # People are placed in the map only in the odometry frame, with the localizer's map_to_odom; until the
-      # camera machine sends odometry-frame tracks and the localizer's map_to_odom is wired, they are logged and
-      # left out.
+      # People are placed in the map from the odometry frame with the localizer's map_to_odom; until the first
+      # correction they are logged and left out.
       people_tracks:
         source: link/people_tracks
         queue_size: 8
-      # map_to_odom: localizer/map_to_odom
+      map_to_odom: localizer/map_to_odom
     outputs:
       - space_answer
       - nav_goal

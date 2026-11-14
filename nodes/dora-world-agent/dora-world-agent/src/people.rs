@@ -1,7 +1,8 @@
 //! Placing the people tracker's confirmed tracks in the map.
 //!
 //! Tracks in the odometry frame are carried into the map with the localizer's latest map to odom correction. Tracks
-//! in the camera frame cannot be placed: the node does not know where the camera was.
+//! in the camera frame cannot be placed: the node does not know where the camera was. A track's joints are its
+//! `skeleton_3d`, the joints fitted to the person's skeleton; the raw `keypoints_3d` are not recorded.
 
 use perception_wire::localization::MapToOdom;
 use perception_wire::navigation::{TrackId, UnixNanos};
@@ -19,14 +20,14 @@ pub enum Unplaced {
 }
 
 #[derive(Clone, Debug, PartialEq, thiserror::Error)]
-#[error("people track {track} has {joints} 3D keypoints, not {}", Joint::ALL.len())]
+#[error("people track {track} has {joints} skeleton joints, not {}", Joint::ALL.len())]
 pub struct WrongJointCount {
     pub track: u64,
     pub joints: usize,
 }
 
-/// The confirmed tracks of one frame placed in the map, each with every joint depth placed. A confirmed track with
-/// no torso position is left out.
+/// The confirmed tracks of one frame placed in the map, each with every joint its skeleton fit placed. A confirmed
+/// track with no torso position is left out.
 pub fn place_people(
     frame: &PeopleTracks,
     correction: Option<&MapToOdom>,
@@ -46,13 +47,13 @@ pub fn place_people(
     };
     let mut sightings = Vec::new();
     for track in frame.tracks.iter().filter(|t| t.state == TrackState::Confirmed) {
-        if track.keypoints_3d.len() != Joint::ALL.len() {
-            return Err(WrongJointCount { track: track.track_id, joints: track.keypoints_3d.len() });
+        if track.skeleton_3d.len() != Joint::ALL.len() {
+            return Err(WrongJointCount { track: track.track_id, joints: track.skeleton_3d.len() });
         }
         let Some(torso) = &track.position else { continue };
         let joints = Joint::ALL
             .into_iter()
-            .zip(&track.keypoints_3d)
+            .zip(&track.skeleton_3d)
             .filter_map(|(joint, point)| point.as_ref().map(|p| JointPlacement { joint, position: to_map(p) }))
             .collect();
         let velocity = track.velocity.map(|v| FloorVelocity { vx_m_s: cos * v.vx_m_s - sin * v.vy_m_s, vy_m_s: sin * v.vx_m_s + cos * v.vy_m_s });
@@ -81,9 +82,9 @@ mod tests {
     }
 
     fn track(id: u64, state: TrackState, position: Option<people::Point>) -> PersonTrack {
-        let mut keypoints_3d = vec![None; Joint::ALL.len()];
-        keypoints_3d[5] = Some(point(1.0, 0.2, 1.4));
-        keypoints_3d[6] = Some(point(1.0, -0.2, 1.4));
+        let mut skeleton_3d = vec![None; Joint::ALL.len()];
+        skeleton_3d[5] = Some(point(1.0, 0.2, 1.4));
+        skeleton_3d[6] = Some(point(1.0, -0.2, 1.4));
         PersonTrack {
             track_id: id,
             state,
@@ -92,8 +93,8 @@ mod tests {
             keypoints: vec![Keypoint { x_px: 0.0, y_px: 0.0, score: 0.9 }; Joint::ALL.len()],
             position,
             velocity: Some(Velocity { vx_m_s: 0.5, vy_m_s: 0.0, vz_m_s: 0.0 }),
-            keypoints_3d,
-            skeleton_3d: vec![None; Joint::ALL.len()],
+            keypoints_3d: vec![Some(point(9.0, 9.0, 9.0)); Joint::ALL.len()],
+            skeleton_3d,
         }
     }
 
@@ -146,7 +147,7 @@ mod tests {
     #[test]
     fn a_track_without_every_joint_slot_is_refused() {
         let mut short = track(3, TrackState::Confirmed, Some(point(1.0, 0.0, 1.2)));
-        short.keypoints_3d.pop();
+        short.skeleton_3d.pop();
         let refused = place_people(&frame(PositionFrame::Odom, vec![short]), Some(&correction()), UnixNanos(9));
         assert_eq!(refused, Err(WrongJointCount { track: 3, joints: 16 }));
     }

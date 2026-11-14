@@ -44,8 +44,8 @@ about 1.3 of the Pi's 4 cores. Pose at 30 frames/s, every frame matched to its d
 of every 300 corrected by the depth cloud; a keyframe a second (align 23 ms, JPEG 18 ms); the skeleton fit 0.66 ms
 per person per frame. The person kept one id for the whole run.
 
-`nodes/dora-realsense-keyframes` (its own camera-dataflow.yml, which opens the D455 itself) is superseded by the
-keyframe picker and can retire.
+The link also publishes the camera's `calibration` on `rig/calibration`, which tells the server's localizer where
+the colour camera sits on the IMU.
 
 GPU machine, `nodes/dora-depth-perception/examples/live-dataflow.yml`: SAM 3 segments, scene concepts and geometry
 from `rig/keyframe`; publishes `rig/segments`.
@@ -54,15 +54,16 @@ Server (strixen), `nodes/dora-depth-perception/examples/spatial-server-dataflow.
 
 ```
 link: connects to the camera machine; subscribes rig/keyframe, rig/imu, rig/segments, rig/people_tracks,
-      rig/space_question, rig/goal_status
- |- keyframe, imu -> localizer (dora-map-localizer) -> keyframe_pose -> dense_map, objects, spatial_agent
+      rig/odom_pose, rig/calibration, rig/space_question, rig/goal_status
+ |- keyframe, imu, odom_pose, calibration -> localizer (dora-map-localizer)
+ |     -> keyframe_pose -> dense_map, objects, spatial_agent
+ |     -> map_to_odom -> spatial_agent
  |- keyframe, keyframe_pose, object_update -> dense_map -> free_space -> spatial_agent
  |- keyframe, keyframe_pose, segments -> objects (dora-object-map) -> object_update -> spatial_agent
- '- people_tracks -> spatial_agent (dora-world-agent: SQLite world store, MCP tools, spatial agents)
+ '- people_tracks, map_to_odom -> spatial_agent (dora-world-agent: SQLite world store, MCP tools, spatial agents)
 ```
 
-The camera machine now publishes everything the server subscribes to, but the server does not yet subscribe to
-`rig/odom_pose` (Next, 1).
+The two have not yet run together (Next, 1).
 
 ## People in the world store
 
@@ -80,7 +81,8 @@ People tracks reach the spatial agent's world store this way:
    migrations in `world-store/src/schema.rs`.
 5. The MCP tool `last_seen` returns a track's joints with their height above the floor.
 
-The joints come from the track's `keypoints_3d`, which is in COCO order; the store's joint mapping depends on that
+The joints come from the track's `skeleton_3d` (the joints dora-people-3d fitted to the person's skeleton; the raw
+`keypoints_3d` are not recorded), which is in COCO order; the store's joint mapping depends on that
 order (`world_model::world::Joint::ALL`). The heading is the walking direction at 0.2 m/s or faster, otherwise the
 facing from the shoulders, then the hips (`world-store/src/geometry.rs`).
 
@@ -111,26 +113,18 @@ runs the voxel-plane map.
 
 ## Next
 
-In order; the first is what it takes for people to reach the world store in a live run.
-
-1. Wire odometry on the server. The `odom_pose` input and `map_to_odom` output of the localizer are commented out in
-   `spatial-server-dataflow.yml`, as is the `map_to_odom` input of `spatial_agent`: subscribe
-   `rig/odom_pose=odom_pose` on the link, add an `[odometry]` section to the localizer settings, and uncomment them.
-2. Run the camera dataflow and the server together and check people reach the world store.
+1. Run the camera dataflow on the Pi and the spatial server on strixen together, and check that people reach the
+   world store with their joints.
 
 Also open:
 
-- Whether the world store records joints from `skeleton_3d` instead of `keypoints_3d` is for robert to decide
-  (recommended: `skeleton_3d` when filled, no joints otherwise, never a mix).
-- `camera_in_imu_m` in the localizer's `[odometry]` settings is set by hand. It could be read from the camera's
-  calibration message instead, if robert agrees.
 - The Zenoh link costs a third of a core on the Pi, more than the pose node; find out why.
 - The keyframe picker's alignment leaves out lens distortion.
 - A sighting's time is when the server received it, not when the camera captured it.
 - clippy warns on `room-map/src/grid.rs:85` (a loop that only indexes an array).
-- 3d-perception's uncommitted IMU calibration change to dora-realsense-keyframes sits in the main clone
-  (`~/src/dora-robot-nodes`, branch depth-perception); dora-realsense applies the same correction. Keep or discard
-  is robert's call.
+- The main clone (`~/src/dora-robot-nodes`, branch depth-perception) still holds 3d-perception's uncommitted IMU
+  calibration change to the retired dora-realsense-keyframes. dora-realsense applies the same correction. The
+  calibration itself, `~/imu-calibration/calibration.json` on the Pi, is still valid and in use.
 
 Odometry, in order:
 

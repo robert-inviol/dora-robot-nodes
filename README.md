@@ -11,13 +11,12 @@ one node without the rest.
 | Package | What it does |
 |---|---|
 | [`dora-hailo-perception`](nodes/dora-hailo-perception) | Camera through YOLOv8 on a Hailo-8, detections with persistent track ids, and the video to browsers over WebRTC; or another node's frames through YOLOv8 pose (`dora-hailo-pose`). Raspberry Pi 5 only |
-| [`dora-realsense`](nodes/dora-realsense) | A RealSense D455 in Rust: every frame's letterboxed model input, raw depth, IMU samples and calibration, on the camera's clock |
+| [`dora-realsense`](nodes/dora-realsense) | A RealSense D455 in Rust: every frame's letterboxed model input, raw depth, IMU samples and calibration, on the camera's clock; and `dora-keyframe-picker`, depth aligned to colour as a keyframe at least once a second and sooner when the camera turns, each led by every IMU sample since the last |
 | [`dora-people-3d`](nodes/dora-people-3d) | The pose model's people placed in 3D with depth, smoothed and followed as tracks, in Rust |
 | [`dora-person-follower`](nodes/dora-person-follower) | Decides where the robot goes: the operator's joystick, or towards one tracked person. Publishes a drive demand and knows nothing about the robot underneath |
 | [`dora-teleop`](nodes/dora-teleop) | A control page for a phone or laptop: joystick, follow toggle, stop button, the live video with the tracker's boxes, and the map |
 | [`dora-delta2a-lidar`](nodes/dora-delta2a-lidar) | The 3irobotics Delta-2A lidar, in Rust: decodes its serial stream and publishes each turn of the head as one scan |
 | [`dora-scan-view`](nodes/dora-scan-view) | A top-down map page of a lidar scan |
-| [`dora-realsense-keyframes`](nodes/dora-realsense-keyframes) | An Intel RealSense D400 camera with an IMU, in Rust: depth aligned to colour as a keyframe at least once a second and sooner when the camera turns, each led by every IMU sample since the last |
 | [`dora-zenoh-bridge`](nodes/dora-zenoh-bridge) | Carries messages between dataflows on different machines over Zenoh, as zstd-compressed Arrow IPC. Rust |
 | [`dora-scene-concepts`](nodes/dora-scene-concepts) | Asks Claude which object types a keyframe shows, and streams the names out as they come |
 | [`dora-sam3-segmenter`](nodes/dora-sam3-segmenter) | Segments each keyframe into the object types named so far with SAM 3 on a CUDA GPU, as one segment map |
@@ -45,9 +44,9 @@ left track gets `forward + turn`, the right `forward - turn`. Whatever you write
 robot when demands stop arriving; the follower already asks for a stop whenever its own inputs go
 quiet, and the control page centres the stick when the browser freezes or closes.
 
-The spatial server runs on a machine of its own. Its `dora-zenoh-bridge` brings in keyframes and IMU
-samples from the camera machine (`dora-realsense-keyframes`), segments from a GPU machine running
-`dora-sam3-segmenter`, questions, and the robot's goal statuses; it sends back poses, the map, objects,
+The spatial server runs on a machine of its own. Its `dora-zenoh-bridge` brings in keyframes, IMU
+samples, odometry and people from the camera machine (`dora-realsense`'s `examples/pose-dataflow.yml`), segments
+from a GPU machine running `dora-sam3-segmenter`, questions, and the robot's goal statuses; it sends back poses, the map, objects,
 answers and nav goals.
 
 ```
