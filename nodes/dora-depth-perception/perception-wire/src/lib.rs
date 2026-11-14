@@ -1,5 +1,11 @@
-//! The perception messages of lib/dora-rig-messages/dora_rig_messages/perception.py, as single-row Arrow structs.
-//! Field names, types and nullability must match that module exactly; the tests read its golden fixtures.
+//! The messages of lib/dora-rig-messages, as single-row Arrow structs: the perception messages of perception.py
+//! here, and the localization, navigation, objects and space_map modules' messages in the modules of the same names.
+//! Field names, types and nullability must match the Python modules exactly; the tests read their golden fixtures.
+
+pub mod localization;
+pub mod navigation;
+pub mod objects;
+pub mod space_map;
 
 use std::sync::Arc;
 
