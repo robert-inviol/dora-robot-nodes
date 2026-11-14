@@ -6,11 +6,27 @@ dora node that places every keyframe in the map with the `map-localizer` library
 |---|---|---|
 | `keyframe` | `keyframe` | `queue_size: 1` is fine: only the newest keyframe matters |
 | `imu` | `imu` | Must not be dropped; every gyro sample is integrated. A keyframe is localised once the imu message leading up to it has arrived |
-| `odom_pose` | not defined | Reserved for the robot's odometry. There is no `odom_pose` message, so wiring it stops the node with an error |
+| `odom_pose` | `odom_pose` (lib/dora-rig-messages odometry) | Only with an `[odometry]` section; without one an `odom_pose` message stops the node. Every pose is needed, in camera-time order |
 
 | Output | Message |
 |---|---|
 | `keyframe_pose` | `keyframe_pose` (lib/dora-rig-messages localization): one per localised keyframe, with the map version, tracking state, registration RMS and inlier fraction. Metadata `localize_ms` is the time taken |
+| `map_to_odom` | `map_to_odom` (lib/dora-rig-messages localization): with odometry, the transform taking odometry poses into the map, sent after every keyframe and every odometry pose that joined a keyframe |
+
+## Odometry
+
+With an `[odometry]` section the node joins every registered keyframe (tracked or relocalised) to the odometry
+pose at the keyframe's camera time, interpolated between the two odometry poses either side, once odometry has
+reached that time. The correction averages the latest `window_keyframes` joined keyframes, each at its current
+optimised map pose, and its spread gives the sigmas, never below the `min_sigma_*` settings.
+
+Odometry gives the IMU body's pose; the keyframe's floor frame is the colour camera's, whose axes on the D455 are
+the IMU's. `camera_in_imu_m`, the colour camera's optical centre in IMU coordinates, has no default: it is the
+camera's own IMU-to-colour extrinsic. A pose with the camera facing too near straight up or down has no heading and
+is left out with a warning. A keyframe that odometry has not reached within `retention_s`, or that falls before the
+odometry kept, is left out of the correction with a warning. Odometry going back in camera time stops the node.
+Odometry needs the imu input, which gives keyframes their camera time: an `[odometry]` section with
+`imu = "absent"` is refused.
 
 ## Without a gyro turn
 
@@ -34,7 +50,7 @@ the node.
 ## Settings
 
 `MAP_LOCALIZER_CONFIG` names a TOML file; without it the library defaults apply. Every key is optional and an
-unknown key is an error. `map-localizer.example.toml` lists every key with its default.
+unknown key is an error, and `[odometry] camera_in_imu_m` is required when that section is present. `map-localizer.example.toml` lists every key with its default.
 
 ## Running
 

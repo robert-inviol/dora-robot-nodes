@@ -40,8 +40,14 @@ nodes:
       imu:
         source: link/imu
         queue_size: 1000
+      # Once the camera machine publishes odometry: subscribe rig/odom_pose=odom_pose on the link, add an
+      # [odometry] section to the settings, wire this input and the map_to_odom output, and publish it.
+      # odom_pose:
+      #   source: link/odom_pose
+      #   queue_size: 1000
     outputs:
       - keyframe_pose
+      # - map_to_odom
 
   - id: dense_map
     path: ../target/release/dora-dense-map
