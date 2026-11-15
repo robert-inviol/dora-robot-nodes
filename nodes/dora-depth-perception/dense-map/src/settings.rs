@@ -79,11 +79,14 @@ impl Default for FreeSpaceSettings {
 pub struct SurfaceSettings {
     /// The shortest time between two surface_patches messages.
     pub period_s: f32,
+    /// A block whose triangles are the same is sent again only once one of its vertices has moved further than
+    /// this from where it was last sent.
+    pub min_vertex_move_m: f32,
 }
 
 impl Default for SurfaceSettings {
     fn default() -> Self {
-        SurfaceSettings { period_s: 1.0 }
+        SurfaceSettings { period_s: 1.0, min_vertex_move_m: 0.01 }
     }
 }
 
@@ -194,6 +197,8 @@ impl DenseMapSettings {
         check("free_space.band_min_m", s.band_min_m, s.band_min_m >= 0.0 && s.band_min_m < s.band_max_m, "expected 0 up to the band max")?;
         check("free_space.period_s", s.period_s, s.period_s >= 0.0, "expected at least 0")?;
         check("surface.period_s", self.surface.period_s, self.surface.period_s >= 0.0, "expected at least 0")?;
+        let move_m = self.surface.min_vertex_move_m;
+        check("surface.min_vertex_move_m", move_m, move_m >= 0.0, "expected at least 0")?;
         check("topology.door_width_m", p.door_width_m, p.door_width_m > p.min_door_width_m, "expected above the min door width")?;
         check("topology.place_spacing_m", p.place_spacing_m, p.place_spacing_m > t.voxel_m, "expected above one voxel")?;
         check("topology.max_edge_length_m", p.max_edge_length_m, p.max_edge_length_m >= p.place_spacing_m, "expected at least the place spacing")?;

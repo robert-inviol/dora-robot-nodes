@@ -66,6 +66,11 @@ impl SurfaceKind {
             SurfaceKind::LevelSurface => "level surface",
         }
     }
+
+    /// The kind a name from [`SurfaceKind::name`] stands for.
+    pub fn from_name(name: &str) -> Option<SurfaceKind> {
+        [SurfaceKind::Floor, SurfaceKind::Ceiling, SurfaceKind::Wall, SurfaceKind::LevelSurface].into_iter().find(|k| k.name() == name)
+    }
 }
 
 /// A plane `normal . p + offset_m = 0`; for a level plane the normal is exactly up, so its height is `-offset_m`.

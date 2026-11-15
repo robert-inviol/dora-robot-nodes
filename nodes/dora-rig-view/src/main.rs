@@ -1,7 +1,8 @@
 //! dora node serving the rig view page on `RIG_VIEW_PORT`.
 //!
 //! Inputs `keyframe`, `keyframe_pose`, `keyframe_poses_moved`, `odom_pose`, `map_to_odom`, `people_tracks`,
-//! `surface_patches`, `object_update`, `topology` and a dora timer `tick`, on which the robot and the people go out. Every input is
+//! `surface_patches`, `object_update`, `topology`, `layout` (a structure or scene message of the geometry node) and a
+//! dora timer `tick`, on which the robot and the people go out. Every input is
 //! optional except `tick`; an input the node does not know stops it.
 
 use std::future::IntoFuture;
@@ -18,6 +19,7 @@ use perception_wire::localization::{decode_keyframe_pose, decode_keyframe_poses_
 use perception_wire::objects::decode_object_update;
 use perception_wire::odometry::decode_odom_pose;
 use perception_wire::people::decode_people_tracks;
+use perception_wire::scene_layout::decode_scene_layout;
 use perception_wire::space_map::{decode_surface_patches, decode_topology};
 use perception_wire::{decode_keyframe, MessageContext};
 
@@ -74,6 +76,7 @@ fn on_input(scene: &mut Scene, input: &str, data: &dyn Array) -> Result<Vec<Outg
             scene.on_surface_patches(&decode_surface_patches(data).wrap_err("decoding a surface_patches message")?)?
         }
         "object_update" => scene.on_object_update(&decode_object_update(data).for_message(input)?),
+        "layout" => scene.on_scene_layout(decode_scene_layout(data).for_message(input)?),
         "topology" => scene.on_topology(&decode_topology(data).wrap_err("decoding a topology message")?),
         "tick" => scene.on_tick(),
         other => bail!("unknown input {other}"),

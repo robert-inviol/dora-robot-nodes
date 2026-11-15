@@ -1,15 +1,17 @@
 //! The rig view fed by a synthetic robot driving a circle in a 6 x 5 m room with a chair, for looking at the page
 //! without the rig. A keyframe a second is rendered from the room and fused by the dense map itself, which sends the
-//! surface patches and the topology; the robot goes at 10 Hz, a person walks along the far wall, and the chair is
-//! an object whose voxels paint the surface. After 20 s a loop closure moves every keyframe 5 cm and the dense map
-//! rebuilds. `cargo run --release --example demo -- 8094`, then open http://localhost:8094.
+//! surface patches and the topology, and each keyframe's planes and room are found as the geometry node finds them.
+//! The robot goes at 10 Hz; a person walks along the far wall, in the depth too, so later keyframes carve the clouds
+//! where they were; the chair is an object whose voxels paint the surface. After 20 s a loop closure moves every
+//! keyframe 5 cm and the dense map rebuilds. `cargo run --release --example demo -- 8094`, then open
+//! http://localhost:8094.
 
 use std::f32::consts::{FRAC_PI_2, TAU};
 use std::future::IntoFuture;
 use std::time::{Duration, Instant};
 
 use dense_map::{BlockTsdf, DenseMapSettings, DenseMapper, DepthKeyframe, KeyframePose as DenseKeyframePose, MapOutput};
-use depth_perception::CameraIntrinsics;
+use depth_perception::{find_planes, infer_room, sample_point_cloud, CameraIntrinsics, DepthImage, FloorFrame, PlaneSettings, RangeLimits, RoomSettings};
 use dora_rig_view::scene::{Scene, SceneSettings};
 use dora_rig_view::server::{router, SharedScene};
 use dora_rig_view::view::Outgoing;
@@ -21,7 +23,8 @@ use perception_wire::navigation::{MapVersion, UnixNanos};
 use perception_wire::objects::{ObjectExtent, ObjectId, ObjectUpdate, ObjectUpdateKind};
 use perception_wire::odometry::OdomPose;
 use perception_wire::people::{Keypoint, PeopleTracks, PersonTrack, PixelBox, Point, PositionFrame, TrackState};
-use perception_wire::Keyframe;
+use perception_wire::scene_layout::decode_scene_layout;
+use perception_wire::{encode_scene, Keyframe, Scene as WireScene};
 
 const ROOM: Vec3 = Vec3::new(6.0, 5.0, 2.6);
 const CHAIR_MIN: Vec3 = Vec3::new(4.95, 0.55, 0.0);
@@ -29,7 +32,8 @@ const CHAIR_MAX: Vec3 = Vec3::new(5.45, 1.05, 0.9);
 const CAMERA_HEIGHT_M: f32 = 1.0;
 const WIDTH: usize = 320;
 const HEIGHT: usize = 240;
-const INTRINSICS: CameraIntrinsics = CameraIntrinsics { fx: 220.0, fy: 220.0, ppx: 160.0, ppy: 120.0 };
+// About the D455's field of view, 90 by 70 degrees, so that the floor is in view.
+const INTRINSICS: CameraIntrinsics = CameraIntrinsics { fx: 160.0, fy: 170.0, ppx: 160.0, ppy: 120.0 };
 const KEYFRAMES: u64 = 40;
 const OBJECT_VOXEL_M: f32 = 0.05;
 
@@ -39,26 +43,52 @@ fn robot_at(t_s: f32) -> (Vec3, f32) {
     (Vec3::new(3.0 + 1.5 * angle.cos(), 2.5 + 1.5 * angle.sin(), CAMERA_HEIGHT_M), angle)
 }
 
-/// Where a ray from outside the chair first meets it, by the slab method.
-fn chair_hit(origin: Vec3, direction: Vec3) -> Option<f32> {
+/// Where a ray from outside a box first meets it, by the slab method.
+fn box_hit(origin: Vec3, direction: Vec3, low: Vec3, high: Vec3) -> Option<f32> {
     let (mut near, mut far) = (f32::NEG_INFINITY, f32::INFINITY);
     for axis in 0..3 {
         let d = direction[axis];
         if d.abs() < 1e-9 {
-            if origin[axis] < CHAIR_MIN[axis] || origin[axis] > CHAIR_MAX[axis] {
+            if origin[axis] < low[axis] || origin[axis] > high[axis] {
                 return None;
             }
             continue;
         }
-        let (a, b) = ((CHAIR_MIN[axis] - origin[axis]) / d, (CHAIR_MAX[axis] - origin[axis]) / d);
+        let (a, b) = ((low[axis] - origin[axis]) / d, (high[axis] - origin[axis]) / d);
         near = near.max(a.min(b));
         far = far.min(a.max(b));
     }
     (near <= far && near > 0.0).then_some(near)
 }
 
-/// Depth and colour seen from a level camera at `position` turned by `yaw` (forward along map +y at yaw 0).
-fn render(frame_id: u64, position: Vec3, yaw: f32) -> Keyframe {
+/// Where the person walking along the far wall stands at time `t_s`, along x.
+fn person_x(t_s: f32) -> f32 {
+    1.0 + 3.0 * (0.5 + 0.5 * (t_s * TAU / 16.0).sin())
+}
+
+/// The person as a box for the depth: shoulder wide, a body deep, 1.7 m tall.
+fn person_box(t_s: f32) -> (Vec3, Vec3) {
+    let x = person_x(t_s);
+    (Vec3::new(x - 0.22, 4.05, 0.0), Vec3::new(x + 0.22, 4.35, 1.7))
+}
+
+/// The colour of the room where a ray meets it: a checked floor, a white ceiling, blue end walls, cream side walls.
+fn room_colour(hit: Vec3) -> [u8; 3] {
+    if hit.z < 0.01 {
+        if (hit.x.floor() + hit.y.floor()) as i32 % 2 == 0 { [150, 130, 105] } else { [110, 92, 72] }
+    } else if hit.z > ROOM.z - 0.01 {
+        [225, 225, 220]
+    } else if hit.x < 0.01 || hit.x > ROOM.x - 0.01 {
+        [120, 160, 190]
+    } else {
+        [190, 175, 140]
+    }
+}
+
+/// Depth and colour seen from a level camera at `position` turned by `yaw` (forward along map +y at yaw 0), with
+/// the person where they are at `t_s`.
+fn render(frame_id: u64, position: Vec3, yaw: f32, t_s: f32) -> Keyframe {
+    let (person_low, person_high) = person_box(t_s);
     let turn = Quat::from_rotation_z(yaw);
     let mut depth_mm = vec![0u16; WIDTH * HEIGHT];
     let mut rgb = vec![0u8; WIDTH * HEIGHT * 3];
@@ -73,21 +103,14 @@ fn render(frame_id: u64, position: Vec3, yaw: f32) -> Keyframe {
                 })
                 .filter(|t| *t > 0.0)
                 .fold(f32::INFINITY, f32::min);
-            let (t, color) = match chair_hit(position, direction) {
-                Some(t) if t < room_t => (t, [150, 45, 40]),
-                _ => {
-                    let hit = position + direction * room_t;
-                    let color: [u8; 3] = if hit.z < 0.01 {
-                        if (hit.x.floor() + hit.y.floor()) as i32 % 2 == 0 { [150, 130, 105] } else { [110, 92, 72] }
-                    } else if hit.z > ROOM.z - 0.01 {
-                        [225, 225, 220]
-                    } else if hit.x < 0.01 || hit.x > ROOM.x - 0.01 {
-                        [120, 160, 190]
-                    } else {
-                        [190, 175, 140]
-                    };
-                    (room_t, color)
-                }
+            let chair_t = box_hit(position, direction, CHAIR_MIN, CHAIR_MAX).unwrap_or(f32::INFINITY);
+            let person_t = box_hit(position, direction, person_low, person_high).unwrap_or(f32::INFINITY);
+            let (t, color) = if person_t < room_t.min(chair_t) {
+                (person_t, [40, 120, 60])
+            } else if chair_t < room_t {
+                (chair_t, [150, 45, 40])
+            } else {
+                (room_t, room_colour(position + direction * room_t))
             };
             let pixel = row * WIDTH + column;
             depth_mm[pixel] = (t * 1000.0) as u16;
@@ -111,7 +134,7 @@ fn render(frame_id: u64, position: Vec3, yaw: f32) -> Keyframe {
 }
 
 fn person_at(t_s: f32) -> PeopleTracks {
-    let x = 1.0 + 3.0 * (0.5 + 0.5 * (t_s * TAU / 16.0).sin());
+    let x = person_x(t_s);
     let at = |dx: f32, z: f32| Some(Point { x_m: x + dx, y_m: 4.2, z_m: z });
     let mut skeleton_3d = vec![None; 17];
     for (joint, point) in [
@@ -199,6 +222,28 @@ fn wire_pose(frame_id: u64, pose: Pose4, map_version: u64) -> KeyframePose {
     }
 }
 
+/// The planes and room of one keyframe, found and encoded as the geometry node does, then read back as the rig
+/// view's layout input.
+fn layout_of(keyframe: &Keyframe) -> eyre::Result<perception_wire::scene_layout::SceneLayout> {
+    let depth_m = keyframe.depth_m();
+    let floor = FloorFrame::from_gravity_reaction(keyframe.gravity_reaction);
+    let depth = DepthImage::new(keyframe.width, keyframe.height, &depth_m);
+    let cloud = sample_point_cloud(&depth, &keyframe.intrinsics, &floor, RangeLimits::D455, 2);
+    let fit = find_planes(&cloud.points, &PlaneSettings::default());
+    let room = infer_room(&fit.planes, &cloud.points, &RoomSettings::default());
+    let (camera_forward, camera_up) = floor.camera_forward_and_up();
+    let scene = WireScene {
+        frame_id: keyframe.frame_id,
+        captured_unix_ns: keyframe.captured_unix_ns,
+        camera_forward,
+        camera_up,
+        planes: &fit.planes,
+        room: &room,
+        objects: &[],
+    };
+    decode_scene_layout(&encode_scene(&scene))
+}
+
 /// Lands rebuilds, and sends what the dense map made of the keyframes so far.
 fn dense_map_tick(mapper: &mut DenseMapper<BlockTsdf>, scene: &mut Scene, now: Instant, tick: u64) -> eyre::Result<Vec<Outgoing>> {
     let (outputs, _) = mapper.on_tick(now, UnixNanos(tick as i64))?;
@@ -242,11 +287,12 @@ async fn main() -> eyre::Result<()> {
             let mut out = Vec::new();
             if tick % 10 == 0 && (keyframes.len() as u64) < KEYFRAMES {
                 let frame_id = tick / 10 + 1;
-                let keyframe = render(frame_id, position, yaw);
+                let keyframe = render(frame_id, position, yaw, t_s);
                 let pose = wire_pose(frame_id, Pose4 { x_m: position.x, y_m: position.y, z_m: position.z, yaw_rad: yaw }, 1);
                 mapper.on_keyframe(DepthKeyframe::from_wire(&keyframe));
                 mapper.on_keyframe_pose(DenseKeyframePose::from(&pose));
                 out.extend(scene.on_keyframe(&keyframe)?);
+                out.extend(scene.on_scene_layout(layout_of(&keyframe)?));
                 out.extend(scene.on_keyframe_pose(&pose));
                 keyframes.push((frame_id, pose.pose));
             }

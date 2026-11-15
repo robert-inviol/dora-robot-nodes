@@ -1,21 +1,45 @@
-//! What the page receives over its WebSocket: keyframe clouds as binary messages, everything else as JSON text
-//! messages tagged by `type`. Positions are in the map frame (z up, metres) unless a message says otherwise.
+//! What the page receives over its WebSocket: keyframe clouds, their carving and the surface as binary messages,
+//! everything else as JSON text messages tagged by `type`. Positions are in the map frame (z up, metres) unless a
+//! message says otherwise.
 
 use std::sync::Arc;
 
 use bytes::Bytes;
 use serde::Serialize;
 
-/// One message to every page, cheap to clone for each of them.
+/// Which pages a message goes to: every page, or only the pages that show the keyframe clouds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Layer {
+    Always,
+    Clouds,
+}
+
 #[derive(Clone, Debug, PartialEq)]
-pub enum Outgoing {
+pub enum Payload {
     Binary(Bytes),
     Json(Arc<str>),
 }
 
+/// One message to the pages that show its layer, cheap to clone for each of them.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Outgoing {
+    pub layer: Layer,
+    pub payload: Payload,
+}
+
+impl Outgoing {
+    pub fn binary(layer: Layer, bytes: Bytes) -> Outgoing {
+        Outgoing { layer, payload: Payload::Binary(bytes) }
+    }
+
+    pub fn json(layer: Layer, update: &Update) -> Outgoing {
+        Outgoing { layer, payload: Payload::Json(serde_json::to_string(update).expect("view updates serialize").into()) }
+    }
+}
+
 impl From<&Update> for Outgoing {
     fn from(update: &Update) -> Outgoing {
-        Outgoing::Json(serde_json::to_string(update).expect("view updates serialize").into())
+        Outgoing::json(Layer::Always, update)
     }
 }
 
@@ -68,6 +92,25 @@ pub struct PlaceView {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct PlaneView {
+    /// floor, ceiling, wall or level surface.
+    pub kind: &'static str,
+    pub area_m2: f32,
+    /// In the keyframe's floor frame.
+    pub outline: Vec<[f32; 3]>,
+}
+
+/// The room one keyframe saw, in its floor frame: a prism from the floor to the ceiling over the footprint.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct RoomBoxView {
+    pub floor_m: f32,
+    pub ceiling_m: f32,
+    pub footprint: Vec<[f32; 2]>,
+    /// For each edge ending at the matching corner, whether a wall was seen along it.
+    pub edge_seen: Vec<bool>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Update {
     /// The first message on every connection: forget everything drawn so far.
@@ -92,11 +135,23 @@ pub enum Update {
         /// The cubes holding the object's points: cube (x, y, z) spans `[x, x + 1) * voxel_m` along x, and
         /// likewise along y and z.
         voxel_m: f32,
-        voxels: Vec<[i32; 3]>,
+        /// Null when the object's voxels are the ones last sent.
+        voxels: Option<Vec<[i32; 3]>>,
     },
     ObjectGone { object_id: u64 },
     /// The whole latest topology; it replaces the one before.
     Topology { rooms: Vec<RoomView>, doorways: Vec<DoorwayView>, places: Vec<PlaceView>, edges: Vec<[u64; 2]> },
+    /// The planes and the room of the latest keyframe whose layout came, in its floor frame, placed with its pose; not
+    /// drawn while the keyframe is not placed. It replaces the one before.
+    Layout {
+        frame_id: u64,
+        pose: FloorPose,
+        placed: bool,
+        planes: Vec<PlaneView>,
+        room: Option<RoomBoxView>,
+        /// Why there is no room.
+        room_problem: Option<String>,
+    },
     /// Why a layer is not drawn, or null once it is again.
     Notice { topic: NoticeTopic, text: Option<String> },
 }

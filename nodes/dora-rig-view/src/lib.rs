@@ -3,6 +3,7 @@
 //! page gets the scene once when it connects, then only what changes.
 
 pub mod cloud;
+pub mod clouds;
 pub mod scene;
 pub mod server;
 pub mod surface;

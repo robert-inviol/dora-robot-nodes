@@ -25,10 +25,12 @@ pub struct CloudSettings {
     pub stride_px: usize,
     pub min_range_m: f32,
     pub max_range_m: f32,
+    /// A later keyframe whose depth lies this much beyond a cloud's point saw through it, and removes it.
+    pub carve_margin_m: f32,
 }
 
 impl CloudSettings {
-    pub const DEFAULT: CloudSettings = CloudSettings { stride_px: 4, min_range_m: 0.4, max_range_m: 5.0 };
+    pub const DEFAULT: CloudSettings = CloudSettings { stride_px: 4, min_range_m: 0.4, max_range_m: 5.0, carve_margin_m: 0.1 };
 
     pub fn checked(self) -> Result<CloudSettings, CloudError> {
         if self.stride_px == 0 {
@@ -36,6 +38,9 @@ impl CloudSettings {
         }
         if !(0.0..self.max_range_m).contains(&self.min_range_m) || self.max_range_m > MAX_REPRESENTABLE_RANGE_M {
             return Err(CloudError::Range { min_m: self.min_range_m, max_m: self.max_range_m });
+        }
+        if !(self.carve_margin_m.is_finite() && self.carve_margin_m > 0.0) {
+            return Err(CloudError::CarveMargin(self.carve_margin_m));
         }
         Ok(self)
     }
@@ -47,6 +52,8 @@ pub enum CloudError {
     ZeroStride,
     #[error("the cloud range {min_m} m to {max_m} m must start at 0 or more, end after it, and end within 32 m")]
     Range { min_m: f32, max_m: f32 },
+    #[error("the carving margin {0} m must be above 0")]
+    CarveMargin(f32),
     #[error("keyframe {frame_id}'s colour image does not decode: {source}")]
     Jpeg { frame_id: u64, source: jpeg_decoder::Error },
     #[error("keyframe {frame_id}'s colour image is {jpeg_width}x{jpeg_height}, its depth {depth_width}x{depth_height}")]

@@ -5,20 +5,23 @@
 //! `map_to_odom`, which applies only to the odom frame in use: a correction made before odometry last started
 //! belongs to an earlier frame. The robot and the people are sent on each tick at most, whatever their rate.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::BTreeMap;
 
-use bytes::Bytes;
 use glam::{Quat, Vec3};
 use perception_wire::localization::{FrameId, KeyframePose, KeyframePosesMoved, MapToOdom, Pose4, Tracking};
 use perception_wire::objects::{ObjectId, ObjectUpdate, ObjectUpdateKind};
 use perception_wire::odometry::OdomPose;
 use perception_wire::people::{PeopleTracks, PositionFrame, TrackState};
+use perception_wire::scene_layout::SceneLayout;
 use perception_wire::space_map::{SurfacePatch, SurfacePatches, Topology};
 use perception_wire::Keyframe;
 
-use crate::cloud::{CloudError, CloudSettings, KeyframeCloud};
+use crate::cloud::{CloudError, CloudSettings};
+use crate::clouds::{CloudStore, Placement};
 use crate::surface::{encode_patches, BlockGrid, SurfaceError};
-use crate::view::{mm, mm3, DoorwayView, FloorPose, NoticeTopic, Outgoing, PersonView, PlaceView, RoomView, Update};
+use crate::view::{
+    mm, mm3, DoorwayView, Layer, NoticeTopic, Outgoing, PersonView, PlaceView, PlaneView, RoomBoxView, RoomView, Update,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SceneSettings {
@@ -32,17 +35,17 @@ impl SceneSettings {
 }
 
 pub struct Scene {
-    settings: SceneSettings,
-    /// Encoded clouds, oldest first.
-    clouds: VecDeque<(FrameId, Bytes)>,
-    keyframe_poses: HashMap<FrameId, Update>,
+    clouds: CloudStore,
     correction: Option<MapToOdom>,
     odometry: Option<OdomPose>,
     robot_due: bool,
     people: Option<PeopleTracks>,
     people_due: bool,
+    /// Every object as last sent, with its voxels.
     objects: BTreeMap<ObjectId, Update>,
     topology: Option<Update>,
+    /// The latest layout, drawn once its keyframe is placed.
+    layout: Option<SceneLayout>,
     notices: BTreeMap<NoticeTopic, String>,
     surface_grid: Option<BlockGrid>,
     /// The latest surface of every block that has one.
@@ -52,9 +55,7 @@ pub struct Scene {
 impl Scene {
     pub fn new(settings: SceneSettings) -> Scene {
         Scene {
-            settings,
-            clouds: VecDeque::new(),
-            keyframe_poses: HashMap::new(),
+            clouds: CloudStore::new(settings.cloud, settings.max_keyframes),
             correction: None,
             odometry: None,
             robot_due: false,
@@ -62,6 +63,7 @@ impl Scene {
             people_due: false,
             objects: BTreeMap::new(),
             topology: None,
+            layout: None,
             notices: BTreeMap::new(),
             surface_grid: None,
             surfaces: BTreeMap::new(),
@@ -76,27 +78,28 @@ impl Scene {
         self.surfaces.len()
     }
 
-    /// Everything a newly connected page needs, starting with a reset.
+    /// Everything a newly connected page needs, starting with a reset; the keyframe clouds come only with
+    /// [`Scene::clouds_snapshot`].
     pub fn snapshot(&self) -> Vec<Outgoing> {
         let mut out = vec![Outgoing::from(&Update::Reset)];
         for (&topic, text) in &self.notices {
             out.push((&Update::Notice { topic, text: Some(text.clone()) }).into());
         }
-        for (frame_id, cloud) in &self.clouds {
-            out.push(Outgoing::Binary(cloud.clone()));
-            if let Some(pose) = self.keyframe_poses.get(frame_id) {
-                out.push(pose.into());
-            }
-        }
         if let Some(grid) = self.surface_grid {
             let encoded = encode_patches(grid, self.surfaces.values()).expect("every kept patch was encoded once already");
-            out.push(Outgoing::Binary(encoded));
+            out.push(Outgoing::binary(Layer::Always, encoded));
         }
         out.extend(self.robot().map(|robot| Outgoing::from(&robot)));
         out.extend(self.people_update().map(|people| Outgoing::from(&people)));
         out.extend(self.objects.values().map(Outgoing::from));
         out.extend(self.topology.iter().map(Outgoing::from));
+        out.extend(self.layout_update().map(|layout| Outgoing::from(&layout)));
         out
+    }
+
+    /// Every keyframe cloud, for a page that starts to show them.
+    pub fn clouds_snapshot(&self) -> Vec<Outgoing> {
+        self.clouds.snapshot()
     }
 
     pub fn on_surface_patches(&mut self, surface: &SurfacePatches) -> Result<Vec<Outgoing>, SurfaceError> {
@@ -114,36 +117,59 @@ impl Scene {
                 self.surfaces.insert(block, patch.clone());
             }
         }
-        Ok(vec![Outgoing::Binary(encoded)])
+        Ok(vec![Outgoing::binary(Layer::Always, encoded)])
     }
 
     pub fn on_keyframe(&mut self, keyframe: &Keyframe) -> Result<Vec<Outgoing>, CloudError> {
-        let cloud = KeyframeCloud::from_keyframe(keyframe, &self.settings.cloud)?;
-        let encoded = cloud.encode();
-        let mut out = vec![Outgoing::Binary(encoded.clone())];
-        self.clouds.push_back((cloud.frame_id, encoded));
-        while self.clouds.len() > self.settings.max_keyframes {
-            let (dropped, _) = self.clouds.pop_front().expect("over the limit");
-            self.keyframe_poses.remove(&dropped);
-            out.push((&Update::KeyframeDropped { frame_id: dropped.0 }).into());
-        }
-        Ok(out)
+        self.clouds.on_keyframe(keyframe)
     }
 
     pub fn on_keyframe_pose(&mut self, pose: &KeyframePose) -> Vec<Outgoing> {
-        self.place_keyframe(pose.frame_id, pose.pose, pose.tracking != Tracking::Lost)
+        self.place_keyframe(pose.frame_id, Placement { pose: pose.pose, placed: pose.tracking != Tracking::Lost })
     }
 
     pub fn on_keyframe_poses_moved(&mut self, moved: &KeyframePosesMoved) -> Vec<Outgoing> {
-        moved.keyframes.iter().flat_map(|keyframe| self.place_keyframe(keyframe.frame_id, keyframe.pose, true)).collect()
+        moved
+            .keyframes
+            .iter()
+            .flat_map(|keyframe| self.place_keyframe(keyframe.frame_id, Placement { pose: keyframe.pose, placed: true }))
+            .collect()
     }
 
-    fn place_keyframe(&mut self, frame_id: FrameId, pose: Pose4, placed: bool) -> Vec<Outgoing> {
-        let pose = FloorPose { x_m: mm(pose.x_m), y_m: mm(pose.y_m), z_m: mm(pose.z_m), yaw_rad: pose.yaw_rad };
-        let update = Update::KeyframePose { frame_id: frame_id.0, pose, placed };
-        let out = vec![Outgoing::from(&update)];
-        self.keyframe_poses.insert(frame_id, update);
+    fn place_keyframe(&mut self, frame_id: FrameId, placement: Placement) -> Vec<Outgoing> {
+        let mut out = self.clouds.place(frame_id, placement);
+        if self.layout.as_ref().is_some_and(|layout| layout.frame_id == frame_id.0) {
+            out.extend(self.layout_update().map(|layout| Outgoing::from(&layout)));
+        }
         out
+    }
+
+    /// Keeps the planes and room of the latest keyframe, sent once that keyframe is placed.
+    pub fn on_scene_layout(&mut self, layout: SceneLayout) -> Vec<Outgoing> {
+        self.layout = Some(layout);
+        self.layout_update().map(|layout| Outgoing::from(&layout)).into_iter().collect()
+    }
+
+    fn layout_update(&self) -> Option<Update> {
+        let layout = self.layout.as_ref()?;
+        let placement = self.clouds.placement(FrameId(layout.frame_id))?;
+        Some(Update::Layout {
+            frame_id: layout.frame_id,
+            pose: placement.floor_pose(),
+            placed: placement.placed,
+            planes: layout
+                .planes
+                .iter()
+                .map(|plane| PlaneView { kind: plane.kind.name(), area_m2: mm(plane.area_m2), outline: plane.outline_m.iter().map(|c| mm3(*c)).collect() })
+                .collect(),
+            room: layout.room.as_ref().ok().map(|room| RoomBoxView {
+                floor_m: mm(room.floor_m),
+                ceiling_m: mm(room.ceiling_m),
+                footprint: room.footprint_m.iter().map(|c| [mm(c.x), mm(c.y)]).collect(),
+                edge_seen: room.edge_seen.clone(),
+            }),
+            room_problem: layout.room.as_ref().err().cloned(),
+        })
     }
 
     pub fn on_map_to_odom(&mut self, correction: &MapToOdom) {
@@ -162,6 +188,7 @@ impl Scene {
         self.people_due = true;
     }
 
+    /// An object that looks as it was last sent is not sent again, and its voxels go only when they changed.
     pub fn on_object_update(&mut self, update: &ObjectUpdate) -> Vec<Outgoing> {
         let gone = matches!(update.kind, ObjectUpdateKind::Disappeared | ObjectUpdateKind::Merged);
         if gone {
@@ -172,17 +199,33 @@ impl Scene {
         let object = Update::Object {
             object_id: update.object_id.0,
             label: update.label.clone(),
-            confidence: mm(update.confidence),
+            confidence: (update.confidence * 100.0).round() / 100.0,
             centre: mm3(extent.centre_m),
             footprint: extent.footprint_m.map(|corner| [mm(corner.x), mm(corner.y)]),
             bottom_m: mm(extent.top_m - extent.height_m),
             top_m: mm(extent.top_m),
             voxel_m: update.voxel_m,
-            voxels: update.voxels.iter().map(|v| v.to_array()).collect(),
+            voxels: Some(update.voxels.iter().map(|v| v.to_array()).collect()),
         };
-        let out = vec![Outgoing::from(&object)];
+        let sent = self.objects.get(&update.object_id);
+        if sent == Some(&object) {
+            return Vec::new();
+        }
+        let voxels_of = |update: &Update| match update {
+            Update::Object { voxel_m, voxels, .. } => Some((*voxel_m, voxels.clone())),
+            _ => None,
+        };
+        let out = if sent.and_then(voxels_of) == voxels_of(&object) {
+            let mut without = object.clone();
+            if let Update::Object { voxels, .. } = &mut without {
+                *voxels = None;
+            }
+            Outgoing::from(&without)
+        } else {
+            Outgoing::from(&object)
+        };
         self.objects.insert(update.object_id, object);
-        out
+        vec![out]
     }
 
     pub fn on_topology(&mut self, topology: &Topology) -> Vec<Outgoing> {
@@ -318,13 +361,14 @@ mod tests {
 
     use super::*;
     use crate::cloud::tests::wall_keyframe;
+    use crate::view::Payload;
 
     fn json(outgoing: &[Outgoing]) -> Vec<Value> {
         outgoing
             .iter()
-            .filter_map(|o| match o {
-                Outgoing::Json(text) => Some(serde_json::from_str(text).unwrap()),
-                Outgoing::Binary(_) => None,
+            .filter_map(|o| match &o.payload {
+                Payload::Json(text) => Some(serde_json::from_str(text).unwrap()),
+                Payload::Binary(_) => None,
             })
             .collect()
     }
@@ -332,9 +376,14 @@ mod tests {
     fn types(outgoing: &[Outgoing]) -> Vec<String> {
         outgoing
             .iter()
-            .map(|o| match o {
-                Outgoing::Json(text) => serde_json::from_str::<Value>(text).unwrap()["type"].as_str().unwrap().to_owned(),
-                Outgoing::Binary(bytes) => if bytes[0] == crate::surface::SURFACE_MESSAGE { "surface" } else { "cloud" }.to_owned(),
+            .map(|o| match &o.payload {
+                Payload::Json(text) => serde_json::from_str::<Value>(text).unwrap()["type"].as_str().unwrap().to_owned(),
+                Payload::Binary(bytes) => match bytes[0] {
+                    crate::surface::SURFACE_MESSAGE => "surface",
+                    crate::clouds::CARVE_MESSAGE => "carve",
+                    _ => "cloud",
+                }
+                .to_owned(),
             })
             .collect()
     }
@@ -441,7 +490,8 @@ mod tests {
         scene.on_keyframe(&wall_keyframe(1, 2000, [9, 9, 9])).unwrap();
         scene.on_keyframe_pose(&keyframe_pose(1, 0.5, Tracking::Tracking));
         scene.on_object_update(&object(3, ObjectUpdateKind::Appeared));
-        assert_eq!(types(&scene.snapshot()), ["reset", "cloud", "keyframe_pose", "object"]);
+        assert_eq!(types(&scene.snapshot()), ["reset", "object"], "clouds only for pages that show them");
+        assert_eq!(types(&scene.clouds_snapshot()), ["cloud", "keyframe_pose"]);
     }
 
     #[test]
@@ -469,7 +519,8 @@ mod tests {
         assert_eq!(types(&third), ["cloud", "keyframe_dropped"]);
         assert_eq!(json(&third)[0]["frame_id"], 1);
         assert_eq!(scene.keyframe_count(), 2);
-        assert_eq!(types(&scene.snapshot()), ["reset", "cloud", "keyframe_pose", "cloud"]);
+        assert_eq!(types(&scene.clouds_snapshot()), ["cloud", "keyframe_pose", "cloud"]);
+        assert!(third.iter().all(|o| o.layer == Layer::Clouds));
     }
 
     #[test]
@@ -567,6 +618,59 @@ mod tests {
         let sent = json(&scene.on_object_update(&object(3, ObjectUpdateKind::Appeared)));
         assert_eq!(sent[0]["voxel_m"].as_f64().map(|v| v as f32), Some(0.05));
         assert_eq!(sent[0]["voxels"], serde_json::json!([[20, 40, 0], [21, 40, 0]]));
+    }
+
+    #[test]
+    fn an_object_is_sent_again_only_when_it_changes_and_its_voxels_only_when_they_change() {
+        let mut scene = Scene::new(SceneSettings::DEFAULT);
+        scene.on_object_update(&object(3, ObjectUpdateKind::Appeared));
+        assert!(scene.on_object_update(&object(3, ObjectUpdateKind::Updated)).is_empty(), "nothing changed");
+        let mut seen_again = object(3, ObjectUpdateKind::Updated);
+        seen_again.confidence = 0.5;
+        let sent = json(&scene.on_object_update(&seen_again));
+        assert_eq!(sent[0]["confidence"].as_f64(), Some(0.5));
+        assert!(sent[0]["voxels"].is_null(), "the voxels are the ones the page has");
+        seen_again.voxels.push(glam::IVec3::new(22, 40, 0));
+        let sent = json(&scene.on_object_update(&seen_again));
+        assert_eq!(sent[0]["voxels"].as_array().map(Vec::len), Some(3));
+        assert_eq!(json(&scene.snapshot())[1]["voxels"].as_array().map(Vec::len), Some(3), "a late page gets them all");
+    }
+
+    fn layout(frame_id: u64) -> SceneLayout {
+        use perception_wire::scene_layout::{LayoutPlane, LayoutRoom};
+        SceneLayout {
+            frame_id,
+            planes: vec![LayoutPlane {
+                kind: depth_perception::SurfaceKind::Floor,
+                area_m2: 4.0,
+                outline_m: vec![Vec3::new(0.0, 1.0, -1.0), Vec3::new(1.0, 1.0, -1.0), Vec3::new(0.0, 2.0, -1.0)],
+            }],
+            room: Ok(LayoutRoom {
+                floor_m: -1.0,
+                ceiling_m: 1.5,
+                footprint_m: vec![Vec2::new(-1.0, 0.5), Vec2::new(1.0, 0.5), Vec2::new(1.0, 3.0), Vec2::new(-1.0, 3.0)],
+                edge_seen: vec![false, true, true, true],
+            }),
+        }
+    }
+
+    #[test]
+    fn a_layout_waits_for_its_keyframe_pose_and_follows_it_when_it_moves() {
+        let mut scene = Scene::new(SceneSettings::DEFAULT);
+        assert!(scene.on_scene_layout(layout(5)).is_empty(), "no pose yet");
+        let placed = scene.on_keyframe_pose(&keyframe_pose(5, 2.0, Tracking::Tracking));
+        let sent = json(&placed);
+        let layout_sent = sent.iter().find(|m| m["type"] == "layout").expect("the layout goes with the pose");
+        assert_eq!((layout_sent["placed"].as_bool(), layout_sent["pose"]["x_m"].as_f64()), (Some(true), Some(2.0)));
+        assert_eq!(layout_sent["planes"][0]["kind"], "floor");
+        assert_eq!(layout_sent["room"]["edge_seen"], serde_json::json!([false, true, true, true]));
+        let moved = KeyframePosesMoved {
+            map_version: MapVersion(2),
+            keyframes: vec![MovedKeyframe { frame_id: FrameId(5), pose: Pose4 { x_m: 2.5, y_m: 0.0, z_m: 0.0, yaw_rad: 0.0 } }],
+        };
+        let sent = json(&scene.on_keyframe_poses_moved(&moved));
+        assert_eq!(sent.iter().find(|m| m["type"] == "layout").unwrap()["pose"]["x_m"].as_f64(), Some(2.5));
+        assert_eq!(types(&scene.snapshot()), ["reset", "layout"]);
     }
 
     #[test]

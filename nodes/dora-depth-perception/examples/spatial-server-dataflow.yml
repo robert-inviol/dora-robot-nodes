@@ -129,6 +129,17 @@ nodes:
       - space_answer
       - nav_goal
 
+  # Planes and the room from each keyframe on its own (dora-depth-perception), for the rig view.
+  - id: geometry
+    path: ../target/release/dora-depth-perception
+    inputs:
+      keyframe:
+        source: link/keyframe
+        queue_size: 1
+    outputs:
+      - structure
+      - scene
+
   - id: rig_view
     path: ../../dora-rig-view/target/release/dora-rig-view
     env:
@@ -159,3 +170,6 @@ nodes:
         source: objects/object_update
         queue_size: 256
       topology: dense_map/topology
+      layout:
+        source: geometry/structure
+        queue_size: 1

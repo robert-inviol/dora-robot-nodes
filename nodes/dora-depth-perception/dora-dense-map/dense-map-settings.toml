@@ -29,6 +29,8 @@ period_s = 1.0
 [surface]
 # The shortest time between two surface_patches messages.
 period_s = 1.0
+# A block whose triangles are the same is sent again only once a vertex has moved further than this.
+min_vertex_move_m = 0.01
 
 [topology]
 door_width_m = 1.1

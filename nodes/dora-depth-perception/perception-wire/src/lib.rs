@@ -9,6 +9,7 @@ pub mod navigation;
 pub mod objects;
 pub mod odometry;
 pub mod people;
+pub mod scene_layout;
 mod serde_wire;
 pub mod space_map;
 
@@ -173,7 +174,7 @@ fn object_fields() -> Fields {
     ])
 }
 
-fn scene_fields() -> Fields {
+pub(crate) fn scene_fields() -> Fields {
     Fields::from(vec![
         field("frame_id", DataType::UInt64),
         field("captured_unix_ns", DataType::Int64),

@@ -101,6 +101,7 @@ impl<F: DistanceField> DenseMapper<F> {
     pub fn new(settings: DenseMapSettings, field: F) -> DenseMapper<F> {
         DenseMapper {
             topologist: Topologist::new(settings.topology),
+            mesher: SurfaceMesher::new(settings.surface.min_vertex_move_m),
             keep_out: KeepOutZones::new(&settings.keep_out),
             settings,
             field,
@@ -114,7 +115,6 @@ impl<F: DistanceField> DenseMapper<F> {
             changed_since_slice: false,
             last_slice: None,
             last_topology: None,
-            mesher: SurfaceMesher::new(),
             unmeshed: FxHashSet::default(),
             last_mesh: None,
         }

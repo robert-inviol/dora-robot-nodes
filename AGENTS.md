@@ -54,7 +54,10 @@ The link also publishes the camera's `calibration` on `rig/calibration`, which t
 the colour camera sits on the IMU.
 
 GPU machine, `nodes/dora-depth-perception/examples/live-dataflow.yml`: SAM 3 segments, scene concepts and geometry
-from `rig/keyframe`; publishes `rig/segments`.
+from `rig/keyframe`; publishes `rig/segments`. It runs on robert's laptop (RTX 4050, 6 GB; the SAM 3 environment
+needs Python 3.12, `uv sync --python 3.12`). Its link must listen as well as connect: Zenoh on the camera machine
+does not forward rig/segments between the laptop and strixen when both only connect to it, so strixen reaches the
+laptop directly.
 
 Server (strixen), `nodes/dora-depth-perception/examples/spatial-server-dataflow.yml`:
 
@@ -70,11 +73,13 @@ link: connects to the camera machine; subscribes rig/keyframe, rig/imu, rig/segm
  |- keyframe, keyframe_pose, segments -> objects (dora-object-map) -> object_update (with its voxels)
  |                                                                    -> spatial_agent, rig_view
  |- people_tracks, map_to_odom -> spatial_agent (dora-world-agent: SQLite world store, MCP tools, spatial agents)
+ |- keyframe -> geometry (dora-depth-perception) -> structure (one keyframe's planes and room) -> rig_view
  '- keyframe, odom_pose, people_tracks, topology, ... -> rig_view (dora-rig-view): the 3D page on port 8094
 ```
 
 dora-rig-view serves a page for people to watch the map grow: the dense map's surface with each object's voxels
-painted on it, the robot and its path, people's skeletons, rooms and places, and optionally the keyframe clouds.
+painted on it, the robot and its path, people's skeletons, rooms and places, the planes and room of the latest
+keyframe, and optionally the keyframe clouds, carved where later keyframes saw through them.
 A page gets the scene once when it connects, then only changes, over one WebSocket. `cargo run --release --example
 demo -- 8094` in nodes/dora-rig-view runs it on a synthetic room fused by the real dense map, without the rig.
 

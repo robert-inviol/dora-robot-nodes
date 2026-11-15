@@ -6,12 +6,10 @@
 //! the quads of the edges that start at its voxels, so it reads its neighbours' voxels one deep, and the vertices it
 //! shares with them come out the same in both.
 
-use std::hash::{Hash, Hasher};
-
 use glam::{IVec3, Vec3};
 use perception_wire::space_map::SurfacePatch;
 use rayon::prelude::*;
-use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::tsdf::{DistanceField, Sample, BLOCK_EDGE_VOXELS};
 
@@ -118,49 +116,50 @@ fn cell_vertex(distance: impl Fn(IVec3) -> Option<f32>) -> Option<Vec3> {
     Some(sum / crossings as f32)
 }
 
-fn fingerprint(patch: &SurfacePatch) -> u64 {
-    let mut hasher = FxHasher::default();
-    patch.positions_m.iter().for_each(|p| p.to_array().map(f32::to_bits).hash(&mut hasher));
-    patch.triangles.hash(&mut hasher);
-    hasher.finish()
+/// Whether `now` looks the same as `sent`: the same triangles over the same vertices, none moved further than
+/// `min_move_m`.
+fn looks_the_same(sent: &SurfacePatch, now: &SurfacePatch, min_move_m: f32) -> bool {
+    sent.triangles == now.triangles
+        && sent.positions_m.len() == now.positions_m.len()
+        && sent.positions_m.iter().zip(&now.positions_m).all(|(a, b)| a.distance_squared(*b) <= min_move_m * min_move_m)
 }
 
-/// Which blocks' surfaces were last sent, so that only the blocks whose surface changed are sent again.
-#[derive(Default)]
+/// The surfaces last sent, so that a block is sent again only when its surface changed enough to see.
 pub struct SurfaceMesher {
-    sent: FxHashMap<IVec3, u64>,
+    /// A block whose triangles are the same is sent again only once a vertex has moved further than this.
+    min_move_m: f32,
+    sent: FxHashMap<IVec3, SurfacePatch>,
 }
 
 impl SurfaceMesher {
-    pub fn new() -> SurfaceMesher {
-        SurfaceMesher::default()
+    pub fn new(min_move_m: f32) -> SurfaceMesher {
+        SurfaceMesher { min_move_m, sent: FxHashMap::default() }
     }
 
     /// Meshes every block whose surface the `changed` blocks can reach (they and their neighbours) and returns the
-    /// patches that differ from the last ones sent: new or changed surface, or a patch without triangles for a block
-    /// whose surface is gone.
+    /// patches that differ from the last ones sent: new surface, other triangles, a vertex moved further than the
+    /// minimum move, or a patch without triangles for a block whose surface is gone.
     pub fn changed_patches(&mut self, field: &dyn DistanceField, changed: &FxHashSet<IVec3>) -> Vec<SurfacePatch> {
         let reach: FxHashSet<IVec3> = changed
             .iter()
             .flat_map(|&block| (-1..=1).flat_map(move |z| (-1..=1).flat_map(move |y| (-1..=1).map(move |x| block + IVec3::new(x, y, z)))))
             .collect();
-        let meshed: Vec<(SurfacePatch, u64)> = reach
-            .into_par_iter()
-            .map(|block| mesh_block(field, block))
-            .map(|patch| {
-                let print = fingerprint(&patch);
-                (patch, print)
-            })
-            .collect();
+        let meshed: Vec<SurfacePatch> = reach.into_par_iter().map(|block| mesh_block(field, block)).collect();
         let mut patches = Vec::new();
-        for (patch, print) in meshed {
-            let empty = patch.triangles.is_empty();
-            let previous = if empty { self.sent.remove(&patch.block) } else { self.sent.insert(patch.block, print) };
-            let unchanged = match previous {
-                Some(previous) => !empty && previous == print,
-                None => empty,
+        for patch in meshed {
+            let unchanged = match (self.sent.get(&patch.block), patch.triangles.is_empty()) {
+                (None, true) => true,
+                (Some(_), true) => {
+                    self.sent.remove(&patch.block);
+                    false
+                }
+                (Some(sent), false) => looks_the_same(sent, &patch, self.min_move_m),
+                (None, false) => false,
             };
             if !unchanged {
+                if !patch.triangles.is_empty() {
+                    self.sent.insert(patch.block, patch.clone());
+                }
                 patches.push(patch);
             }
         }
@@ -268,14 +267,15 @@ mod tests {
 
     #[test]
     fn only_changed_surfaces_are_sent_again_and_a_vanished_one_once_as_empty() {
-        let mut mesher = SurfaceMesher::new();
+        let mut mesher = SurfaceMesher::new(0.005);
         let changed: FxHashSet<IVec3> = [IVec3::new(0, 1, 0)].into_iter().collect();
         let first = mesher.changed_patches(&wall(0.51), &changed);
         assert_eq!(first.len(), 9, "the block and its eight neighbours across the wall's plane");
         assert!(first.iter().all(|p| p.block.y == 1 && !p.triangles.is_empty()));
         assert!(mesher.changed_patches(&wall(0.51), &changed).is_empty(), "nothing changed");
+        assert!(mesher.changed_patches(&wall(0.513), &changed).is_empty(), "a 3 mm move is below the minimum");
         let moved = mesher.changed_patches(&wall(0.53), &changed);
-        assert_eq!(moved.len(), 9, "the wall moved within the same blocks");
+        assert_eq!(moved.len(), 9, "the wall moved 2 cm from what was sent, within the same blocks");
         let gone = mesher.changed_patches(&wall(1.51), &changed);
         assert_eq!(gone.len(), 9);
         assert!(gone.iter().all(|p| p.triangles.is_empty()), "the wall left these blocks");
