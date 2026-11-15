@@ -135,6 +135,8 @@ mod tests {
                 top_m: 0.9,
             },
             crop_jpeg: None,
+            voxel_m: 0.05,
+            voxels: vec![glam::IVec3::ZERO],
         }
     }
 

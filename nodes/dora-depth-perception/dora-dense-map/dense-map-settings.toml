@@ -26,6 +26,10 @@ band_max_m = 0.6
 occupied_below_m = 0.025
 period_s = 1.0
 
+[surface]
+# The shortest time between two surface_patches messages.
+period_s = 1.0
+
 [topology]
 door_width_m = 1.1
 min_rise_m = 0.1

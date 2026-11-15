@@ -138,6 +138,8 @@ fn appeared(id: ObjectId, label: &str, centre: Vec2, (long_m, short_m, height_m)
             top_m: height_m,
         },
         crop_jpeg: None,
+        voxel_m: 0.05,
+        voxels: vec![glam::IVec3::new(100, 16, 9)],
     })
 }
 

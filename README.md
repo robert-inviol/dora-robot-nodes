@@ -22,6 +22,7 @@ one node without the rest.
 | [`dora-sam3-segmenter`](nodes/dora-sam3-segmenter) | Segments each keyframe into the object types named so far with SAM 3 on a CUDA GPU, as one segment map |
 | [`dora-depth-perception`](nodes/dora-depth-perception) | A Rust workspace. Room geometry from one keyframe (planes, the room, object footprints) and its node; keyframe replay; `room-map`, one map of a room from a recording; `perception-wire`, the Rust side of the messages; and the mapping nodes: `dora-map-localizer` places every keyframe in one map, `dora-dense-map` builds free space, rooms, doorways, places and keep-out zones from posed depth, and `dora-object-map` keeps persistent objects from SAM 3 masks |
 | [`dora-scene-view`](nodes/dora-scene-view) | A live 3D debug page of what perception sees: point cloud, segments, planes, room and object boxes |
+| [`dora-rig-view`](nodes/dora-rig-view) | A live 3D page of the robot's map for people to watch, sent to browsers as small updates: the dense map's surface with objects painted on it, keyframe clouds, the robot and its path, people with their skeletons, rooms and places. Rust |
 | [`dora-world-agent`](nodes/dora-world-agent) | The spatial agent, in Rust: keeps the world model in SQLite, answers `space_question` messages with several Claude Code models at once and a reconciler, and sends `space_answer` revisions and `nav_goal` messages |
 | [`dora-rig-messages`](lib/dora-rig-messages) | The messages the nodes exchange, each defined once with an explicit Arrow type and a golden file that tests in any language check against |
 
@@ -52,7 +53,7 @@ answers and nav goals.
 ```
  keyframe, imu                            -> dora-map-localizer -> keyframe_pose
  keyframe, keyframe_pose, segments        -> dora-object-map    -> object_update
- keyframe, keyframe_pose, object_update   -> dora-dense-map     -> free_space, topology, keep_out
+ keyframe, keyframe_pose, object_update   -> dora-dense-map     -> free_space, topology, keep_out, surface_patches
  space_question, goal_status, topology,
  free_space, object_update, keyframe_pose -> dora-world-agent   -> space_answer, nav_goal
                                              (world store)

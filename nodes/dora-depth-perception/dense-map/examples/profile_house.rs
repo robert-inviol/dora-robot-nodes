@@ -68,6 +68,7 @@ fn main() {
                 MapOutput::Topology(t) => {
                     summary += &format!("{} rooms, {} doorways, {} places, {} edges", t.rooms.len(), t.doorways.len(), t.places.len(), t.edges.len())
                 }
+                MapOutput::SurfacePatches(s) => summary += &format!("{} surface patches; ", s.patches.len()),
             }
         }
         println!("free space and topology {round}: {:.1} ms; {summary}", ms(elapsed));

@@ -43,6 +43,13 @@ impl VoxelSet {
         self.cells.iter().copied()
     }
 
+    /// Every cell, ordered by x, then y, then z.
+    pub fn sorted_cells(&self) -> Vec<IVec3> {
+        let mut cells: Vec<IVec3> = self.cells().collect();
+        cells.sort_unstable_by_key(|cell| cell.to_array());
+        cells
+    }
+
     pub fn insert(&mut self, cell: IVec3) {
         if self.cells.is_empty() {
             (self.min, self.max) = (cell, cell);

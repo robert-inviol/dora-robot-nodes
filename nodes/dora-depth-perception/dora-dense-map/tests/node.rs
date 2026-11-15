@@ -12,7 +12,7 @@ use glam::{Vec2, Vec3};
 use perception_wire::localization::{encode_keyframe_pose, encode_keyframe_poses_moved, FrameId, KeyframePose, KeyframePosesMoved, MovedKeyframe, Pose4, Tracking};
 use perception_wire::navigation::{MapVersion, ObjectId, UnixNanos};
 use perception_wire::objects::{encode_object_update, ObjectExtent, ObjectUpdate, ObjectUpdateKind};
-use perception_wire::space_map::{decode_free_space, decode_keep_out, decode_topology};
+use perception_wire::space_map::{decode_free_space, decode_keep_out, decode_surface_patches, decode_topology};
 use perception_wire::{encode_keyframe, Keyframe};
 
 fn messages(node: &mut DenseMapNode, input: Input, data: StructArray, now: Instant) -> Vec<(Output, StructArray)> {
@@ -40,6 +40,8 @@ fn glass_door(kind: ObjectUpdateKind) -> ObjectUpdate {
             top_m: 1.7,
         },
         crop_jpeg: None,
+        voxel_m: 0.05,
+        voxels: vec![glam::IVec3::new(100, 16, 9)],
     }
 }
 
@@ -77,10 +79,13 @@ fn a_walk_through_two_rooms_comes_out_as_free_space_and_topology_and_a_glass_doo
 
     let out = messages(&mut node, Input::Tick, StructArray::new_empty_fields(1, None), start);
     let kinds: Vec<Output> = out.iter().map(|(o, _)| *o).collect();
-    assert_eq!(kinds, vec![Output::FreeSpace, Output::Topology]);
-    let free_space = decode_free_space(&out[0].1).unwrap();
+    assert_eq!(kinds, vec![Output::SurfacePatches, Output::FreeSpace, Output::Topology]);
+    let surface = decode_surface_patches(&out[0].1).unwrap();
+    assert_eq!((surface.map_version, surface.voxel_m, surface.block_voxels), (MapVersion(1), 0.05, 8));
+    assert!(surface.patches.len() > 100, "{} patches", surface.patches.len());
+    let free_space = decode_free_space(&out[1].1).unwrap();
     assert_eq!((free_space.map_version, free_space.resolution_m), (MapVersion(1), 0.05));
-    let topology = decode_topology(&out[1].1).unwrap();
+    let topology = decode_topology(&out[2].1).unwrap();
     assert_eq!((topology.rooms.len(), topology.doorways.len()), (2, 1));
 
     let early = messages(&mut node, Input::Tick, StructArray::new_empty_fields(1, None), start + Duration::from_millis(250));

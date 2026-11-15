@@ -109,6 +109,30 @@ ZONE_TYPE = pa.struct(
 
 KEEP_OUT_TYPE = pa.struct([("map_version", pa.uint64()), ("zones", _items(ZONE_TYPE))])
 
+SURFACE_PATCH_TYPE = pa.struct(
+    [
+        # The block of the dense map the patch covers: block (x, y, z) spans [x, x + 1) * block_voxels * voxel_m
+        # along x, and likewise along y and z.
+        ("block_x", pa.int32()),
+        ("block_y", pa.int32()),
+        ("block_z", pa.int32()),
+        # x, y and z of every vertex in turn, in the map frame.
+        ("positions_m", _items(pa.float32())),
+        # Three vertex indices per triangle, anticlockwise seen from the free side of the surface.
+        ("triangles", _items(pa.uint32())),
+    ]
+)
+
+SURFACE_PATCHES_TYPE = pa.struct(
+    [
+        ("map_version", pa.uint64()),
+        ("built_unix_ns", pa.int64()),
+        ("voxel_m", pa.float32()),
+        ("block_voxels", pa.uint32()),
+        ("patches", _items(SURFACE_PATCH_TYPE)),
+    ]
+)
+
 
 @dataclass(frozen=True)
 class Point:
@@ -388,6 +412,78 @@ class KeepOut:
         )
 
 
+@dataclass(frozen=True)
+class SurfacePatch:
+    """The dense map's surface inside one block; a patch without triangles says the block has no surface now."""
+
+    block: tuple[int, int, int]
+    positions_m: tuple[float, ...]
+    triangles: tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        if len(self.positions_m) % 3 or len(self.triangles) % 3:
+            raise ValueError(f"block {self.block} has {len(self.positions_m)} coordinates and {len(self.triangles)} "
+                             "triangle corners; both must be multiples of 3")
+        vertices = len(self.positions_m) // 3
+        if any(index >= vertices for index in self.triangles):
+            raise ValueError(f"block {self.block} has a triangle corner beyond its {vertices} vertices")
+
+
+@dataclass(frozen=True)
+class SurfacePatches:
+    """The blocks of the dense map whose surface changed since the last message, each with its whole new surface."""
+
+    map_version: MapVersion
+    built_unix_ns: int
+    voxel_m: float
+    block_voxels: int
+    patches: tuple[SurfacePatch, ...]
+
+    def __post_init__(self) -> None:
+        if not (math.isfinite(self.voxel_m) and self.voxel_m > 0.0):
+            raise ValueError(f"voxel_m is {self.voxel_m}, expected a finite value above 0")
+        if self.block_voxels < 1:
+            raise ValueError(f"block_voxels is {self.block_voxels}, expected at least 1")
+        blocks = [patch.block for patch in self.patches]
+        if len(set(blocks)) != len(blocks):
+            raise ValueError("a block has more than one patch")
+
+    def to_arrow(self) -> pa.Array:
+        return one_row(
+            {
+                "map_version": self.map_version,
+                "built_unix_ns": self.built_unix_ns,
+                "voxel_m": self.voxel_m,
+                "block_voxels": self.block_voxels,
+                "patches": [
+                    {
+                        "block_x": p.block[0],
+                        "block_y": p.block[1],
+                        "block_z": p.block[2],
+                        "positions_m": list(p.positions_m),
+                        "triangles": list(p.triangles),
+                    }
+                    for p in self.patches
+                ],
+            },
+            SURFACE_PATCHES_TYPE,
+        )
+
+    @classmethod
+    def from_arrow(cls, array: pa.Array) -> "SurfacePatches":
+        row = only_row(array, SURFACE_PATCHES_TYPE)
+        return cls(
+            map_version=MapVersion(row["map_version"]),
+            built_unix_ns=row["built_unix_ns"],
+            voxel_m=row["voxel_m"],
+            block_voxels=row["block_voxels"],
+            patches=tuple(
+                SurfacePatch((p["block_x"], p["block_y"], p["block_z"]), tuple(p["positions_m"]), tuple(p["triangles"]))
+                for p in row["patches"]
+            ),
+        )
+
+
 def _square(x_m: float, y_m: float, side_m: float) -> tuple[Point, ...]:
     return (Point(x_m, y_m), Point(x_m + side_m, y_m), Point(x_m + side_m, y_m + side_m), Point(x_m, y_m + side_m))
 
@@ -427,4 +523,20 @@ FIXTURE_EXAMPLES: dict[str, Any] = {
         zones=(KeepOutZone(ObjectId(42), "glass door", _square(4.0, 1.0, 1.0), margin_m=0.25),),
     ),
     "keep_out_empty": KeepOut(map_version=MapVersion(413), zones=()),
+    "surface_patches": SurfacePatches(
+        map_version=MapVersion(412),
+        built_unix_ns=1_762_560_003_000_000_000,
+        voxel_m=0.0625,
+        block_voxels=8,
+        patches=(
+            # A square of floor in block (0, 1, -1), facing up.
+            SurfacePatch(
+                (0, 1, -1),
+                (0.0, 0.5, -0.125, 0.25, 0.5, -0.125, 0.25, 0.75, -0.125, 0.0, 0.75, -0.125),
+                (0, 1, 2, 0, 2, 3),
+            ),
+            # Block (2, 0, 0) had surface and has none now.
+            SurfacePatch((2, 0, 0), (), ()),
+        ),
+    ),
 }

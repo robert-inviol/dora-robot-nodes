@@ -6,7 +6,7 @@ use dense_map::synthetic::{keyframe_at, look_around, two_rooms};
 use dense_map::{Arrival, BlockTsdf, DenseMapSettings, DenseMapper, FrameId, KeyframePose, MapOutput};
 use glam::Vec2;
 use perception_wire::navigation::{MapVersion, UnixNanos};
-use perception_wire::space_map::{Clearance, FreeSpace, RoomId, Topology};
+use perception_wire::space_map::{Clearance, FreeSpace, RoomId, SurfacePatches, Topology};
 
 const SPOTS: [(f32, f32); 10] =
     [(1.0, 1.0), (3.0, 1.0), (2.0, 2.0), (1.0, 3.0), (3.0, 3.0), (5.0, 1.0), (7.0, 1.0), (6.0, 2.0), (5.0, 3.0), (7.0, 3.0)];
@@ -15,16 +15,23 @@ fn walk() -> Vec<(Vec2, f32)> {
     look_around(&SPOTS.map(|(x, y)| Vec2::new(x, y)), 6)
 }
 
-fn outputs(outputs: Vec<MapOutput>) -> (FreeSpace, Option<Topology>) {
+fn outputs(outputs: Vec<MapOutput>) -> (FreeSpace, Option<Topology>, Option<SurfacePatches>) {
     let mut free_space = None;
     let mut topology = None;
+    let mut surface = None;
     for output in outputs {
         match output {
             MapOutput::FreeSpace(f) => free_space = Some(f),
             MapOutput::Topology(t) => topology = Some(t),
+            MapOutput::SurfacePatches(s) => surface = Some(s),
         }
     }
-    (free_space.expect("free space"), topology)
+    (free_space.expect("free space"), topology, surface)
+}
+
+/// How many of the surface's vertices lie within 3 cm of the height `z_m`.
+fn vertices_at_height(surface: &SurfacePatches, z_m: f32) -> usize {
+    surface.patches.iter().flat_map(|p| &p.positions_m).filter(|v| (v.z - z_m).abs() < 0.03).count()
 }
 
 fn room_at(topology: &Topology, point: Vec2) -> RoomId {
@@ -54,8 +61,12 @@ fn a_walk_through_two_rooms_maps_both_and_the_door_between_and_a_rebuild_keeps_t
         poses.push(pose);
     }
 
-    let (free_space, topology) = outputs(mapper.on_tick(start, UnixNanos(1)).unwrap().0);
+    let (free_space, topology, surface) = outputs(mapper.on_tick(start, UnixNanos(1)).unwrap().0);
     assert_eq!(free_space.map_version, MapVersion(1));
+    let surface = surface.expect("the first surface");
+    assert!(surface.patches.iter().all(|p| !p.triangles.is_empty()), "a first surface has no emptied blocks");
+    assert!(vertices_at_height(&surface, -0.3) > 1000, "the floor");
+    assert!(vertices_at_height(&surface, 2.1) > 1000, "the ceiling");
     let cell = |x: f32, y: f32| {
         let (column, row) = free_space.cell_at(Vec2::new(x, y)).expect("inside the grid");
         free_space.cell(column, row)
@@ -90,8 +101,10 @@ fn a_walk_through_two_rooms_maps_both_and_the_door_between_and_a_rebuild_keeps_t
     assert_eq!(report.rebuild_started, Some(MapVersion(2)));
     let (outputs_after, report) = mapper.on_tick_after_rebuild(start + Duration::from_secs(4), UnixNanos(4)).unwrap();
     assert_eq!(report.rebuilt, Some(MapVersion(2)));
-    let (free_space, topology) = outputs(outputs_after);
+    let (free_space, topology, surface) = outputs(outputs_after);
     assert_eq!(free_space.map_version, MapVersion(2));
+    let surface = surface.expect("the moved walls are meshed again");
+    assert_eq!(surface.map_version, MapVersion(2));
     let topology = topology.expect("a topology for the new map version");
     assert_eq!(topology.map_version, MapVersion(2));
     assert_eq!(topology.rooms.len(), 2);

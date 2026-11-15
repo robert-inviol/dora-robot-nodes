@@ -52,7 +52,17 @@ pub trait DistanceField: Send + Sync + 'static {
 
     /// A box around every voxel the field holds, or None while it holds none.
     fn bounds(&self) -> Option<Bounds>;
+
+    /// The blocks of `BLOCK_EDGE_VOXELS` voxels a side that the field holds: block `b` spans voxels
+    /// `b * BLOCK_EDGE_VOXELS` up to the next block's.
+    fn blocks(&self) -> Vec<IVec3>;
+
+    /// The blocks integration changed since the last call; the call empties the record.
+    fn take_changed_blocks(&mut self) -> FxHashSet<IVec3>;
 }
+
+/// The edge of a block, in voxels.
+pub const BLOCK_EDGE_VOXELS: i32 = BLOCK_EDGE;
 
 const BLOCK_EDGE: i32 = 8;
 const BLOCK_VOXELS: usize = (BLOCK_EDGE * BLOCK_EDGE * BLOCK_EDGE) as usize;
@@ -85,11 +95,12 @@ fn split(voxel: IVec3) -> (IVec3, usize) {
 pub struct BlockTsdf {
     settings: TsdfSettings,
     blocks: FxHashMap<IVec3, Box<Block>>,
+    changed: FxHashSet<IVec3>,
 }
 
 impl BlockTsdf {
     pub fn new(settings: TsdfSettings) -> BlockTsdf {
-        BlockTsdf { settings, blocks: FxHashMap::default() }
+        BlockTsdf { settings, blocks: FxHashMap::default(), changed: FxHashSet::default() }
     }
 
     pub fn block_count(&self) -> usize {
@@ -200,6 +211,7 @@ impl DistanceField for BlockTsdf {
             in_view.iter().map(|index| (*index, self.blocks.remove(index).expect("allocated above"))).collect();
         targets.par_iter_mut().for_each(|(index, block)| self.integrate_block(*index, block, depth));
         self.blocks.extend(targets);
+        self.changed.extend(in_view);
     }
 
     fn voxel(&self, index: IVec3) -> Sample {
@@ -254,6 +266,14 @@ impl DistanceField for BlockTsdf {
         let first = *indices.next()?;
         let (low, high) = indices.fold((first, first), |(low, high), index| (low.min(*index), high.max(*index)));
         Some(Bounds { min: low.as_vec3() * block_m, max: (high + 1).as_vec3() * block_m })
+    }
+
+    fn blocks(&self) -> Vec<IVec3> {
+        self.blocks.keys().copied().collect()
+    }
+
+    fn take_changed_blocks(&mut self) -> FxHashSet<IVec3> {
+        std::mem::take(&mut self.changed)
     }
 }
 
@@ -318,6 +338,17 @@ mod tests {
         tsdf.integrate(&facing_wall(2.1, &mut far_mm));
         let Sample::Observed { distance_m } = tsdf.sample(Vec3::new(0.01, 2.02, 0.01)) else { panic!("unobserved") };
         assert!((distance_m - 0.025).abs() < 1e-4, "halfway between the two walls: {distance_m}");
+    }
+
+    #[test]
+    fn integration_records_the_blocks_it_changed_until_they_are_taken() {
+        let mut depth_mm = Vec::new();
+        let mut tsdf = BlockTsdf::new(TsdfSettings::default());
+        tsdf.integrate(&facing_wall(2.0, &mut depth_mm));
+        let changed = tsdf.take_changed_blocks();
+        assert!(!changed.is_empty());
+        assert_eq!(changed.len(), tsdf.blocks().len(), "every block was new");
+        assert!(tsdf.take_changed_blocks().is_empty(), "taken once");
     }
 
     #[test]

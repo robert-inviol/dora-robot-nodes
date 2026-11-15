@@ -7,12 +7,14 @@ use std::fmt;
 use std::sync::Arc;
 
 use dora_node_api::arrow::array::{
-    Array, ArrayRef, AsArray, Float32Array, Int64Array, ListArray, StringArray, StructArray, UInt16Array, UInt32Array,
-    UInt64Array,
+    Array, ArrayRef, AsArray, Float32Array, Int32Array, Int64Array, ListArray, StringArray, StructArray, UInt16Array,
+    UInt32Array, UInt64Array,
 };
 use dora_node_api::arrow::buffer::OffsetBuffer;
-use dora_node_api::arrow::datatypes::{DataType, Field, Fields, Float32Type, Int64Type, UInt16Type, UInt32Type, UInt64Type};
-use glam::Vec2;
+use dora_node_api::arrow::datatypes::{
+    DataType, Field, Fields, Float32Type, Int32Type, Int64Type, UInt16Type, UInt32Type, UInt64Type,
+};
+use glam::{IVec3, Vec2, Vec3};
 
 use crate::navigation::{MapVersion, ObjectId, PlaceId, UnixNanos};
 pub use crate::navigation::RoomId;
@@ -156,6 +158,26 @@ pub struct KeepOut {
     pub zones: Vec<KeepOutZone>,
 }
 
+/// The dense map's surface inside one block; a patch without triangles says the block has no surface now.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SurfacePatch {
+    /// Block (x, y, z) spans `[x, x + 1) * block_voxels * voxel_m` along x, and likewise along y and z.
+    pub block: IVec3,
+    pub positions_m: Vec<Vec3>,
+    /// Vertex indices, anticlockwise seen from the free side of the surface.
+    pub triangles: Vec<[u32; 3]>,
+}
+
+/// The blocks of the dense map whose surface changed since the last message, each with its whole new surface.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SurfacePatches {
+    pub map_version: MapVersion,
+    pub built: UnixNanos,
+    pub voxel_m: f32,
+    pub block_voxels: u32,
+    pub patches: Vec<SurfacePatch>,
+}
+
 #[derive(Debug, thiserror::Error, PartialEq)]
 pub enum SpaceMapError {
     #[error("expected the {message} wire type {expected:?}, received {received:?}")]
@@ -168,6 +190,10 @@ pub enum SpaceMapError {
     CellsDoNotFillGrid { cells: usize, width: u32, height: u32 },
     #[error("a polygon has {0} points, expected at least 3")]
     DegeneratePolygon(usize),
+    #[error("{field} holds {count} values, not a multiple of 3")]
+    NotTriples { field: &'static str, count: usize },
+    #[error("block {block:?} has a triangle corner beyond its {vertices} vertices")]
+    CornerBeyondVertices { block: [i32; 3], vertices: usize },
 }
 
 fn item(data_type: DataType) -> Arc<Field> {
@@ -262,6 +288,26 @@ fn zone_fields() -> Fields {
 
 pub fn keep_out_fields() -> Fields {
     Fields::from(vec![field("map_version", DataType::UInt64), field("zones", items(DataType::Struct(zone_fields())))])
+}
+
+fn surface_patch_fields() -> Fields {
+    Fields::from(vec![
+        field("block_x", DataType::Int32),
+        field("block_y", DataType::Int32),
+        field("block_z", DataType::Int32),
+        field("positions_m", items(DataType::Float32)),
+        field("triangles", items(DataType::UInt32)),
+    ])
+}
+
+pub fn surface_patches_fields() -> Fields {
+    Fields::from(vec![
+        field("map_version", DataType::UInt64),
+        field("built_unix_ns", DataType::Int64),
+        field("voxel_m", DataType::Float32),
+        field("block_voxels", DataType::UInt32),
+        field("patches", items(DataType::Struct(surface_patch_fields()))),
+    ])
 }
 
 // Encoding.
@@ -366,6 +412,28 @@ pub fn encode_keep_out(keep_out: &KeepOut) -> StructArray {
     StructArray::new(keep_out_fields(), columns, None)
 }
 
+pub fn encode_surface_patches(surface: &SurfacePatches) -> StructArray {
+    let patches = &surface.patches;
+    let block = |axis: fn(IVec3) -> i32| -> ArrayRef { Arc::new(patches.iter().map(|p| axis(p.block)).collect::<Int32Array>()) };
+    let positions = floats(patches.iter().flat_map(|p| p.positions_m.iter().flat_map(|v| v.to_array())));
+    let triangles: ArrayRef = Arc::new(patches.iter().flat_map(|p| p.triangles.iter().flatten().copied()).collect::<UInt32Array>());
+    let patch_columns: Vec<ArrayRef> = vec![
+        block(|b| b.x),
+        block(|b| b.y),
+        block(|b| b.z),
+        list_of(positions, patches.iter().map(|p| 3 * p.positions_m.len())),
+        list_of(triangles, patches.iter().map(|p| 3 * p.triangles.len())),
+    ];
+    let columns: Vec<ArrayRef> = vec![
+        ids([surface.map_version.0]),
+        Arc::new(Int64Array::from(vec![surface.built.0])),
+        floats([surface.voxel_m]),
+        Arc::new(UInt32Array::from(vec![surface.block_voxels])),
+        one_list(structs(surface_patch_fields(), patch_columns)),
+    ];
+    StructArray::new(surface_patches_fields(), columns, None)
+}
+
 // Decoding.
 
 fn checked<'a>(array: &'a dyn Array, fields: Fields, message: &'static str) -> Result<&'a StructArray, SpaceMapError> {
@@ -404,6 +472,29 @@ impl<'a> Rows<'a> {
     fn u32(&self, name: &'static str, row: usize) -> Result<u32, SpaceMapError> {
         let values = self.column(name).as_primitive::<UInt32Type>();
         values.is_valid(row).then(|| values.value(row)).ok_or(SpaceMapError::Null { field: name })
+    }
+
+    fn i32(&self, name: &'static str, row: usize) -> Result<i32, SpaceMapError> {
+        let values = self.column(name).as_primitive::<Int32Type>();
+        values.is_valid(row).then(|| values.value(row)).ok_or(SpaceMapError::Null { field: name })
+    }
+
+    /// The values of the list of numbers in `name` at `row`, in threes.
+    fn triples<T: dora_node_api::arrow::datatypes::ArrowPrimitiveType>(
+        &self,
+        name: &'static str,
+        row: usize,
+    ) -> Result<Vec<[T::Native; 3]>, SpaceMapError> {
+        let list = self.column(name).as_list::<i32>();
+        if list.is_null(row) {
+            return Err(SpaceMapError::Null { field: name });
+        }
+        let values = list.value(row);
+        let values = values.as_primitive::<T>().values();
+        if values.len() % 3 != 0 {
+            return Err(SpaceMapError::NotTriples { field: name, count: values.len() });
+        }
+        Ok(values.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect())
     }
 
     fn optional_f32(&self, name: &str, row: usize) -> Option<f32> {
@@ -528,6 +619,25 @@ pub fn decode_keep_out(array: &dyn Array) -> Result<KeepOut, SpaceMapError> {
     })
 }
 
+pub fn decode_surface_patches(array: &dyn Array) -> Result<SurfacePatches, SpaceMapError> {
+    let row = Rows(checked(array, surface_patches_fields(), "surface patches")?);
+    Ok(SurfacePatches {
+        map_version: MapVersion(row.u64("map_version", 0)?),
+        built: UnixNanos(row.i64("built_unix_ns", 0)?),
+        voxel_m: row.f32("voxel_m", 0)?,
+        block_voxels: row.u32("block_voxels", 0)?,
+        patches: each(&row.list("patches", 0)?, |r, i| {
+            let block = IVec3::new(r.i32("block_x", i)?, r.i32("block_y", i)?, r.i32("block_z", i)?);
+            let positions_m: Vec<Vec3> = r.triples::<Float32Type>("positions_m", i)?.into_iter().map(Vec3::from_array).collect();
+            let triangles = r.triples::<UInt32Type>("triangles", i)?;
+            if triangles.iter().flatten().any(|&corner| corner as usize >= positions_m.len()) {
+                return Err(SpaceMapError::CornerBeyondVertices { block: block.to_array(), vertices: positions_m.len() });
+            }
+            Ok(SurfacePatch { block, positions_m, triangles })
+        })?,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs::File;
@@ -644,6 +754,29 @@ mod tests {
     fn a_topology_of_another_wire_type_is_rejected() {
         let error = decode_topology(&fixture("keep_out")).unwrap_err();
         assert!(matches!(error, SpaceMapError::WrongType { message: "topology", .. }), "{error}");
+    }
+
+    #[test]
+    fn the_surface_patches_fixture_decodes_and_encodes_back_to_itself() {
+        let golden = fixture("surface_patches");
+        let surface = decode_surface_patches(&golden).unwrap();
+        assert_eq!((surface.map_version, surface.voxel_m, surface.block_voxels), (MapVersion(412), 0.0625, 8));
+        let floor = &surface.patches[0];
+        assert_eq!(floor.block, IVec3::new(0, 1, -1));
+        assert_eq!(floor.positions_m[2], Vec3::new(0.25, 0.75, -0.125));
+        assert_eq!(floor.triangles, vec![[0, 1, 2], [0, 2, 3]]);
+        assert_eq!(surface.patches[1], SurfacePatch { block: IVec3::new(2, 0, 0), positions_m: vec![], triangles: vec![] });
+        assert_eq!(encode_surface_patches(&surface), golden);
+    }
+
+    #[test]
+    fn a_triangle_beyond_its_patch_vertices_is_rejected() {
+        let mut surface = decode_surface_patches(&fixture("surface_patches")).unwrap();
+        surface.patches[0].triangles.push([0, 1, 4]);
+        assert_eq!(
+            decode_surface_patches(&encode_surface_patches(&surface)),
+            Err(SpaceMapError::CornerBeyondVertices { block: [0, 1, -1], vertices: 4 })
+        );
     }
 
     #[test]

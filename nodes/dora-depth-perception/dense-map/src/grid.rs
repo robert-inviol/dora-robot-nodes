@@ -243,6 +243,12 @@ mod tests {
         fn bounds(&self) -> Option<Bounds> {
             Some(Bounds { min: Vec3::ZERO, max: Vec3::new(2.0, 2.0, 1.0) })
         }
+        fn blocks(&self) -> Vec<IVec3> {
+            vec![IVec3::ZERO]
+        }
+        fn take_changed_blocks(&mut self) -> rustc_hash::FxHashSet<IVec3> {
+            rustc_hash::FxHashSet::default()
+        }
     }
 
     #[test]

@@ -1,0 +1,573 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rig View</title>
+<style>
+  :root { --bg: #111418; --panel: rgba(20, 24, 30, 0.9); --text: #e6e9ee; --muted: #9aa3ad; --line: #2c333c;
+          --accent: #4fa3ff; --warn: #f0b35a; --bad: #ef6b6b; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text); font: 13px/1.4 system-ui, sans-serif; overflow: hidden; }
+  #view { position: fixed; inset: 0; }
+  #panel { position: fixed; top: 12px; left: 12px; width: 270px; max-height: calc(100% - 24px); overflow: auto;
+           background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px; box-sizing: border-box; }
+  h1 { font-size: 14px; margin: 0 0 6px; display: flex; align-items: center; gap: 8px; }
+  #link { width: 8px; height: 8px; border-radius: 50%; background: var(--bad); }
+  #link.up { background: #5bd17a; }
+  .row { display: flex; align-items: center; gap: 8px; margin: 5px 0; }
+  .row label { flex: 1; }
+  button { background: #1f2630; color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 5px 9px; cursor: pointer; font: inherit; }
+  button:hover { border-color: var(--accent); }
+  .stats { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; margin: 4px 0 8px; }
+  #notices div { color: var(--warn); font-size: 12px; margin: 4px 0; }
+  .help { color: var(--muted); font-size: 12px; margin: 8px 0 0; }
+  .help kbd { background: #222a33; border: 1px solid var(--line); border-radius: 3px; padding: 0 4px; font-size: 11px; }
+  .section { border-top: 1px solid var(--line); margin-top: 8px; padding-top: 6px; }
+  .tag { position: absolute; padding: 1px 5px; border-radius: 3px; font-size: 11px; color: #fff; white-space: nowrap;
+         pointer-events: none; transform: translate(-50%, -100%); }
+  #toggle { display: none; }
+  @media (max-width: 600px) {
+    #panel { width: calc(100% - 32px); left: 16px; max-height: 45%; }
+    #panel.collapsed > :not(#toggle) { display: none; }
+    #toggle { display: inline-block; }
+  }
+</style>
+</head>
+<body>
+<div id="view"></div>
+<div id="tags"></div>
+<div id="panel">
+  <button id="toggle">Panel</button>
+  <h1><span id="link"></span>Rig view</h1>
+  <div class="stats" id="stats">connecting</div>
+  <div id="notices"></div>
+  <div class="row"><button id="top">Top down</button><button id="behind">Behind robot</button></div>
+  <div class="row"><label for="follow">Follow robot</label><input type="checkbox" id="follow"></div>
+  <div class="section">
+    <div class="row"><label for="surface">Surface</label><input type="checkbox" id="surface" checked></div>
+    <div class="row"><label for="painted">Objects on the surface</label><input type="checkbox" id="painted" checked></div>
+    <div class="row"><label for="clouds">Keyframe clouds</label><input type="checkbox" id="clouds"></div>
+    <div class="row"><label for="robot">Robot</label><input type="checkbox" id="robot" checked></div>
+    <div class="row"><label for="path">Robot path</label><input type="checkbox" id="path" checked></div>
+    <div class="row"><label for="people">People</label><input type="checkbox" id="people" checked></div>
+    <div class="row"><label for="objects">Objects</label><input type="checkbox" id="objects" checked></div>
+    <div class="row"><label for="rooms">Rooms and places</label><input type="checkbox" id="rooms" checked></div>
+    <div class="row"><label for="labels">Labels</label><input type="checkbox" id="labels" checked></div>
+    <div class="row"><label for="size">Point size</label><input type="range" id="size" min="1" max="8" value="2"></div>
+  </div>
+  <div class="help">Drag to orbit, right-drag to pan, scroll to zoom.<br>
+    <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> move, <kbd>Q</kbd><kbd>E</kbd> down/up, hold <kbd>Shift</kbd> for faster.</div>
+</div>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+} }
+</script>
+<script type="module">
+import * as THREE from "three";
+import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+
+// The map frame is z up, so the page is too.
+THREE.Object3D.DEFAULT_UP.set(0, 0, 1);
+const CLOUD_MESSAGE = 1;
+const SURFACE_MESSAGE = 2;
+const MOVE_SPEED_M_PER_S = 1.5;
+const PATH_POINTS = 4000;
+// COCO-17: 0 nose, 1-4 eyes and ears, 5-6 shoulders, 7-8 elbows, 9-10 wrists, 11-12 hips, 13-14 knees, 15-16 ankles.
+// The fitted skeleton has no face joints.
+const BONES = [[5, 6], [5, 7], [7, 9], [6, 8], [8, 10], [5, 11], [6, 12], [11, 12], [11, 13], [13, 15], [12, 14], [14, 16]];
+const SHOULDERS = [5, 6];
+const hue = id => new THREE.Color().setHSL((id * 0.618034) % 1, 0.75, 0.58);
+const css = color => `#${color.getHexString()}`;
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(devicePixelRatio);
+document.getElementById("view").appendChild(renderer.domElement);
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x111418);
+const camera = new THREE.PerspectiveCamera(60, 1, 0.05, 200);
+camera.position.set(-4, -4, 4);
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+scene.add(new THREE.GridHelper(20, 20, 0x2c333c, 0x1c2128).rotateX(Math.PI / 2));
+scene.add(new THREE.AxesHelper(0.5));
+
+const layers = {};
+for (const name of ["surface", "clouds", "robot", "path", "people", "objects", "rooms"]) {
+  layers[name] = new THREE.Group();
+  scene.add(layers[name]);
+}
+layers.clouds.visible = false;
+scene.add(new THREE.HemisphereLight(0xffffff, 0x404850, 2.2));
+const sun = new THREE.DirectionalLight(0xffffff, 1.2);
+sun.position.set(3, 2, 6);
+scene.add(sun);
+const pointMaterial = new THREE.PointsMaterial({ size: 2, sizeAttenuation: false, vertexColors: true });
+
+// Tags are HTML labels pinned to points in the scene; each layer owns its own.
+const tagLayer = document.getElementById("tags");
+const tags = new Map();
+function setTag(key, text, color, anchor, layer) {
+  let tag = tags.get(key);
+  if (!tag) {
+    const el = document.createElement("div");
+    el.className = "tag";
+    tagLayer.appendChild(el);
+    tag = { el, anchor: new THREE.Vector3(), layer };
+    tags.set(key, tag);
+  }
+  tag.el.textContent = text;
+  tag.el.style.background = color;
+  tag.anchor.copy(anchor);
+}
+function dropTags(prefix) {
+  for (const [key, tag] of tags) if (key.startsWith(prefix)) { tag.el.remove(); tags.delete(key); }
+}
+function dispose(group) {
+  for (const child of [...group.children]) {
+    group.remove(child);
+    child.traverse(o => { o.geometry?.dispose(); if (o.material && o.material !== pointMaterial) o.material.dispose(); });
+  }
+}
+
+// Keyframe clouds, each in its own floor frame, placed by its pose. A pose can arrive before its cloud is decoded.
+const clouds = new Map();
+const poses = new Map();
+function placeCloud(frameId) {
+  const cloud = clouds.get(frameId), pose = poses.get(frameId);
+  if (!cloud) return;
+  cloud.visible = Boolean(pose && pose.placed);
+  if (pose) {
+    cloud.position.set(pose.pose.x_m, pose.pose.y_m, pose.pose.z_m);
+    cloud.rotation.set(0, 0, pose.pose.yaw_rad);
+  }
+}
+async function addCloud(compressed, generation) {
+  const stream = new Blob([compressed]).stream().pipeThrough(new DecompressionStream("gzip"));
+  const body = new DataView(await new Response(stream).arrayBuffer());
+  if (generation !== connection.generation) return;
+  const frameId = Number(body.getBigUint64(0, true));
+  const count = body.getUint32(8, true);
+  const positions = new Float32Array(count * 3);
+  for (let i = 0; i < count * 3; i++) positions[i] = body.getInt16(12 + 2 * i, true) / 1000;
+  const colors = new Uint8Array(body.buffer, body.byteOffset + 12 + 6 * count, 3 * count);
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+  geometry.setAttribute("color", new THREE.BufferAttribute(colors, 3, true));
+  const points = new THREE.Points(geometry, pointMaterial);
+  points.frustumCulled = false;
+  removeCloud(frameId);
+  clouds.set(frameId, points);
+  layers.clouds.add(points);
+  placeCloud(frameId);
+}
+function removeCloud(frameId) {
+  const cloud = clouds.get(frameId);
+  if (!cloud) return;
+  layers.clouds.remove(cloud);
+  cloud.geometry.dispose();
+  clouds.delete(frameId);
+}
+
+// The dense map's surface, one mesh per block. Faces point to the free side, so walls are see-through from behind.
+// Vertices inside an object's voxels take the object's colour.
+const surfaceMaterial = new THREE.MeshLambertMaterial({ vertexColors: true });
+const blocks = new Map();
+let blockM = 0.4;
+const SURFACE_LOW = new THREE.Color(0x8a8f96), SURFACE_HIGH = new THREE.Color(0xd9dde2);
+const objectCells = new Map();
+const objectVoxels = new Map();
+let objectVoxelM = 0.05;
+let painted = true;
+const cellKey = (x, y, z) => `${x},${y},${z}`;
+function objectAt(p) {
+  const c = [0, 1, 2].map(i => Math.floor(p[i] / objectVoxelM));
+  const own = objectCells.get(cellKey(...c));
+  if (own !== undefined) return own;
+  for (const [dx, dy, dz] of [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]]) {
+    const near = objectCells.get(cellKey(c[0] + dx, c[1] + dy, c[2] + dz));
+    if (near !== undefined) return near;
+  }
+  return undefined;
+}
+function colourBlock(mesh) {
+  const positions = mesh.geometry.getAttribute("position");
+  const colors = mesh.geometry.getAttribute("color");
+  const p = [0, 0, 0], shade = new THREE.Color();
+  for (let i = 0; i < positions.count; i++) {
+    p[0] = positions.getX(i); p[1] = positions.getY(i); p[2] = positions.getZ(i);
+    const owner = painted ? objectAt(p) : undefined;
+    if (owner !== undefined) shade.copy(hue(owner));
+    else shade.lerpColors(SURFACE_LOW, SURFACE_HIGH, Math.min(1, Math.max(0, (p[2] + 0.3) / 2.6)));
+    colors.setXYZ(i, shade.r, shade.g, shade.b);
+  }
+  colors.needsUpdate = true;
+}
+function removeBlock(key) {
+  const mesh = blocks.get(key);
+  if (!mesh) return;
+  layers.surface.remove(mesh);
+  mesh.geometry.dispose();
+  blocks.delete(key);
+}
+async function addSurface(compressed, generation) {
+  const stream = new Blob([compressed]).stream().pipeThrough(new DecompressionStream("gzip"));
+  const body = new DataView(await new Response(stream).arrayBuffer());
+  if (generation !== connection.generation) return;
+  const voxelM = body.getFloat32(0, true), blockVoxels = body.getUint32(4, true), count = body.getUint32(8, true);
+  blockM = voxelM * blockVoxels;
+  let at = 12;
+  for (let n = 0; n < count; n++) {
+    const block = [0, 1, 2].map(i => body.getInt32(at + 4 * i, true));
+    const vertices = body.getUint32(at + 12, true), triangles = body.getUint32(at + 16, true);
+    at += 20;
+    const key = block.join(",");
+    removeBlock(key);
+    const positions = new Float32Array(vertices * 3);
+    for (let i = 0; i < vertices * 3; i++) positions[i] = block[i % 3] * blockM + body.getInt16(at + 2 * i, true) / 1000;
+    at += 6 * vertices;
+    const indices = new Uint16Array(triangles * 3);
+    for (let i = 0; i < triangles * 3; i++) indices[i] = body.getUint16(at + 2 * i, true);
+    at += 6 * triangles;
+    if (triangles === 0) continue;
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+    geometry.setAttribute("color", new THREE.BufferAttribute(new Float32Array(vertices * 3), 3));
+    geometry.setIndex(new THREE.BufferAttribute(indices, 1));
+    geometry.computeVertexNormals();
+    const mesh = new THREE.Mesh(geometry, surfaceMaterial);
+    colourBlock(mesh);
+    blocks.set(key, mesh);
+    layers.surface.add(mesh);
+  }
+}
+// The blocks whose vertices can fall in or next to these object voxels.
+function blocksNear(voxels) {
+  const keys = new Set();
+  for (const [x, y, z] of voxels) {
+    for (const [dx, dy, dz] of [[0, 0, 0], [1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]]) {
+      const b = [x + dx, y + dy, z + dz].map(c => Math.floor((c + 0.5) * objectVoxelM / blockM));
+      keys.add(b.join(","));
+    }
+  }
+  return keys;
+}
+function setObjectVoxels(objectId, voxelM, voxels) {
+  const before = objectVoxels.get(objectId) || [];
+  for (const v of before) if (objectCells.get(cellKey(...v)) === objectId) objectCells.delete(cellKey(...v));
+  objectVoxelM = voxelM;
+  for (const v of voxels) objectCells.set(cellKey(...v), objectId);
+  if (voxels.length) objectVoxels.set(objectId, voxels); else objectVoxels.delete(objectId);
+  for (const key of new Set([...blocksNear(before), ...blocksNear(voxels)])) {
+    const mesh = blocks.get(key);
+    if (mesh) colourBlock(mesh);
+  }
+}
+
+// The robot: the IMU body, whose z axis is the camera's forward.
+const robot = new THREE.Group();
+robot.add(new THREE.ArrowHelper(new THREE.Vector3(0, 0, 1), new THREE.Vector3(), 0.45, 0x4fa3ff, 0.12, 0.08));
+robot.add(new THREE.Mesh(new THREE.BoxGeometry(0.12, 0.03, 0.03), new THREE.MeshBasicMaterial({ color: 0x4fa3ff })));
+robot.visible = false;
+layers.robot.add(robot);
+const pathPositions = new Float32Array(PATH_POINTS * 3);
+const pathGeometry = new THREE.BufferGeometry();
+pathGeometry.setAttribute("position", new THREE.BufferAttribute(pathPositions, 3));
+pathGeometry.setDrawRange(0, 0);
+layers.path.add(new THREE.Line(pathGeometry, new THREE.LineBasicMaterial({ color: 0x4fa3ff, transparent: true, opacity: 0.6 })));
+let pathLength = 0;
+function addPathPoint(p) {
+  if (pathLength === PATH_POINTS) { pathPositions.copyWithin(0, 3); pathLength--; }
+  pathPositions.set(p, pathLength * 3);
+  pathLength++;
+  pathGeometry.setDrawRange(0, pathLength);
+  pathGeometry.getAttribute("position").needsUpdate = true;
+  pathGeometry.computeBoundingSphere();
+}
+// Hidden while the server says why it cannot place the robot; drawn once a pose has arrived.
+let robotHidden = false, robotPlaced = false;
+const followLast = new THREE.Vector3();
+let followHas = false;
+function setRobot(update) {
+  robot.position.fromArray(update.position);
+  robot.quaternion.set(...update.orientation);
+  robotPlaced = true;
+  robot.visible = !robotHidden;
+  addPathPoint(update.position);
+}
+
+// People: rebuilt from each frame, coloured by track; lost tracks are faded.
+function setPeople(update) {
+  dispose(layers.people);
+  dropTags("person:");
+  for (const track of update.tracks) {
+    const color = hue(track.track_id);
+    const opacity = track.state === "confirmed" ? 1 : 0.35;
+    const bones = [];
+    for (const [a, b] of BONES) {
+      const p = track.joints[a], q = track.joints[b];
+      if (p && q) bones.push(...p, ...q);
+    }
+    const material = { color, transparent: opacity < 1, opacity };
+    if (bones.length) {
+      const geometry = new THREE.BufferGeometry();
+      geometry.setAttribute("position", new THREE.Float32BufferAttribute(bones, 3));
+      layers.people.add(new THREE.LineSegments(geometry, new THREE.LineBasicMaterial(material)));
+    }
+    const joints = track.joints.filter(Boolean).flat();
+    if (joints.length) {
+      const geometry = new THREE.BufferGeometry();
+      geometry.setAttribute("position", new THREE.Float32BufferAttribute(joints, 3));
+      layers.people.add(new THREE.Points(geometry, new THREE.PointsMaterial({ ...material, size: 6, sizeAttenuation: false })));
+    }
+    const above = SHOULDERS.map(j => track.joints[j]).find(Boolean) || track.torso;
+    if (above) {
+      const anchor = new THREE.Vector3(...above).add(new THREE.Vector3(0, 0, 0.35));
+      setTag(`person:${track.track_id}`, `person ${track.track_id}${track.state === "lost" ? " (lost)" : ""}`, css(color), anchor, "people");
+    }
+  }
+}
+
+// Objects: a box from the footprint and height band, with a label.
+const objects = new Map();
+function setObject(update) {
+  removeObject(update.object_id);
+  setObjectVoxels(update.object_id, update.voxel_m, update.voxels);
+  const color = hue(update.object_id);
+  const bottom = update.footprint.map(([x, y]) => new THREE.Vector3(x, y, update.bottom_m));
+  const top = update.footprint.map(([x, y]) => new THREE.Vector3(x, y, update.top_m));
+  const lines = [];
+  for (let k = 0; k < 4; k++) {
+    const n = (k + 1) % 4;
+    lines.push(bottom[k], bottom[n], top[k], top[n], bottom[k], top[k]);
+  }
+  const box = new THREE.LineSegments(new THREE.BufferGeometry().setFromPoints(lines), new THREE.LineBasicMaterial({ color }));
+  objects.set(update.object_id, box);
+  layers.objects.add(box);
+  const anchor = top.reduce((a, p) => a.add(p), new THREE.Vector3()).multiplyScalar(0.25);
+  setTag(`object:${update.object_id}`, `${update.label} ${Math.round(update.confidence * 100)}%`, css(color), anchor, "objects");
+}
+function removeObject(objectId) {
+  const box = objects.get(objectId);
+  if (box) { layers.objects.remove(box); box.geometry.dispose(); box.material.dispose(); objects.delete(objectId); }
+  dropTags(`object:${objectId}`);
+  if (objectVoxels.has(objectId)) setObjectVoxels(objectId, objectVoxelM, []);
+}
+
+// Rooms as floor outlines, places as dots on their room's floor, doorways as gaps marked across.
+function setTopology(update) {
+  dispose(layers.rooms);
+  dropTags("room:");
+  const floorOf = new Map(update.rooms.map(r => [r.room_id, r.floor_m]));
+  for (const room of update.rooms) {
+    const color = hue(room.room_id + 101);
+    const ring = room.polygon.map(([x, y]) => new THREE.Vector3(x, y, room.floor_m + 0.01));
+    layers.rooms.add(new THREE.LineLoop(new THREE.BufferGeometry().setFromPoints(ring), new THREE.LineBasicMaterial({ color })));
+    const shape = new THREE.Shape(room.polygon.map(([x, y]) => new THREE.Vector2(x, y)));
+    const fill = new THREE.Mesh(new THREE.ShapeGeometry(shape),
+      new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.08, side: THREE.DoubleSide, depthWrite: false }));
+    fill.position.z = room.floor_m + 0.005;
+    layers.rooms.add(fill);
+    const centre = ring.reduce((a, p) => a.add(p), new THREE.Vector3()).multiplyScalar(1 / ring.length);
+    setTag(`room:${room.room_id}`, `room ${room.room_id}`, css(color), centre, "rooms");
+  }
+  const placeAt = new Map(update.places.map(p => [p.place_id, new THREE.Vector3(p.position[0], p.position[1], (floorOf.get(p.room_id) ?? 0) + 0.02)]));
+  if (placeAt.size) {
+    layers.rooms.add(new THREE.Points(new THREE.BufferGeometry().setFromPoints([...placeAt.values()]),
+      new THREE.PointsMaterial({ color: 0xe6e9ee, size: 5, sizeAttenuation: false })));
+  }
+  const edges = update.edges.flatMap(([a, b]) => (placeAt.has(a) && placeAt.has(b) ? [placeAt.get(a), placeAt.get(b)] : []));
+  if (edges.length) {
+    layers.rooms.add(new THREE.LineSegments(new THREE.BufferGeometry().setFromPoints(edges),
+      new THREE.LineBasicMaterial({ color: 0x9aa3ad, transparent: true, opacity: 0.4 })));
+  }
+  for (const door of update.doorways) {
+    const marker = new THREE.Mesh(new THREE.RingGeometry(door.width_m / 2 - 0.03, door.width_m / 2, 24),
+      new THREE.MeshBasicMaterial({ color: 0xf0b35a, side: THREE.DoubleSide }));
+    marker.position.set(door.position[0], door.position[1], 0.02);
+    layers.rooms.add(marker);
+  }
+}
+
+const notices = new Map();
+function setNotice(update) {
+  if (update.text) notices.set(update.topic, update.text); else notices.delete(update.topic);
+  if (update.topic === "robot") { robotHidden = Boolean(update.text); robot.visible = robotPlaced && !robotHidden; }
+  document.getElementById("notices").replaceChildren(...[...notices].map(([topic, text]) => {
+    const row = document.createElement("div");
+    row.textContent = `${topic}: ${text}`;
+    return row;
+  }));
+}
+
+function reset() {
+  for (const key of [...blocks.keys()]) removeBlock(key);
+  objectCells.clear();
+  objectVoxels.clear();
+  for (const frameId of [...clouds.keys()]) removeCloud(frameId);
+  poses.clear();
+  for (const objectId of [...objects.keys()]) removeObject(objectId);
+  dispose(layers.people);
+  dispose(layers.rooms);
+  dropTags("");
+  pathLength = 0;
+  pathGeometry.setDrawRange(0, 0);
+  robot.visible = false;
+  robotHidden = false;
+  robotPlaced = false;
+  followHas = false;
+  notices.clear();
+  document.getElementById("notices").replaceChildren();
+}
+
+function onUpdate(update) {
+  switch (update.type) {
+    case "reset": return reset();
+    case "keyframe_pose": poses.set(update.frame_id, update); return placeCloud(update.frame_id);
+    case "keyframe_dropped": poses.delete(update.frame_id); return removeCloud(update.frame_id);
+    case "robot": return setRobot(update);
+    case "people": return setPeople(update);
+    case "object": return setObject(update);
+    case "object_gone": return removeObject(update.object_id);
+    case "topology": return setTopology(update);
+    case "notice": return setNotice(update);
+    default: console.warn("unknown update", update);
+  }
+}
+
+// One connection at a time; a new one starts from the server's snapshot, so the scene is cleared first.
+const connection = { generation: 0, bytes: 0, rateBytes: 0, socket: null, closedBecause: "" };
+// Surface messages each replace whole blocks, so they are applied in the order they came.
+let surfaceQueue = Promise.resolve();
+function connect() {
+  const generation = ++connection.generation;
+  const socket = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws`);
+  socket.binaryType = "arraybuffer";
+  connection.socket = socket;
+  socket.onopen = () => { document.getElementById("link").classList.add("up"); connection.closedBecause = ""; };
+  socket.onmessage = event => {
+    if (generation !== connection.generation) return;
+    if (typeof event.data === "string") {
+      connection.bytes += event.data.length;
+      onUpdate(JSON.parse(event.data));
+      return;
+    }
+    connection.bytes += event.data.byteLength;
+    const kind = new Uint8Array(event.data, 0, 1)[0];
+    if (kind === CLOUD_MESSAGE) addCloud(event.data.slice(1), generation).catch(e => console.error("cloud", e));
+    else if (kind === SURFACE_MESSAGE) surfaceQueue = surfaceQueue.then(() => addSurface(event.data.slice(1), generation)).catch(e => console.error("surface", e));
+    else console.warn("unknown binary message", kind);
+  };
+  socket.onclose = event => {
+    document.getElementById("link").classList.remove("up");
+    connection.closedBecause = event.reason || "disconnected";
+    if (generation === connection.generation) setTimeout(connect, 1000);
+  };
+}
+connect();
+
+let lastBytes = 0;
+setInterval(() => {
+  connection.rateBytes = connection.bytes - lastBytes;
+  lastBytes = connection.bytes;
+  const status = connection.closedBecause ? `${connection.closedBecause}; retrying` :
+    `${blocks.size} surface blocks, ${clouds.size} keyframes, ${objects.size} objects<br>` +
+    `${(connection.bytes / 1e6).toFixed(1)} MB in, ${(connection.rateBytes * 8 / 1000).toFixed(0)} kbit/s`;
+  document.getElementById("stats").innerHTML = status;
+}, 1000);
+
+function topDown() {
+  const centre = robot.visible ? robot.position.clone() : controls.target.clone();
+  camera.position.set(centre.x, centre.y - 0.01, centre.z + 12);
+  controls.target.copy(centre);
+  controls.update();
+}
+function behindRobot() {
+  if (!robot.visible) return;
+  const forward = new THREE.Vector3(0, 0, 1).applyQuaternion(robot.quaternion).setZ(0).normalize();
+  controls.target.copy(robot.position).addScaledVector(forward, 1.5);
+  camera.position.copy(robot.position).addScaledVector(forward, -2).add(new THREE.Vector3(0, 0, 1.2));
+  controls.update();
+}
+function followRobot() {
+  if (!document.getElementById("follow").checked || !robot.visible) { followHas = false; return; }
+  if (followHas) {
+    const step = robot.position.clone().sub(followLast);
+    camera.position.add(step);
+    controls.target.add(step);
+  }
+  followLast.copy(robot.position);
+  followHas = true;
+}
+
+document.getElementById("painted").onchange = e => { painted = e.target.checked; blocks.forEach(colourBlock); };
+for (const name of ["surface", "clouds", "path", "people", "objects", "rooms"]) {
+  document.getElementById(name).onchange = e => (layers[name].visible = e.target.checked);
+}
+document.getElementById("robot").onchange = e => (layers.robot.visible = e.target.checked);
+document.getElementById("labels").onchange = e => (tagLayer.style.display = e.target.checked ? "" : "none");
+document.getElementById("size").oninput = e => (pointMaterial.size = Number(e.target.value));
+document.getElementById("top").onclick = topDown;
+document.getElementById("behind").onclick = behindRobot;
+document.getElementById("toggle").onclick = () => document.getElementById("panel").classList.toggle("collapsed");
+
+const held = new Set();
+addEventListener("keydown", e => { if (e.target.tagName !== "INPUT") held.add(e.key.toLowerCase()); });
+addEventListener("keyup", e => held.delete(e.key.toLowerCase()));
+addEventListener("blur", () => held.clear());
+function moveFromKeys(dt) {
+  const forward = new THREE.Vector3();
+  camera.getWorldDirection(forward);
+  forward.z = 0;
+  if (forward.lengthSq() < 1e-6) forward.set(0, 1, 0);
+  forward.normalize();
+  const right = new THREE.Vector3().crossVectors(forward, new THREE.Vector3(0, 0, 1));
+  const step = new THREE.Vector3();
+  if (held.has("w")) step.add(forward);
+  if (held.has("s")) step.sub(forward);
+  if (held.has("d")) step.add(right);
+  if (held.has("a")) step.sub(right);
+  if (held.has("e")) step.z += 1;
+  if (held.has("q")) step.z -= 1;
+  if (step.lengthSq() === 0) return;
+  step.normalize().multiplyScalar(MOVE_SPEED_M_PER_S * dt * (held.has("shift") ? 3 : 1));
+  camera.position.add(step);
+  controls.target.add(step);
+}
+
+function placeTags() {
+  const w = renderer.domElement.clientWidth, h = renderer.domElement.clientHeight;
+  const p = new THREE.Vector3();
+  for (const tag of tags.values()) {
+    p.copy(tag.anchor).project(camera);
+    const visible = layers[tag.layer].visible && p.z > -1 && p.z < 1 && Math.abs(p.x) < 1.1 && Math.abs(p.y) < 1.1;
+    tag.el.style.display = visible ? "" : "none";
+    if (visible) {
+      tag.el.style.left = `${(p.x + 1) / 2 * w}px`;
+      tag.el.style.top = `${(1 - p.y) / 2 * h}px`;
+    }
+  }
+}
+
+function resize() {
+  renderer.setSize(innerWidth, innerHeight);
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+}
+addEventListener("resize", resize);
+resize();
+controls.target.set(0, 2, 0);
+controls.update();
+
+const clock = new THREE.Clock();
+renderer.setAnimationLoop(() => {
+  moveFromKeys(clock.getDelta());
+  followRobot();
+  controls.update();
+  renderer.render(scene, camera);
+  placeTags();
+});
+</script>
+</body>
+</html>

@@ -120,6 +120,8 @@ impl MapObject {
             map_version: stamp.map_version,
             extent: self.voxels.extent(grid),
             crop_jpeg,
+            voxel_m: grid.size_m,
+            voxels: self.voxels.sorted_cells(),
         }
     }
 }

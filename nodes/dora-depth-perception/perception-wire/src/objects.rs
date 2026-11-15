@@ -4,11 +4,11 @@
 use std::sync::Arc;
 
 use dora_node_api::arrow::array::{
-    Array, ArrayRef, AsArray, BinaryArray, Int64Array, StringArray, StructArray, UInt32Array, UInt64Array,
+    Array, ArrayRef, AsArray, BinaryArray, Int32Array, Int64Array, StringArray, StructArray, UInt32Array, UInt64Array,
 };
-use dora_node_api::arrow::datatypes::{DataType, Fields, Float32Type, Int64Type, UInt32Type, UInt64Type};
-use eyre::{bail, Result};
-use glam::{Vec2, Vec3};
+use dora_node_api::arrow::datatypes::{DataType, Fields, Float32Type, Int32Type, Int64Type, UInt32Type, UInt64Type};
+use eyre::{bail, ensure, Result};
+use glam::{IVec3, Vec2, Vec3};
 
 use super::{checked, field, floats, item, list_of, scalar};
 use crate::localization::FrameId;
@@ -85,10 +85,19 @@ pub struct ObjectUpdate {
     pub extent: ObjectExtent,
     /// The best view of the object so far, when it is new to the receiver.
     pub crop_jpeg: Option<Vec<u8>>,
+    /// The edge of the cubes the object's points are counted in.
+    pub voxel_m: f32,
+    /// Every cube holding a point of the object, sorted by x, then y, then z: cube (x, y, z) spans
+    /// `[x, x + 1) * voxel_m` along x, and likewise along y and z.
+    pub voxels: Vec<IVec3>,
 }
 
 fn map_point_fields() -> Fields {
     Fields::from(vec![field("x_m", DataType::Float32), field("y_m", DataType::Float32)])
+}
+
+fn voxel_fields() -> Fields {
+    Fields::from(vec![field("x", DataType::Int32), field("y", DataType::Int32), field("z", DataType::Int32)])
 }
 
 fn object_update_fields() -> Fields {
@@ -112,6 +121,8 @@ fn object_update_fields() -> Fields {
         field("height_m", DataType::Float32),
         field("top_m", DataType::Float32),
         field("crop_jpeg", DataType::Binary),
+        field("voxel_m", DataType::Float32),
+        field("voxels", DataType::List(item(DataType::Struct(voxel_fields())))),
     ])
 }
 
@@ -122,6 +133,27 @@ fn column<'a>(row: &'a StructArray, name: &str) -> &'a ArrayRef {
 fn footprint_column(corners: &[Vec2; 4]) -> ArrayRef {
     let columns: Vec<ArrayRef> = vec![floats(corners.iter().map(|c| c.x)), floats(corners.iter().map(|c| c.y))];
     list_of(Arc::new(StructArray::new(map_point_fields(), columns, None)), [corners.len()])
+}
+
+fn voxels_column(voxels: &[IVec3]) -> ArrayRef {
+    let axis = |get: fn(&IVec3) -> i32| -> ArrayRef { Arc::new(voxels.iter().map(get).collect::<Int32Array>()) };
+    let columns = vec![axis(|v| v.x), axis(|v| v.y), axis(|v| v.z)];
+    list_of(Arc::new(StructArray::new(voxel_fields(), columns, None)), [voxels.len()])
+}
+
+fn decode_voxels(row: &StructArray, object_id: ObjectId) -> Result<Vec<IVec3>> {
+    let cells = column(row, "voxels").as_list::<i32>().value(0);
+    let cells = cells.as_struct();
+    let axis = |name: &str| cells.column_by_name(name).expect("checked wire type").as_primitive::<Int32Type>().clone();
+    let (xs, ys, zs) = (axis("x"), axis("y"), axis("z"));
+    let voxels: Vec<IVec3> = (0..cells.len()).map(|i| IVec3::new(xs.value(i), ys.value(i), zs.value(i))).collect();
+    ensure!(!voxels.is_empty(), "object {} has no voxels", object_id.0);
+    ensure!(
+        voxels.windows(2).all(|pair| pair[0].to_array() < pair[1].to_array()),
+        "object {}'s voxels are not sorted and distinct",
+        object_id.0
+    );
+    Ok(voxels)
 }
 
 fn decode_footprint(row: &StructArray) -> Result<[Vec2; 4]> {
@@ -146,9 +178,12 @@ pub fn decode_object_update(array: &dyn Array) -> Result<ObjectUpdate> {
     }
     let crop_column = column(row, "crop_jpeg").as_binary::<i32>();
     let float = |name: &str| scalar::<Float32Type>(row, name);
+    let object_id = ObjectId(scalar::<UInt64Type>(row, "object_id"));
+    let voxel_m = float("voxel_m");
+    ensure!(voxel_m.is_finite() && voxel_m > 0.0, "object {}'s voxel_m is {voxel_m}, expected above 0", object_id.0);
     Ok(ObjectUpdate {
         kind,
-        object_id: ObjectId(scalar::<UInt64Type>(row, "object_id")),
+        object_id,
         merged_into,
         label: column(row, "label").as_string::<i32>().value(0).to_owned(),
         score: float("score"),
@@ -166,6 +201,8 @@ pub fn decode_object_update(array: &dyn Array) -> Result<ObjectUpdate> {
             top_m: float("top_m"),
         },
         crop_jpeg: crop_column.is_valid(0).then(|| crop_column.value(0).to_vec()),
+        voxel_m,
+        voxels: decode_voxels(row, object_id)?,
     })
 }
 
@@ -191,6 +228,8 @@ pub fn encode_object_update(update: &ObjectUpdate) -> StructArray {
         floats([extent.height_m]),
         floats([extent.top_m]),
         Arc::new(BinaryArray::from_opt_vec(vec![update.crop_jpeg.as_deref()])),
+        floats([update.voxel_m]),
+        voxels_column(&update.voxels),
     ];
     StructArray::new(object_update_fields(), columns, None)
 }
@@ -218,6 +257,8 @@ mod tests {
         assert_eq!(update.extent.centre_m, Vec3::new(1.875, 2.25, 0.25));
         assert_eq!(update.extent.footprint_m[1], Vec2::new(2.75, 2.0));
         assert_eq!(update.crop_jpeg, Some(vec![0xFF, 0xD8, 0xFF, 0xD9]));
+        assert_eq!(update.voxel_m, 0.25);
+        assert_eq!(update.voxels, vec![IVec3::new(4, 8, 0), IVec3::new(4, 9, 0), IVec3::new(5, 8, 0), IVec3::new(10, 9, 1)]);
         assert_eq!(encode_object_update(&update), golden);
     }
 
@@ -236,6 +277,17 @@ mod tests {
         update.merged_into = None;
         let error = decode_object_update(&encode_object_update(&update)).err().unwrap();
         assert!(error.to_string().contains("merged object update needs merged_into"), "{error}");
+    }
+
+    #[test]
+    fn voxels_out_of_order_or_none_are_rejected() {
+        let mut update = decode_object_update(&fixture("object_update_appeared")).unwrap();
+        update.voxels.swap(0, 1);
+        let error = decode_object_update(&encode_object_update(&update)).err().unwrap();
+        assert!(error.to_string().contains("not sorted and distinct"), "{error}");
+        update.voxels.clear();
+        let error = decode_object_update(&encode_object_update(&update)).err().unwrap();
+        assert!(error.to_string().contains("has no voxels"), "{error}");
     }
 
     #[test]

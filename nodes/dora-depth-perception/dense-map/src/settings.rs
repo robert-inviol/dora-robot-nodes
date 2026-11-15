@@ -76,6 +76,19 @@ impl Default for FreeSpaceSettings {
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
+pub struct SurfaceSettings {
+    /// The shortest time between two surface_patches messages.
+    pub period_s: f32,
+}
+
+impl Default for SurfaceSettings {
+    fn default() -> Self {
+        SurfaceSettings { period_s: 1.0 }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
 pub struct TopologySettings {
     /// Passages narrower than this between wider spaces are doorways.
     pub door_width_m: f32,
@@ -146,6 +159,7 @@ pub struct DenseMapSettings {
     pub tsdf: TsdfSettings,
     pub floor: FloorSettings,
     pub free_space: FreeSpaceSettings,
+    pub surface: SurfaceSettings,
     pub topology: TopologySettings,
     pub keep_out: KeepOutSettings,
     pub buffers: BufferSettings,
@@ -179,6 +193,7 @@ impl DenseMapSettings {
         check("floor.fraction_of_peak", f.fraction_of_peak, f.fraction_of_peak > 0.0 && f.fraction_of_peak <= 1.0, "expected 0 to 1")?;
         check("free_space.band_min_m", s.band_min_m, s.band_min_m >= 0.0 && s.band_min_m < s.band_max_m, "expected 0 up to the band max")?;
         check("free_space.period_s", s.period_s, s.period_s >= 0.0, "expected at least 0")?;
+        check("surface.period_s", self.surface.period_s, self.surface.period_s >= 0.0, "expected at least 0")?;
         check("topology.door_width_m", p.door_width_m, p.door_width_m > p.min_door_width_m, "expected above the min door width")?;
         check("topology.place_spacing_m", p.place_spacing_m, p.place_spacing_m > t.voxel_m, "expected above one voxel")?;
         check("topology.max_edge_length_m", p.max_edge_length_m, p.max_edge_length_m >= p.place_spacing_m, "expected at least the place spacing")?;

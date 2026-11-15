@@ -1,4 +1,4 @@
-//! Keyframes, their poses and object updates in; free space, topology and keep-out zones out.
+//! Keyframes, their poses and object updates in; free space, topology, keep-out zones and surface patches out.
 
 use std::path::Path;
 use std::time::Instant;
@@ -12,7 +12,7 @@ use glam::Vec3;
 use perception_wire::localization::{decode_keyframe_pose, decode_keyframe_poses_moved, Tracking};
 use perception_wire::navigation::UnixNanos;
 use perception_wire::objects::decode_object_update;
-use perception_wire::space_map::{encode_free_space, encode_keep_out, encode_topology};
+use perception_wire::space_map::{encode_free_space, encode_keep_out, encode_surface_patches, encode_topology};
 use perception_wire::{decode_keyframe, MessageContext};
 
 /// The environment variable naming the settings file; without it the settings are the defaults.
@@ -47,6 +47,7 @@ pub enum Output {
     FreeSpace,
     Topology,
     KeepOut,
+    SurfacePatches,
 }
 
 impl Output {
@@ -55,6 +56,7 @@ impl Output {
             Output::FreeSpace => "free_space",
             Output::Topology => "topology",
             Output::KeepOut => "keep_out",
+            Output::SurfacePatches => "surface_patches",
         }
     }
 }
@@ -129,6 +131,7 @@ impl DenseMapNode {
                     .map(|output| match output {
                         MapOutput::FreeSpace(free_space) => (Output::FreeSpace, encode_free_space(&free_space)),
                         MapOutput::Topology(topology) => (Output::Topology, encode_topology(&topology)),
+                        MapOutput::SurfacePatches(surface) => (Output::SurfacePatches, encode_surface_patches(&surface)),
                     })
                     .collect())
             }
@@ -158,5 +161,8 @@ fn log_tick(report: &TickReport) {
     }
     if let Some(time) = report.slice_time {
         tracing::debug!("free space and topology in {:.1} ms", time.as_secs_f64() * 1e3);
+    }
+    if let Some(time) = report.mesh_time {
+        tracing::debug!("surface meshed in {:.1} ms", time.as_secs_f64() * 1e3);
     }
 }

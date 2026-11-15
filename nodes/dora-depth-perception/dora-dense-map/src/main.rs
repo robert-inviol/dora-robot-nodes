@@ -1,4 +1,4 @@
-//! Keyframes, their poses and object updates in; free space, topology and keep-out zones out.
+//! Keyframes, their poses and object updates in; free space, topology, keep-out zones and surface patches out.
 
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 

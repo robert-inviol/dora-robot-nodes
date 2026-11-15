@@ -1,6 +1,7 @@
 //! The dense map as a node runs it: keyframes wait for their poses, are integrated and kept, the map is rebuilt
-//! from the kept keyframes in the background when the localizer publishes a new map version, and free space and
-//! topology are sliced from it at most once a period.
+//! from the kept keyframes in the background when the localizer publishes a new map version, free space and
+//! topology are sliced from it at most once a period, and the surface of the blocks that changed is meshed at most
+//! once a period.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -8,16 +9,18 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use perception_wire::navigation::{MapVersion, UnixNanos};
-use perception_wire::space_map::{Clearance, FreeSpace, HeightBand, KeepOut, Topology};
-use rustc_hash::FxHashMap;
+use glam::IVec3;
+use perception_wire::space_map::{Clearance, FreeSpace, HeightBand, KeepOut, SurfacePatches, Topology};
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::grid::{slice_field, squared_distance_transform, Cell, CellGrid, Slice};
 use crate::keep_out::{KeepOutZones, ObjectUpdate};
 use crate::keyframe::{DepthKeyframe, FrameId, KeyframePose, PosedDepth, Tracking};
 use crate::levels::{ceiling_points, find_floor};
 use crate::settings::DenseMapSettings;
+use crate::surface_mesh::SurfaceMesher;
 use crate::topology::{Topologist, TopologyPlan};
-use crate::tsdf::DistanceField;
+use crate::tsdf::{DistanceField, BLOCK_EDGE_VOXELS};
 
 #[derive(Debug, thiserror::Error)]
 pub enum MapperError {
@@ -46,6 +49,7 @@ pub enum Arrival {
 pub enum MapOutput {
     FreeSpace(FreeSpace),
     Topology(Topology),
+    SurfacePatches(SurfacePatches),
 }
 
 /// What a tick did besides its outputs, for the node to log.
@@ -56,6 +60,7 @@ pub struct TickReport {
     /// Set when there was something new to slice but no floor seen yet.
     pub no_floor: bool,
     pub slice_time: Option<Duration>,
+    pub mesh_time: Option<Duration>,
 }
 
 struct Kept {
@@ -86,6 +91,10 @@ pub struct DenseMapper<F: DistanceField> {
     topologist: Topologist,
     last_topology: Option<(MapVersion, TopologyPlan)>,
     keep_out: KeepOutZones,
+    mesher: SurfaceMesher,
+    /// Blocks whose surface may have changed since it was last meshed.
+    unmeshed: FxHashSet<IVec3>,
+    last_mesh: Option<Instant>,
 }
 
 impl<F: DistanceField> DenseMapper<F> {
@@ -105,6 +114,9 @@ impl<F: DistanceField> DenseMapper<F> {
             changed_since_slice: false,
             last_slice: None,
             last_topology: None,
+            mesher: SurfaceMesher::new(),
+            unmeshed: FxHashSet::default(),
+            last_mesh: None,
         }
     }
 
@@ -169,6 +181,7 @@ impl<F: DistanceField> DenseMapper<F> {
         // The localizer places keyframes in order, so any older one still waiting was skipped and never will be.
         self.awaiting_pose.retain(|waiting| waiting.frame_id > frame_id);
         self.field.integrate(&PosedDepth::new(&keyframe, &pose));
+        self.unmeshed.extend(self.field.take_changed_blocks());
         self.field_version.get_or_insert(pose.map_version);
         self.kept_index.insert(frame_id, self.kept.len());
         self.kept.push(Kept { keyframe: Arc::new(keyframe), pose });
@@ -194,25 +207,46 @@ impl<F: DistanceField> DenseMapper<F> {
         if self.rebuild_wanted && self.rebuild.is_none() {
             report.rebuild_started = Some(self.start_rebuild());
         }
+        let mut outputs = Vec::new();
+        let mesh_period = Duration::from_secs_f32(self.settings.surface.period_s);
+        let mesh_due = self.last_mesh.is_none_or(|last| now.duration_since(last) >= mesh_period);
+        if !self.unmeshed.is_empty() && mesh_due {
+            let started = Instant::now();
+            outputs.extend(self.mesh_now(now_unix).map(MapOutput::SurfacePatches));
+            self.last_mesh = Some(now);
+            report.mesh_time = Some(started.elapsed());
+        }
         let period = Duration::from_secs_f32(self.settings.free_space.period_s);
         let due = self.last_slice.is_none_or(|last| now.duration_since(last) >= period);
         if !(self.changed_since_slice && due) {
-            return Ok((Vec::new(), report));
+            return Ok((outputs, report));
         }
         let started = Instant::now();
-        let outputs = self.slice_now(now_unix);
+        let sliced = self.slice_now(now_unix);
         self.changed_since_slice = false;
-        match outputs {
-            Some(outputs) => {
+        match sliced {
+            Some(sliced) => {
                 self.last_slice = Some(now);
                 report.slice_time = Some(started.elapsed());
-                Ok((outputs, report))
+                outputs.extend(sliced);
             }
-            None => {
-                report.no_floor = true;
-                Ok((Vec::new(), report))
-            }
+            None => report.no_floor = true,
         }
+        Ok((outputs, report))
+    }
+
+    /// The surface of every block that changed since it was last meshed, or None when no block's surface differs
+    /// from the one last sent.
+    pub fn mesh_now(&mut self, now_unix: UnixNanos) -> Option<SurfacePatches> {
+        let unmeshed = std::mem::take(&mut self.unmeshed);
+        let patches = self.mesher.changed_patches(&self.field, &unmeshed);
+        (!patches.is_empty()).then(|| SurfacePatches {
+            map_version: self.field_version.expect("a field with changed blocks has keyframes"),
+            built: now_unix,
+            voxel_m: self.field.voxel_m(),
+            block_voxels: BLOCK_EDGE_VOXELS as u32,
+            patches,
+        })
     }
 
     fn start_rebuild(&mut self) -> MapVersion {
@@ -236,6 +270,9 @@ impl<F: DistanceField> DenseMapper<F> {
         for kept in &self.kept[rebuild.keyframes..] {
             field.integrate(&PosedDepth::new(&kept.keyframe, &kept.pose));
         }
+        // Every block of the old field and of the new may have a different surface now.
+        self.unmeshed.extend(self.field.blocks());
+        self.unmeshed.extend(field.take_changed_blocks());
         self.field = field;
         self.field_version = Some(rebuild.version);
         self.changed_since_slice = true;

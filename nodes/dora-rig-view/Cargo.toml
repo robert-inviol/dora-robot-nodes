@@ -1,0 +1,35 @@
+[package]
+name = "dora-rig-view"
+version = "0.1.0"
+description = "dora node serving a live 3D page of the robot's map: keyframe clouds, the robot, people, objects and rooms, sent to browsers as small updates"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+readme = "README.md"
+
+[dependencies]
+perception-wire = { path = "../dora-depth-perception/perception-wire" }
+depth-perception = { path = "../dora-depth-perception/depth-perception" }
+# The node API has to match the version of the dora CLI that runs the dataflow.
+dora-node-api = { version = "=0.3.13", default-features = false }
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "ws"] }
+bytes = "1"
+eyre = "0.6"
+flate2 = "1"
+glam = "0.29"
+jpeg-decoder = { version = "0.3", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+# The demo builds its surface with the dense map itself.
+dense-map = { path = "../dora-depth-perception/dense-map" }
+jpeg-encoder = "0.6"
+
+[profile.release]
+strip = true
+debug = "line-tables-only"

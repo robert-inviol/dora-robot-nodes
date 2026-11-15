@@ -1,5 +1,6 @@
 # The dense map on its own, fed over Zenoh: keyframes from the camera machine, keyframe poses from the localizer and
-# object updates from the object map. Free space, topology and keep-out zones go back out on rig/*.
+# object updates from the object map. Free space, topology and keep-out zones go back out on rig/*; surface patches
+# stay in this dataflow.
 # Paths are relative to this file. Build with `cargo build --release` in nodes/dora-depth-perception first.
 # ZENOH_CONNECT is the address of the machine whose Zenoh router the others publish to.
 nodes:
@@ -44,3 +45,4 @@ nodes:
       - free_space
       - topology
       - keep_out
+      - surface_patches

@@ -63,12 +63,20 @@ link: connects to the camera machine; subscribes rig/keyframe, rig/imu, rig/segm
       rig/odom_pose, rig/calibration, rig/space_question, rig/goal_status
  |- keyframe, imu, odom_pose, calibration -> localizer (dora-map-localizer)
  |     -> keyframe_pose -> dense_map, objects, spatial_agent
- |     -> keyframe_poses_moved (past keyframes an optimisation moved) -> dense_map
- |     -> map_to_odom -> spatial_agent
+ |     -> keyframe_poses_moved (past keyframes an optimisation moved) -> dense_map, rig_view
+ |     -> map_to_odom -> spatial_agent, rig_view
  |- keyframe, keyframe_pose, object_update -> dense_map -> free_space -> spatial_agent
- |- keyframe, keyframe_pose, segments -> objects (dora-object-map) -> object_update -> spatial_agent
- '- people_tracks, map_to_odom -> spatial_agent (dora-world-agent: SQLite world store, MCP tools, spatial agents)
+ |                                                       -> surface_patches (meshed blocks that changed) -> rig_view
+ |- keyframe, keyframe_pose, segments -> objects (dora-object-map) -> object_update (with its voxels)
+ |                                                                    -> spatial_agent, rig_view
+ |- people_tracks, map_to_odom -> spatial_agent (dora-world-agent: SQLite world store, MCP tools, spatial agents)
+ '- keyframe, odom_pose, people_tracks, topology, ... -> rig_view (dora-rig-view): the 3D page on port 8094
 ```
+
+dora-rig-view serves a page for people to watch the map grow: the dense map's surface with each object's voxels
+painted on it, the robot and its path, people's skeletons, rooms and places, and optionally the keyframe clouds.
+A page gets the scene once when it connects, then only changes, over one WebSocket. `cargo run --release --example
+demo -- 8094` in nodes/dora-rig-view runs it on a synthetic room fused by the real dense map, without the rig.
 
 The two have not yet run together (Next, 1).
 

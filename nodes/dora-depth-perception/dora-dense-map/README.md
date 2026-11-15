@@ -13,11 +13,12 @@ dora node around the `dense-map` crate.
 | Output | Message | When |
 |---|---|---|
 | `free_space` | `free_space` | at most once per `free_space.period_s` (1 s), when the map changed |
+| `surface_patches` | `surface_patches` | at most once per `surface.period_s` (1 s): the surface of every block whose surface changed, and an empty patch for a block whose surface is gone |
 | `topology` | `topology` | with free space, when rooms, doorways, places or edges changed |
 | `keep_out` | `keep_out` | when a zone appears, changes or goes |
 
 `DENSE_MAP_SETTINGS` names a TOML settings file (`dense-map-settings.toml` lists every setting at its default);
-without it the defaults apply. `RUST_LOG=info` logs rebuilds and missing floor; `debug` adds every integration
-and slice time.
+without it the defaults apply. `RUST_LOG=info` logs rebuilds and missing floor; `debug` adds every integration,
+slice and mesh time.
 
 `dense-map-dataflow.yml` runs the node on its own, fed over Zenoh.

@@ -1,10 +1,11 @@
-# The spatial server on the mapping machine (strixen): localizer, dense map, object map and the spatial agent,
-# fed live over Zenoh. Keyframes, their IMU, odometry, the camera's calibration and people come from the camera
-# machine's dataflow (dora-realsense/examples/pose-dataflow.yml); SAM 3 segments come from a GPU machine running the
-# perception dataflow with `segments` published to rig/segments; questions come from whichever agent asks them.
+# The spatial server on the mapping machine (strixen): localizer, dense map, object map, the spatial agent and the
+# rig view page for people to watch (http://<this machine>:8094), fed live over Zenoh. Keyframes, their IMU,
+# odometry, the camera's calibration and people come from the camera machine's dataflow
+# (dora-realsense/examples/pose-dataflow.yml); SAM 3 segments come from a GPU machine running the perception
+# dataflow with `segments` published to rig/segments; questions come from whichever agent asks them.
 # ZENOH_CONNECT is the camera machine's address.
 # Paths are relative to this file. Build with `cargo build --release` in nodes/dora-depth-perception,
-# nodes/dora-world-agent and nodes/dora-zenoh-bridge before `dora start`.
+# nodes/dora-world-agent, nodes/dora-rig-view and nodes/dora-zenoh-bridge before `dora start`.
 nodes:
   - id: link
     path: ../../dora-zenoh-bridge/target/release/dora-zenoh-bridge
@@ -80,6 +81,7 @@ nodes:
       - free_space
       - topology
       - keep_out
+      - surface_patches
 
   - id: objects
     path: ../target/release/dora-object-map
@@ -126,3 +128,34 @@ nodes:
     outputs:
       - space_answer
       - nav_goal
+
+  - id: rig_view
+    path: ../../dora-rig-view/target/release/dora-rig-view
+    env:
+      RIG_VIEW_PORT: "8094"
+      RUST_LOG: info
+    inputs:
+      # Sends the robot and the people to the page at most ten times a second.
+      tick: dora/timer/millis/100
+      keyframe:
+        source: link/keyframe
+        queue_size: 4
+      keyframe_pose: localizer/keyframe_pose
+      keyframe_poses_moved:
+        source: localizer/keyframe_poses_moved
+        queue_size: 32
+      odom_pose:
+        source: link/odom_pose
+        queue_size: 1
+      map_to_odom: localizer/map_to_odom
+      people_tracks:
+        source: link/people_tracks
+        queue_size: 1
+      # Every patch is needed: each one is the only message that says how its block looks now.
+      surface_patches:
+        source: dense_map/surface_patches
+        queue_size: 32
+      object_update:
+        source: objects/object_update
+        queue_size: 256
+      topology: dense_map/topology

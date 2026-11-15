@@ -29,6 +29,9 @@ class ObjectUpdateKind(Enum):
 
 MAP_POINT_TYPE = pa.struct([("x_m", pa.float32()), ("y_m", pa.float32())])
 
+# A cube of the object map's grid: cell (x, y, z) spans [x, x + 1) * voxel_m along x, and likewise along y and z.
+VOXEL_TYPE = pa.struct([("x", pa.int32()), ("y", pa.int32()), ("z", pa.int32())])
+
 FOOTPRINT_CORNERS = 4
 
 OBJECT_UPDATE_TYPE = pa.struct(
@@ -60,6 +63,10 @@ OBJECT_UPDATE_TYPE = pa.struct(
         ("top_m", pa.float32()),
         # The best view of the object so far; null unless it is new to the receiver.
         ("crop_jpeg", pa.binary()),
+        # The edge of the cubes the object's points are counted in.
+        ("voxel_m", pa.float32()),
+        # Every cube holding a point of the object, sorted by x, then y, then z.
+        ("voxels", pa.list_(pa.field("item", VOXEL_TYPE, nullable=False))),
     ]
 )
 
@@ -91,6 +98,8 @@ class ObjectUpdate:
     height_m: float
     top_m: float
     crop_jpeg: bytes | None
+    voxel_m: float
+    voxels: tuple[tuple[int, int, int], ...]
 
     def __post_init__(self) -> None:
         if (self.kind is ObjectUpdateKind.MERGED) != (self.merged_into is not None):
@@ -102,6 +111,12 @@ class ObjectUpdate:
             value = getattr(self, name)
             if not (math.isfinite(value) and 0.0 <= value <= 1.0):
                 raise ValueError(f"{name} is {value}, expected a value from 0 to 1")
+        if not (math.isfinite(self.voxel_m) and self.voxel_m > 0.0):
+            raise ValueError(f"voxel_m is {self.voxel_m}, expected a finite value above 0")
+        if not self.voxels:
+            raise ValueError(f"object {self.object_id} has no voxels")
+        if list(self.voxels) != sorted(set(self.voxels)):
+            raise ValueError(f"object {self.object_id}'s voxels are not sorted and distinct")
 
     def to_arrow(self) -> pa.Array:
         return one_row(
@@ -125,6 +140,8 @@ class ObjectUpdate:
                 "height_m": self.height_m,
                 "top_m": self.top_m,
                 "crop_jpeg": self.crop_jpeg,
+                "voxel_m": self.voxel_m,
+                "voxels": [{"x": x, "y": y, "z": z} for x, y, z in self.voxels],
             },
             OBJECT_UPDATE_TYPE,
         )
@@ -153,10 +170,13 @@ class ObjectUpdate:
             height_m=row["height_m"],
             top_m=row["top_m"],
             crop_jpeg=row["crop_jpeg"],
+            voxel_m=row["voxel_m"],
+            voxels=tuple((v["x"], v["y"], v["z"]) for v in row["voxels"]),
         )
 
 
 _SOFA_FOOTPRINT = (MapPoint(1.0, 2.0), MapPoint(2.75, 2.0), MapPoint(2.75, 2.5), MapPoint(1.0, 2.5))
+_SOFA_VOXELS = ((4, 8, 0), (4, 9, 0), (5, 8, 0), (10, 9, 1))
 
 # Golden examples of this module's messages, merged into fixtures.EXAMPLES.
 FIXTURE_EXAMPLES: dict[str, Any] = {
@@ -180,6 +200,8 @@ FIXTURE_EXAMPLES: dict[str, Any] = {
         height_m=0.5,
         top_m=0.5,
         crop_jpeg=bytes([0xFF, 0xD8, 0xFF, 0xD9]),
+        voxel_m=0.25,
+        voxels=_SOFA_VOXELS,
     ),
     "object_update_merged": ObjectUpdate(
         kind=ObjectUpdateKind.MERGED,
@@ -201,5 +223,7 @@ FIXTURE_EXAMPLES: dict[str, Any] = {
         height_m=0.5,
         top_m=0.5,
         crop_jpeg=None,
+        voxel_m=0.25,
+        voxels=_SOFA_VOXELS,
     ),
 }

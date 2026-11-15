@@ -46,3 +46,20 @@ def test_a_confidence_above_one_is_rejected():
 
 def test_map_version_travels_with_the_update():
     assert ObjectUpdate.from_arrow(APPEARED.to_arrow()).map_version == MapVersion(412)
+
+
+def test_an_update_keeps_its_voxels_in_order():
+    update = ObjectUpdate.from_arrow(read_fixture("object_update_appeared"))
+
+    assert update.voxel_m == 0.25
+    assert update.voxels[0] == (4, 8, 0) and update.voxels[-1] == (10, 9, 1)
+
+
+def test_an_object_without_voxels_is_rejected():
+    with pytest.raises(ValueError, match="has no voxels"):
+        _with(voxels=())
+
+
+def test_voxels_out_of_order_are_rejected():
+    with pytest.raises(ValueError, match="not sorted and distinct"):
+        _with(voxels=((5, 8, 0), (4, 8, 0)))

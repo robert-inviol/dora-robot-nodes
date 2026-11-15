@@ -5,11 +5,11 @@ import pytest
 from dora_rig_messages.fixtures import EXAMPLES, read_fixture
 from dora_rig_messages.navigation import MapVersion, ObjectId, PlaceId
 from dora_rig_messages.space_map import (
-    FREE_SPACE_TYPE, UNKNOWN_MM, Doorway, DoorwayId, FreeSpace, KeepOut, KeepOutZone, Place, Point, RoomId, Topology,
-    TopologyRoom,
+    FREE_SPACE_TYPE, UNKNOWN_MM, Doorway, DoorwayId, FreeSpace, KeepOut, KeepOutZone, Place, Point, RoomId,
+    SurfacePatch, SurfacePatches, Topology, TopologyRoom,
 )
 
-SPACE_MAP_FIXTURES = ["free_space", "topology", "keep_out", "keep_out_empty"]
+SPACE_MAP_FIXTURES = ["free_space", "topology", "keep_out", "keep_out_empty", "surface_patches"]
 SQUARE = (Point(0.0, 0.0), Point(1.0, 0.0), Point(1.0, 1.0), Point(0.0, 1.0))
 
 
@@ -72,3 +72,21 @@ def test_a_keep_out_zone_with_a_negative_margin_is_rejected():
 def test_a_room_polygon_of_two_points_is_rejected():
     with pytest.raises(ValueError, match="polygon of 2 points"):
         TopologyRoom(RoomId(1), SQUARE[:2], floor_m=0.0, ceiling_m=None)
+
+
+def test_surface_patches_read_back_with_an_emptied_block():
+    patches = SurfacePatches.from_arrow(read_fixture("surface_patches"))
+
+    assert patches == EXAMPLES["surface_patches"]
+    assert [len(p.triangles) // 3 for p in patches.patches] == [2, 0]
+
+
+def test_a_triangle_beyond_the_vertices_is_rejected():
+    with pytest.raises(ValueError, match="beyond its 1 vertices"):
+        SurfacePatch((0, 0, 0), (0.0, 0.0, 0.0), (0, 0, 1))
+
+
+def test_two_patches_of_one_block_are_rejected():
+    empty = SurfacePatch((1, 2, 3), (), ())
+    with pytest.raises(ValueError, match="more than one patch"):
+        SurfacePatches(MapVersion(1), 0, 0.05, 8, (empty, empty))
