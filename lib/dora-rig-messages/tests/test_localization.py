@@ -3,7 +3,7 @@ import pytest
 
 from dora_rig_messages.fixtures import read_fixture
 from dora_rig_messages.localization import (
-    FIXTURE_EXAMPLES, KEYFRAME_POSE_TYPE, FrameId, KeyframePose, MapToOdom, Tracking,
+    FIXTURE_EXAMPLES, KEYFRAME_POSE_TYPE, CameraNanos, FrameId, KeyframePose, MapToOdom, Tracking,
 )
 from dora_rig_messages.navigation import MapVersion
 
@@ -56,9 +56,14 @@ def test_an_unknown_tracking_state_is_rejected():
 
 def test_a_negative_sigma_is_rejected():
     with pytest.raises(ValueError, match="sigma_yaw_rad"):
-        MapToOdom(MapVersion(1), 0, 0.0, 0.0, 0.0, 0.0, 0.01, 0.01, -0.01)
+        MapToOdom(MapVersion(1), CameraNanos(10), CameraNanos(0), 0.0, 0.0, 0.0, 0.0, 0.01, 0.01, -0.01)
 
 
 def test_a_keyframe_pose_is_not_read_as_a_map_to_odom():
     with pytest.raises(ValueError, match="expected wire type"):
         MapToOdom.from_arrow(read_fixture("keyframe_pose_tracking"))
+
+
+def test_a_correction_valid_from_before_its_odom_frame_started_is_rejected():
+    with pytest.raises(ValueError, match="before its odom frame started"):
+        MapToOdom(MapVersion(1), CameraNanos(5), CameraNanos(10), 0.0, 0.0, 0.0, 0.0, 0.01, 0.01, 0.01)

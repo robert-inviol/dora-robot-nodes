@@ -1,10 +1,11 @@
 //! The rig view fed by a synthetic robot driving a circle in a 6 x 5 m room with a chair, for looking at the page
 //! without the rig. A keyframe a second is rendered from the room and fused by the dense map itself, which sends the
-//! surface patches and the topology, and each keyframe's planes and room are found as the geometry node finds them.
-//! The robot goes at 10 Hz; a person walks along the far wall, in the depth too, so later keyframes carve the clouds
-//! where they were; the chair is an object whose voxels paint the surface. After 20 s a loop closure moves every
-//! keyframe 5 cm and the dense map rebuilds. `cargo run --release --example demo -- 8094`, then open
-//! http://localhost:8094.
+//! mesh blocks and the topology, and each keyframe's planes and room are found as the plane_segmentation node finds them.
+//! The robot's odometry and the people frames go at 30 Hz, as on the rig; a person walks along the far wall, in the
+//! depth too, so later keyframes carve the clouds where they were; the chair is an object whose voxels paint the surface. After 20 s a loop closure moves every
+//! keyframe 5 cm and the dense map rebuilds. The first surface message after 10 s is lost on its way, as a full
+//! dora queue would lose it: the rig view sees the gap, asks the dense map for a snapshot, and the snapshot repairs
+//! the surface. `cargo run --release --example demo -- 8094`, then open http://localhost:8094.
 
 use std::f32::consts::{FRAC_PI_2, TAU};
 use std::future::IntoFuture;
@@ -12,18 +13,16 @@ use std::time::{Duration, Instant};
 
 use dense_map::{BlockTsdf, DenseMapSettings, DenseMapper, DepthKeyframe, KeyframePose as DenseKeyframePose, MapOutput};
 use depth_perception::{find_planes, infer_room, sample_point_cloud, CameraIntrinsics, DepthImage, FloorFrame, PlaneSettings, RangeLimits, RoomSettings};
-use dora_rig_view::scene::{Scene, SceneSettings};
-use dora_rig_view::server::{router, SharedScene};
-use dora_rig_view::view::Outgoing;
+use dora_rig_view::rig::{RigInput, RigView, RigViewSettings};
 use glam::{IVec3, Quat, Vec2, Vec3};
 use perception_wire::localization::{
-    CameraNanos, FrameId, KeyframePose, KeyframePosesMoved, MapToOdom, MovedKeyframe, Pose4, Tracking,
+    CameraNanos, FrameId, KeyframePose, PoseGraphUpdate, MapToOdom, UpdatedKeyframePose, Pose4Dof, Tracking,
 };
 use perception_wire::navigation::{MapVersion, UnixNanos};
 use perception_wire::objects::{ObjectExtent, ObjectId, ObjectUpdate, ObjectUpdateKind};
 use perception_wire::odometry::OdomPose;
 use perception_wire::people::{Keypoint, PeopleTracks, PersonTrack, PixelBox, Point, PositionFrame, TrackState};
-use perception_wire::scene_layout::decode_scene_layout;
+use perception_wire::room_layout::decode_room_layout;
 use perception_wire::{encode_scene, Keyframe, Scene as WireScene};
 
 const ROOM: Vec3 = Vec3::new(6.0, 5.0, 2.6);
@@ -36,6 +35,10 @@ const HEIGHT: usize = 240;
 const INTRINSICS: CameraIntrinsics = CameraIntrinsics { fx: 160.0, fy: 170.0, ppx: 160.0, ppy: 120.0 };
 const KEYFRAMES: u64 = 40;
 const OBJECT_VOXEL_M: f32 = 0.05;
+/// The rig's frame rate: odometry and people frames come this often.
+const FRAMES_PER_S: u64 = 30;
+/// The first surface message from this tick on is lost before the rig view sees it.
+const LOST_SURFACE_TICK: u64 = 10 * FRAMES_PER_S;
 
 /// The robot at time `t_s`: on a 1.5 m circle round the room's middle, facing along the circle.
 fn robot_at(t_s: f32) -> (Vec3, f32) {
@@ -127,13 +130,13 @@ fn render(frame_id: u64, position: Vec3, yaw: f32, t_s: f32) -> Keyframe {
         width: WIDTH,
         height: HEIGHT,
         intrinsics: INTRINSICS,
-        gravity_reaction: Vec3::new(0.0, -9.8, 0.0),
+        specific_force: Vec3::new(0.0, -9.8, 0.0),
         depth_mm: depth_mm.into(),
         color_jpeg: jpeg,
     }
 }
 
-fn person_at(t_s: f32) -> PeopleTracks {
+fn person_at(t_s: f32, frame_id: u64, captured_camera_ns: i64) -> PeopleTracks {
     let x = person_x(t_s);
     let at = |dx: f32, z: f32| Some(Point { x_m: x + dx, y_m: 4.2, z_m: z });
     let mut skeleton_3d = vec![None; 17];
@@ -145,12 +148,12 @@ fn person_at(t_s: f32) -> PeopleTracks {
         skeleton_3d[joint] = point;
     }
     PeopleTracks {
-        frame_id: 0,
-        captured_camera_ns: 0,
+        frame_id,
+        captured_camera_ns,
         width: WIDTH as u16,
         height: HEIGHT as u16,
-        position_frame: PositionFrame::Odom,
-        gravity_reaction: None,
+        position_frame: PositionFrame::Odom { odom_started: CameraNanos(0) },
+        specific_force: None,
         tracks: vec![PersonTrack {
             track_id: 7,
             state: TrackState::Confirmed,
@@ -210,7 +213,7 @@ fn chair() -> ObjectUpdate {
     }
 }
 
-fn wire_pose(frame_id: u64, pose: Pose4, map_version: u64) -> KeyframePose {
+fn wire_pose(frame_id: u64, pose: Pose4Dof, map_version: u64) -> KeyframePose {
     KeyframePose {
         frame_id: FrameId(frame_id),
         captured: UnixNanos(frame_id as i64),
@@ -222,11 +225,11 @@ fn wire_pose(frame_id: u64, pose: Pose4, map_version: u64) -> KeyframePose {
     }
 }
 
-/// The planes and room of one keyframe, found and encoded as the geometry node does, then read back as the rig
-/// view's layout input.
-fn layout_of(keyframe: &Keyframe) -> eyre::Result<perception_wire::scene_layout::SceneLayout> {
+/// The planes and room of one keyframe, found and encoded as the plane_segmentation node does, then read back as the rig
+/// view's room_layout input.
+fn layout_of(keyframe: &Keyframe) -> eyre::Result<perception_wire::room_layout::RoomLayout> {
     let depth_m = keyframe.depth_m();
-    let floor = FloorFrame::from_gravity_reaction(keyframe.gravity_reaction);
+    let floor = FloorFrame::from_specific_force(keyframe.specific_force);
     let depth = DepthImage::new(keyframe.width, keyframe.height, &depth_m);
     let cloud = sample_point_cloud(&depth, &keyframe.intrinsics, &floor, RangeLimits::D455, 2);
     let fit = find_planes(&cloud.points, &PlaneSettings::default());
@@ -241,92 +244,120 @@ fn layout_of(keyframe: &Keyframe) -> eyre::Result<perception_wire::scene_layout:
         room: &room,
         objects: &[],
     };
-    decode_scene_layout(&encode_scene(&scene))
+    decode_room_layout(&encode_scene(&scene))
 }
 
-/// Lands rebuilds, and sends what the dense map made of the keyframes so far.
-fn dense_map_tick(mapper: &mut DenseMapper<BlockTsdf>, scene: &mut Scene, now: Instant, tick: u64) -> eyre::Result<Vec<Outgoing>> {
-    let (outputs, _) = mapper.on_tick(now, UnixNanos(tick as i64))?;
-    let mut out = Vec::new();
-    for output in outputs {
-        match output {
-            MapOutput::SurfacePatches(surface) => out.extend(scene.on_surface_patches(&surface)?),
-            MapOutput::Topology(topology) => out.extend(scene.on_topology(&topology)),
-            MapOutput::FreeSpace(_) => {}
+/// The dense map and the rig view joined as a dataflow joins them: surface messages one way, snapshot requests the
+/// other.
+struct Demo {
+    mapper: DenseMapper<BlockTsdf>,
+    rig_view: RigView,
+    /// Whether the surface message to lose has been lost yet.
+    lost_one: bool,
+}
+
+impl Demo {
+    /// Gives the rig view one message, and the dense map the snapshot request it leads to.
+    fn send(&mut self, input: RigInput, tick: u64) -> eyre::Result<()> {
+        let mut input = Some(input);
+        while let Some(message) = input.take() {
+            if let Some(reason) = self.rig_view.on_input(message, Instant::now())? {
+                println!("the rig view asks for a mesh snapshot: {reason:?}");
+                input = Some(RigInput::MeshBlocks(self.mapper.mesh_snapshot(UnixNanos(tick as i64))));
+            }
         }
+        Ok(())
     }
-    Ok(out)
+
+    /// Lands rebuilds, and sends what the dense map made of the keyframes so far.
+    fn dense_map_tick(&mut self, now: Instant, tick: u64) -> eyre::Result<()> {
+        let (outputs, _) = self.mapper.on_tick(now, UnixNanos(tick as i64))?;
+        for output in outputs {
+            match output {
+                MapOutput::MeshBlocks(surface) if tick >= LOST_SURFACE_TICK && !self.lost_one => {
+                    println!("surface message {} is lost on its way to the rig view", surface.sequence.0);
+                    self.lost_one = true;
+                }
+                MapOutput::MeshBlocks(surface) => self.send(RigInput::MeshBlocks(surface), tick)?,
+                MapOutput::Topology(topology) => self.send(RigInput::Topology(topology), tick)?,
+                MapOutput::OccupancyGrid(_) => {}
+            }
+        }
+        Ok(())
+    }
 }
 
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
     let port: u16 = std::env::args().nth(1).map(|p| p.parse()).transpose()?.unwrap_or(8094);
-    let shared = SharedScene::new(Scene::new(SceneSettings::DEFAULT));
+    let (rig_view, background) = RigView::start(RigViewSettings::DEFAULT);
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await?;
-    tokio::spawn(axum::serve(listener, router(shared.clone())).into_future());
+    tokio::spawn(axum::serve(listener, rig_view.router()).into_future());
     println!("rig view demo on http://localhost:{port}");
     let settings = DenseMapSettings::default();
-    let mut mapper = DenseMapper::new(settings.clone(), BlockTsdf::new(settings.tsdf));
+    let mapper = DenseMapper::new(settings.clone(), BlockTsdf::new(settings.tsdf), UnixNanos(0));
+    let mut demo = Demo { mapper, rig_view, lost_one: false };
     let identity = MapToOdom {
         map_version: MapVersion(1),
         valid_from: CameraNanos(0),
-        correction: Pose4 { x_m: 0.0, y_m: 0.0, z_m: 0.0, yaw_rad: 0.0 },
+        odom_started: CameraNanos(0),
+        correction: Pose4Dof { x_m: 0.0, y_m: 0.0, z_m: 0.0, yaw_rad: 0.0 },
         sigma_xy_m: 0.01,
         sigma_z_m: 0.01,
         sigma_yaw_rad: 0.01,
     };
-    shared.apply(|scene| -> eyre::Result<_> {
-        scene.on_map_to_odom(&identity);
-        Ok(scene.on_object_update(&chair()))
-    })?;
-    let mut keyframes: Vec<(u64, Pose4)> = Vec::new();
+    demo.send(RigInput::MapToOdom(identity), 0)?;
+    demo.send(RigInput::ObjectUpdate(chair()), 0)?;
+    let mut keyframes: Vec<(u64, Pose4Dof)> = Vec::new();
+    let mut frames = tokio::time::interval(Duration::from_nanos(1_000_000_000 / FRAMES_PER_S));
+    frames.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     for tick in 0u64.. {
-        let t_s = tick as f32 * 0.1;
+        frames.tick().await;
+        if background.is_finished() {
+            eyre::bail!("the rig view's keyframe and surface work stopped: {:?}", background.await);
+        }
+        let t_s = tick as f32 / FRAMES_PER_S as f32;
+        let camera_ns = tick as i64 * 1_000_000_000 / FRAMES_PER_S as i64;
         let (position, yaw) = robot_at(t_s);
-        shared.apply(|scene| -> eyre::Result<_> {
-            let mut out = Vec::new();
-            if tick % 10 == 0 && (keyframes.len() as u64) < KEYFRAMES {
-                let frame_id = tick / 10 + 1;
-                let keyframe = render(frame_id, position, yaw, t_s);
-                let pose = wire_pose(frame_id, Pose4 { x_m: position.x, y_m: position.y, z_m: position.z, yaw_rad: yaw }, 1);
-                mapper.on_keyframe(DepthKeyframe::from_wire(&keyframe));
-                mapper.on_keyframe_pose(DenseKeyframePose::from(&pose));
-                out.extend(scene.on_keyframe(&keyframe)?);
-                out.extend(scene.on_scene_layout(layout_of(&keyframe)?));
-                out.extend(scene.on_keyframe_pose(&pose));
-                keyframes.push((frame_id, pose.pose));
+        if tick % FRAMES_PER_S == 0 && (keyframes.len() as u64) < KEYFRAMES {
+            let frame_id = tick / FRAMES_PER_S + 1;
+            let keyframe = render(frame_id, position, yaw, t_s);
+            let pose = wire_pose(frame_id, Pose4Dof { x_m: position.x, y_m: position.y, z_m: position.z, yaw_rad: yaw }, 1);
+            demo.mapper.on_keyframe(DepthKeyframe::from_wire(&keyframe));
+            demo.mapper.on_keyframe_pose(DenseKeyframePose::from(&pose));
+            let layout = layout_of(&keyframe)?;
+            demo.send(RigInput::Keyframe(keyframe), tick)?;
+            demo.send(RigInput::RoomLayout(layout), tick)?;
+            demo.send(RigInput::KeyframePose(pose), tick)?;
+            keyframes.push((frame_id, pose.pose));
+        }
+        if tick == 20 * FRAMES_PER_S {
+            let moved: Vec<UpdatedKeyframePose> = keyframes
+                .iter()
+                .map(|&(frame_id, pose)| UpdatedKeyframePose { frame_id: FrameId(frame_id), pose: Pose4Dof { x_m: pose.x_m + 0.05, ..pose } })
+                .collect();
+            for keyframe in &moved {
+                demo.mapper.on_keyframe_pose(DenseKeyframePose::from(&wire_pose(keyframe.frame_id.0, keyframe.pose, 2)));
             }
-            if tick == 200 {
-                let moved: Vec<MovedKeyframe> = keyframes
-                    .iter()
-                    .map(|&(frame_id, pose)| MovedKeyframe { frame_id: FrameId(frame_id), pose: Pose4 { x_m: pose.x_m + 0.05, ..pose } })
-                    .collect();
-                for keyframe in &moved {
-                    mapper.on_keyframe_pose(DenseKeyframePose::from(&wire_pose(keyframe.frame_id.0, keyframe.pose, 2)));
-                }
-                out.extend(scene.on_keyframe_poses_moved(&KeyframePosesMoved { map_version: MapVersion(2), keyframes: moved }));
-            }
-            out.extend(dense_map_tick(&mut mapper, scene, Instant::now(), tick)?);
-            scene.on_odom_pose(&OdomPose {
-                camera_ns: tick as i64 * 100_000_000,
-                odom_started_camera_ns: 0,
-                depth_frame_id: tick,
-                position_m: position,
-                // Body z is the camera's forward: a level camera facing along map +y turned by yaw.
-                orientation: Quat::from_rotation_z(yaw) * Quat::from_rotation_x(-FRAC_PI_2),
-                velocity_m_s: Vec3::ZERO,
-                position_sigma_m: Vec3::splat(0.001),
-                tilt_sigma_rad: 0.001,
-                heading_sigma_rad: 0.001,
-                corrected: true,
-                matched_points: 500,
-                weakest: None,
-            });
-            scene.on_people_tracks(&person_at(t_s));
-            out.extend(scene.on_tick());
-            Ok(out)
-        })?;
-        tokio::time::sleep(Duration::from_millis(100)).await;
+            demo.send(RigInput::PoseGraphUpdate(PoseGraphUpdate { map_version: MapVersion(2), keyframes: moved }), tick)?;
+        }
+        demo.dense_map_tick(Instant::now(), tick)?;
+        demo.send(RigInput::OdomPose(OdomPose {
+            camera_ns,
+            odom_started_camera_ns: 0,
+            depth_frame_id: tick,
+            position_m: position,
+            // Body z is the camera's forward: a level camera facing along map +y turned by yaw.
+            orientation: Quat::from_rotation_z(yaw) * Quat::from_rotation_x(-FRAC_PI_2),
+            velocity_m_s: Vec3::ZERO,
+            position_sigma_m: Vec3::splat(0.001),
+            tilt_sigma_rad: 0.001,
+            heading_sigma_rad: 0.001,
+            corrected: true,
+            matched_points: 500,
+            degenerate: None,
+        }), tick)?;
+        demo.send(RigInput::PeopleTracks(person_at(t_s, tick, camera_ns)), tick)?;
     }
     Ok(())
 }

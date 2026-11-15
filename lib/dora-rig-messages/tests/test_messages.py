@@ -125,14 +125,14 @@ def test_an_odom_pose_vector_of_the_wrong_length_is_rejected():
         OdomPose.from_arrow(pa.array([wire], type=pose.to_arrow().type))
 
 
-@pytest.mark.parametrize("lone", ["weakest_direction", "weakest_sigma_m"])
-def test_an_odom_pose_with_half_of_its_weakest_direction_is_rejected(lone):
+@pytest.mark.parametrize("lone", ["degenerate_direction", "degenerate_sigma_m"])
+def test_an_odom_pose_with_half_of_its_degenerate_direction_is_rejected(lone):
     from dora_rig_messages.odometry import ODOM_POSE_TYPE, OdomPose
 
-    half = EXAMPLES["odom_pose"].to_arrow().to_pylist()[0] | {"weakest_direction": None, "weakest_sigma_m": None}
-    half[lone] = [0.0, 1.0, 0.0] if lone == "weakest_direction" else 0.125
+    half = EXAMPLES["odom_pose"].to_arrow().to_pylist()[0] | {"degenerate_direction": None, "degenerate_sigma_m": None}
+    half[lone] = [0.0, 1.0, 0.0] if lone == "degenerate_direction" else 0.125
 
-    with pytest.raises(ValueError, match="one of weakest_direction and weakest_sigma_m without the other"):
+    with pytest.raises(ValueError, match="one of degenerate_direction and degenerate_sigma_m without the other"):
         OdomPose.from_arrow(pa.array([half], type=ODOM_POSE_TYPE))
 
 

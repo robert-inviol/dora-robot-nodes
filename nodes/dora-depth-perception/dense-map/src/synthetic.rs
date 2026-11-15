@@ -80,7 +80,7 @@ pub fn keyframe_at(house: &SyntheticRoom, frame_id: u64, position: Vec2, heading
         width: house.width,
         height: house.height,
         intrinsics: house.intrinsics,
-        gravity_reaction: frame.accel_camera,
+        specific_force: frame.accel_camera,
         depth_mm: Arc::from(depth_mm),
     };
     let pose = KeyframePose { frame_id: FrameId(frame_id), map_version, translation: camera, yaw_rad: heading_rad, tracking: Tracking::Tracking };

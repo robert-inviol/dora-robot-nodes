@@ -1,4 +1,4 @@
-"""The data the debug page draws, built from the latest keyframe, segments and scene."""
+"""The data the debug page draws, built from the latest keyframe, instance masks and scene."""
 
 import base64
 import io
@@ -6,7 +6,7 @@ import io
 import numpy as np
 from PIL import Image
 
-from dora_rig_messages.perception import NO_SEGMENT, Keyframe, Scene, Segments
+from dora_rig_messages.perception import NO_INSTANCE, Keyframe, Scene, InstanceMasks
 
 POINT_STRIDE_PX = 2
 MIN_RANGE_M, MAX_RANGE_M = 0.4, 8.0
@@ -17,9 +17,9 @@ NO_PLANE = -1
 MIN_POINTS_TO_LOCATE = 20
 
 
-def floor_axes(gravity_reaction: tuple[float, float, float]) -> np.ndarray:
+def floor_axes(specific_force: tuple[float, float, float]) -> np.ndarray:
     """Rows are (right, forward, up) in camera coordinates, with right and forward level."""
-    up = np.asarray(gravity_reaction, dtype=np.float64)
+    up = np.asarray(specific_force, dtype=np.float64)
     up /= np.linalg.norm(up)
     forward = np.array([0.0, 0.0, 1.0]) - up[2] * up
     forward /= np.linalg.norm(forward)
@@ -30,9 +30,9 @@ def _b64(array: np.ndarray) -> str:
     return base64.b64encode(np.ascontiguousarray(array).tobytes()).decode()
 
 
-def page_data(keyframe: Keyframe, segments: Segments | None, scene: Scene | None, version: str) -> dict:
-    """Segments and scene are drawn only if they belong to this keyframe."""
-    segments = segments if segments is not None and segments.frame_id == keyframe.frame_id else None
+def page_data(keyframe: Keyframe, instance_masks: InstanceMasks | None, scene: Scene | None, version: str) -> dict:
+    """InstanceMasks and scene are drawn only if they belong to this keyframe."""
+    instance_masks = instance_masks if instance_masks is not None and instance_masks.frame_id == keyframe.frame_id else None
     scene = scene if scene is not None and scene.frame_id == keyframe.frame_id else None
     k = keyframe.intrinsics
     v, u = np.mgrid[0 : keyframe.height : POINT_STRIDE_PX, 0 : keyframe.width : POINT_STRIDE_PX]
@@ -40,10 +40,10 @@ def page_data(keyframe: Keyframe, segments: Segments | None, scene: Scene | None
     valid = (z > MIN_RANGE_M) & (z < MAX_RANGE_M)
     u, v, z = u[valid], v[valid], z[valid]
     camera_points = np.stack([(u - k.ppx) * z / k.fx, (v - k.ppy) * z / k.fy, z], axis=1)
-    axes = floor_axes(keyframe.gravity_reaction)
+    axes = floor_axes(keyframe.specific_force)
     points = (camera_points @ axes.T).astype(np.float32)
     color = np.asarray(Image.open(io.BytesIO(keyframe.color_jpeg)).convert("RGB"))
-    point_segments = segments.segment_ids[v, u] if segments else np.full(len(points), NO_SEGMENT, np.int16)
+    point_instances = instance_masks.instance_ids[v, u] if instance_masks else np.full(len(points), NO_INSTANCE, np.int16)
 
     point_planes = np.full(len(points), NO_PLANE, np.int16)
     flattened = points.copy()
@@ -55,10 +55,10 @@ def page_data(keyframe: Keyframe, segments: Segments | None, scene: Scene | None
         point_planes[on] = index
         flattened[on] -= distance[on, None] * normal
 
-    boxes = {o.segment_index: o for o in scene.objects} if scene else {}
+    boxes = {o.instance_index: o for o in scene.objects} if scene else {}
     objects = []
-    for index, (label, score) in enumerate(zip(segments.labels, segments.scores) if segments else ()):
-        own = points[point_segments == index]
+    for index, (label, score) in enumerate(zip(instance_masks.labels, instance_masks.scores) if instance_masks else ()):
+        own = points[point_instances == index]
         located = len(own) >= MIN_POINTS_TO_LOCATE
         box = boxes.get(index)
         objects.append({
@@ -83,9 +83,9 @@ def page_data(keyframe: Keyframe, segments: Segments | None, scene: Scene | None
         "positions_b64": _b64(points),
         "flattened_b64": _b64(flattened),
         "colors_b64": _b64(color[v, u].astype(np.uint8)),
-        "segments_b64": _b64(point_segments.astype(np.int16)),
+        "segments_b64": _b64(point_instances.astype(np.int16)),
         "planes_b64": _b64(point_planes),
-        "no_segment": NO_SEGMENT,
+        "no_instance": NO_INSTANCE,
         "no_plane": NO_PLANE,
         "camera": {
             "forward": (axes @ np.array([0.0, 0.0, 1.0])).tolist(),

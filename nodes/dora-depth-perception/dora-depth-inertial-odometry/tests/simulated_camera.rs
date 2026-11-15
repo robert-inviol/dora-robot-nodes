@@ -2,21 +2,23 @@ use std::num::NonZeroUsize;
 use std::time::Duration;
 
 use depth_inertial_odometry::imu_pairing::ImuStream;
-use depth_inertial_odometry::simulation::{seeded, ImuErrors, ImuStreams, PinholeDepthCamera, Scene, Walk};
+use depth_inertial_odometry::simulation::{seeded, Cuboid, ImuErrors, ImuStreams, PinholeDepthCamera, Scene, Walk};
+use depth_inertial_odometry::SurfaceMap;
 use depth_inertial_odometry::tracker::{Awaited, DepthFrameId, TrackerError};
 use depth_inertial_odometry::TrackerSettings;
 use dora_depth_inertial_odometry::{CalibrationChange, CalibrationOutcome, DepthCalibration, DepthFrame, DepthOutcome, FrameOutcome, ImuOutcome, NodeSettings, OdometryNode, OdometryNodeError, StartProgress};
-use glam::Vec3;
+use glam::{DQuat, DVec3, Vec3};
 use perception_wire::camera::{decode_camera_calibration, encode_camera_calibration, CameraCalibration, RigidTransform, StreamIntrinsics};
 use perception_wire::localization::CameraNanos;
 use perception_wire::odometry::{decode_odom_pose, encode_odom_pose, OdomPose};
+use perception_wire::people::{PersonPose, PersonPoses, PixelBox};
 use perception_wire::{decode_imu, encode_imu, Imu};
 use rand::rngs::SmallRng;
 
 const FRAME_PERIOD: Duration = Duration::from_micros(32_500);
 /// The camera's clock does not start at zero.
 const CLOCK_START: Duration = Duration::from_secs(4_000);
-const REST_FOR: Duration = Duration::from_millis(500);
+const STATIONARY_FOR: Duration = Duration::from_millis(500);
 const IDENTITY: RigidTransform = RigidTransform { rotation: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0], translation_m: [0.0; 3] };
 
 fn camera_ns(simulated: Duration) -> i64 {
@@ -32,18 +34,20 @@ struct Rig {
     rng: SmallRng,
     imu_through: Option<Duration>,
     depth_mm: Vec<u16>,
+    /// Someone standing or walking in the room.
+    person: Option<Cuboid>,
 }
 
 impl Rig {
     /// A camera that rests for `still` and then drives around the room.
-    fn new(still: Duration, rest_for: Duration) -> Rig {
+    fn new(still: Duration, stationary_for: Duration) -> Rig {
         let camera = PinholeDepthCamera::d455(212, 120);
         let k = camera.intrinsics;
         let depth = StreamIntrinsics { width: k.width as u16, height: k.height as u16, fx: k.fx, fy: k.fy, ppx: k.ppx, ppy: k.ppy };
         let color = StreamIntrinsics { width: 1280, height: 720, fx: 640.0, fy: 640.0, ppx: 640.0, ppy: 360.0 };
         // The depth sensor looks along the body's x from a few centimetres off the IMU.
         let depth_to_imu = RigidTransform { rotation: PinholeDepthCamera::FACING_FORWARD, translation_m: [0.03, 0.01, -0.02] };
-        let settings = NodeSettings { tracker: TrackerSettings { rest_for, depth_stride: NonZeroUsize::MIN, ..TrackerSettings::d455() }, ..NodeSettings::d455() };
+        let settings = NodeSettings { tracker: TrackerSettings { stationary_for, depth_stride: NonZeroUsize::MIN, ..TrackerSettings::d455() }, ..NodeSettings::d455() };
         Rig {
             node: OdometryNode::new(settings),
             walk: Walk::on_a_robot(still),
@@ -52,11 +56,12 @@ impl Rig {
             rng: seeded(7),
             imu_through: None,
             depth_mm: Vec::new(),
+            person: None,
         }
     }
 
     fn standing_still() -> Rig {
-        Rig::new(Duration::from_secs(3600), REST_FOR)
+        Rig::new(Duration::from_secs(3600), STATIONARY_FOR)
     }
 
     fn time(frame: u64) -> Duration {
@@ -98,8 +103,10 @@ impl Rig {
 
     fn send_depth(&mut self, frame: u64) -> Result<DepthOutcome, OdometryNodeError> {
         let seconds = Rig::time(frame).as_secs_f64();
-        let mount = DepthCalibration::of(&self.calibration).sensor_mount().unwrap();
-        self.camera.image(&Scene::living_room(), self.walk.position(seconds), self.walk.rotation(seconds), &mount, &mut self.rng, &mut self.depth_mm);
+        let extrinsics = DepthCalibration::of(&self.calibration).sensor_extrinsics().unwrap();
+        let mut scene = Scene::living_room();
+        scene.furniture.extend(self.person);
+        self.camera.image(&scene, self.walk.position(seconds), self.walk.rotation(seconds), &extrinsics, &mut self.rng, &mut self.depth_mm);
         let (width, height) = (self.camera.intrinsics.width, self.camera.intrinsics.height);
         self.node.on_depth(DepthFrame { frame_id: DepthFrameId(frame), time: CameraNanos(camera_ns(Rig::time(frame))), width, height, depth_mm: &self.depth_mm })
     }
@@ -111,7 +118,7 @@ impl Rig {
             let ImuOutcome::Fed { start, held_frame: None } = self.send_imu(frame).unwrap() else { panic!("frame {frame}'s imu message was not fed") };
             match start {
                 StartProgress::Started => return frame,
-                StartProgress::Resting { .. } => assert_eq!(self.send_depth(frame).unwrap(), DepthOutcome::Tracked(FrameOutcome::BeforeStart)),
+                StartProgress::StaticInitialization { .. } => assert_eq!(self.send_depth(frame).unwrap(), DepthOutcome::Tracked(FrameOutcome::BeforeStart)),
                 other => panic!("{other:?} at frame {frame}"),
             }
         }
@@ -159,10 +166,10 @@ fn a_camera_that_rests_and_then_drives_gives_an_odom_pose_for_every_frame_from_t
     assert!(worst_position_m < 0.10 && worst_angle_deg < 1.0, "strayed {worst_position_m:.3} m, {worst_angle_deg:.2} deg");
 
     // The first cloud becomes the map; every later one corrects the pose.
-    assert_eq!((poses[0].corrected, poses[0].matched_points, poses[0].weakest), (false, 0, None));
+    assert_eq!((poses[0].corrected, poses[0].matched_points, poses[0].degenerate), (false, 0, None));
     for pose in &poses[1..] {
-        let weakest = pose.weakest.expect("a corrected pose has a weakest direction");
-        assert!(pose.corrected && pose.matched_points >= 50 && (weakest.direction.length() - 1.0).abs() < 1e-5 && weakest.sigma_m > 0.0, "{pose:?}");
+        let degenerate = pose.degenerate.expect("a corrected pose has a degenerate direction");
+        assert!(pose.corrected && pose.matched_points >= 50 && (degenerate.direction.length() - 1.0).abs() < 1e-5 && degenerate.sigma_m > 0.0, "{pose:?}");
         assert!(pose.position_sigma_m.min_element() > 0.0 && pose.position_sigma_m.max_element() < 0.05, "{pose:?}");
         assert!(pose.tilt_sigma_rad > 0.0 && pose.tilt_sigma_rad < 0.02 && pose.heading_sigma_rad > 0.0 && pose.heading_sigma_rad < 0.02, "{pose:?}");
     }
@@ -183,8 +190,8 @@ fn imu_messages_and_depth_frames_before_the_first_calibration_are_dropped() {
     assert!(matches!(rig.send_calibration(), Ok(CalibrationOutcome::TrackerBuilt(_))));
     // None of the dropped samples count towards the rest: it runs its whole time from the calibration on.
     let started = rig.rest_until_started(20);
-    let rested = Rig::time(started) - Rig::time(20);
-    assert!(rested > REST_FOR - FRAME_PERIOD && rested < REST_FOR + FRAME_PERIOD, "started after {rested:?}");
+    let initialized_after = Rig::time(started) - Rig::time(20);
+    assert!(initialized_after > STATIONARY_FOR - FRAME_PERIOD && initialized_after < STATIONARY_FOR + FRAME_PERIOD, "started after {initialized_after:?}");
     assert_eq!(rig.posed(started + 1).depth_frame_id, started + 1);
 }
 
@@ -214,7 +221,7 @@ fn a_calibration_equal_to_the_first_is_ignored_and_one_that_differs_is_refused()
 fn a_calibration_that_cannot_be_tracked_from_is_refused() {
     let mut rig = Rig::standing_still();
     let sheared = CameraCalibration { depth_to_imu: RigidTransform { rotation: [1.0, 0.0, 0.0, 0.5, 1.0, 0.0, 0.0, 0.0, 1.0], ..IDENTITY }, ..rig.calibration };
-    assert!(matches!(rig.send_calibration_of(&sheared), Err(OdometryNodeError::Mount(_))));
+    assert!(matches!(rig.send_calibration_of(&sheared), Err(OdometryNodeError::Extrinsics(_))));
     let unfocused = CameraCalibration { depth: StreamIntrinsics { fx: 0.0, ..rig.calibration.depth }, ..rig.calibration };
     assert!(matches!(rig.send_calibration_of(&unfocused), Err(OdometryNodeError::DepthStream(_))));
     // Neither became the calibration.
@@ -222,7 +229,7 @@ fn a_calibration_that_cannot_be_tracked_from_is_refused() {
 }
 
 #[test]
-fn a_camera_that_moves_while_it_should_rest_gets_no_pose_until_it_has_rested() {
+fn a_camera_that_moves_while_it_should_be_stationary_gets_no_pose_until_static_initialization() {
     let mut rig = Rig::standing_still();
     rig.send_calibration().unwrap();
     let (mut refusals, mut frame) = (0, 0);
@@ -237,15 +244,15 @@ fn a_camera_that_moves_while_it_should_rest_gets_no_pose_until_it_has_rested() {
         let ImuOutcome::Fed { start, held_frame: None } = rig.send_imu_message(&imu).unwrap() else { panic!("frame {frame}'s imu message was not fed") };
         match start {
             StartProgress::Started => break frame,
-            StartProgress::NotAtRest(_) => refusals += 1,
-            StartProgress::Resting { .. } => {}
+            StartProgress::NotStationary(_) => refusals += 1,
+            StartProgress::StaticInitialization { .. } => {}
             StartProgress::Tracking => panic!("tracking before the start"),
         }
         assert_eq!(rig.send_depth(frame).unwrap(), DepthOutcome::Tracked(FrameOutcome::BeforeStart));
         frame += 1;
     };
     assert_eq!(refusals, 1, "the rest the camera moved through is refused once");
-    assert!(Rig::time(started) > 2 * REST_FOR - FRAME_PERIOD, "started at {:?}", Rig::time(started));
+    assert!(Rig::time(started) > 2 * STATIONARY_FOR - FRAME_PERIOD, "started at {:?}", Rig::time(started));
     assert!(rig.posed(started + 1).position_m.length() < 0.01);
 }
 
@@ -315,4 +322,218 @@ fn a_depth_stream_that_goes_silent_while_tracking_is_refused_once_the_imu_has_ru
     assert!(matches!(refusal, OdometryNodeError::Tracker(TrackerError::Backlog { waiting_for: Awaited::DepthFrame, span }) if span > max_backlog), "{refusal}");
     let waited = Rig::time(refused_at) - Rig::time(started + 1);
     assert!(waited > max_backlog && waited < max_backlog + 2 * FRAME_PERIOD, "refused after {waited:?}");
+}
+
+#[test]
+fn a_view_people_fill_is_dead_reckoned_through_and_lost_once_the_position_uncertainty_passes_the_bound() {
+    let mut rig = Rig::standing_still();
+    rig.send_calibration().unwrap();
+    let started = rig.rest_until_started(0);
+    rig.depth_posed(started);
+    let mut at_rest = rig.posed(started + 1);
+    for frame in started + 2..started + 60 {
+        at_rest = rig.posed(frame);
+        assert!(at_rest.corrected, "frame {frame}");
+    }
+    // Someone stands right in front of the camera: the whole colour image is one person, and their box is cut out
+    // of every depth frame, which leaves nothing to correct with.
+    let filling = |frame: u64| PersonPoses {
+        frame_id: frame,
+        captured_camera_ns: camera_ns(Rig::time(frame)),
+        width: 1280,
+        height: 720,
+        people: vec![PersonPose { track_id: None, score: 0.9, bbox: PixelBox { x_px: 0.0, y_px: 0.0, w_px: 1280.0, h_px: 720.0 }, keypoints: vec![] }],
+    };
+    let blocked_from = started + 60;
+    let mut lost = None;
+    for frame in blocked_from..blocked_from + 300 {
+        rig.node.on_person_poses(&filling(frame)).unwrap();
+        rig.send_imu(frame).unwrap();
+        match rig.send_depth(frame).unwrap() {
+            DepthOutcome::Tracked(FrameOutcome::Posed(pose)) => {
+                assert!(!pose.corrected, "frame {frame} had nothing left to correct with");
+                let strayed_m = (pose.position_m - at_rest.position_m).length();
+                assert!(strayed_m < 3.0 * pose.position_sigma_m.max_element(), "the dead-reckoned pose strayed {strayed_m} m, beyond what its sigmas allow: {pose:?}");
+            }
+            DepthOutcome::Tracked(FrameOutcome::Lost { uncorrected_for, largest_position_sigma_m, last_second }) => {
+                lost = Some((frame, uncorrected_for, largest_position_sigma_m, last_second));
+                break;
+            }
+            other => panic!("frame {frame}: {other:?}"),
+        }
+    }
+    let (lost_at, uncorrected_for, largest_position_sigma_m, last_second) = lost.expect("odometry is lost with the view blocked");
+    let bound = NodeSettings::d455().lost_beyond_position_sigma_m;
+    assert!(largest_position_sigma_m > bound && largest_position_sigma_m < 1.1 * bound, "lost at a sigma of {largest_position_sigma_m} m");
+    // At rest the filter's position uncertainty takes well over a second to grow to the bound, in camera time.
+    assert!(uncorrected_for > Duration::from_millis(1200) && uncorrected_for < Duration::from_secs(3), "{uncorrected_for:?}");
+    let refused = last_second.refused.expect("the last second's clouds were refused");
+    assert_eq!((refused.frames, refused.within_gate.max, refused.needed, last_second.with_people), (last_second.frames, 0, 50, last_second.frames), "{last_second}");
+    assert!(last_second.cut_fraction.is_some_and(|cut| cut.min == 1.0), "{last_second}");
+
+    // Gone again, the camera rests and odometry starts in a new odom frame.
+    let restarted = rig.rest_until_started(lost_at + 1);
+    let pose = rig.depth_posed(restarted);
+    assert!(pose.odom_started_camera_ns > camera_ns(Rig::time(lost_at)), "a new odom frame");
+    assert!(rig.posed(restarted + 1).corrected, "tracking again");
+}
+
+/// A person-sized box standing on the floor with its middle at `at`.
+fn person_at(at: DVec3) -> Cuboid {
+    Cuboid { min: DVec3::new(at.x - 0.22, at.y - 0.15, 0.0), max: DVec3::new(at.x + 0.22, at.y + 0.15, 1.75) }
+}
+
+/// The pose model's box around a person in the colour image of a frame taken from a body pose: the box round every
+/// corner of the person in front of the camera, within the image. None when the person is out of view.
+fn colour_box(rig: &Rig, person: &Cuboid, body_position: DVec3, body_rotation: DQuat) -> Option<PixelBox> {
+    let extrinsics = DepthCalibration::of(&rig.calibration).sensor_extrinsics().unwrap();
+    // The colour camera is where the depth camera is (the rig's depth_to_color is the identity).
+    let (optical_to_world, origin) = (body_rotation * extrinsics.rotation, body_position + body_rotation * extrinsics.translation_m);
+    let color = rig.calibration.color;
+    let (mut low, mut high) = (DVec3::splat(f64::INFINITY), DVec3::splat(f64::NEG_INFINITY));
+    for corner in 0..8 {
+        let pick = |bit: usize, axis: usize| if corner & bit == 0 { person.min[axis] } else { person.max[axis] };
+        let optical = optical_to_world.conjugate() * (DVec3::new(pick(1, 0), pick(2, 1), pick(4, 2)) - origin);
+        assert!(optical.z > 0.1, "the test keeps people in front of the camera");
+        let pixel = DVec3::new(f64::from(color.fx) * optical.x / optical.z + f64::from(color.ppx), f64::from(color.fy) * optical.y / optical.z + f64::from(color.ppy), 0.0);
+        (low, high) = (low.min(pixel), high.max(pixel));
+    }
+    let (width, height) = (f64::from(color.width), f64::from(color.height));
+    let (x0, y0, x1, y1) = (low.x.clamp(0.0, width), low.y.clamp(0.0, height), high.x.clamp(0.0, width), high.y.clamp(0.0, height));
+    (x1 > x0 && y1 > y0).then_some(PixelBox { x_px: x0 as f32, y_px: y0 as f32, w_px: (x1 - x0) as f32, h_px: (y1 - y0) as f32 })
+}
+
+/// How the pose model reports a frame's people: as late as inference makes it, so the newest boxes a depth frame
+/// can be cut with come from a frame this many frames earlier.
+const POSE_LATENCY_FRAMES: u64 = 3;
+
+/// What a resting camera made of someone moving in front of it.
+struct PassedBy {
+    poses: usize,
+    corrected: usize,
+    /// The furthest the pose strayed from the pose before the person appeared, and the largest turn from it.
+    worst_position_m: f32,
+    worst_angle_deg: f32,
+    /// Frames with people cut out of them.
+    with_people: usize,
+    /// The longest run of frames whose cloud did not correct the pose, in camera time.
+    longest_uncorrected_s: f64,
+}
+
+/// Rests the camera, then has a person follow `path` (where they stand at each time since they appeared) in front
+/// of it, the pose model reporting their box late when `seen` holds. A path that starts in view has the person
+/// reported from before the start, as if they had walked into view earlier. Panics if odometry is lost.
+fn pass_by(path: impl Fn(f64) -> DVec3, for_s: f64, seen: bool) -> (Rig, PassedBy) {
+    let mut rig = Rig::standing_still();
+    rig.send_calibration().unwrap();
+    let started = rig.rest_until_started(0);
+    let appeared = started + 60;
+    let mut at_rest = rig.depth_posed(started);
+    for frame in started + 1..appeared {
+        at_rest = rig.posed(frame);
+        assert!(at_rest.corrected, "frame {frame}");
+    }
+    rig.node.take_progress();
+    let (rest_position, rest_rotation) = (rig.walk.position(0.0), rig.walk.rotation(0.0));
+    let since = |frame: u64| (frame as f64 - appeared as f64) * FRAME_PERIOD.as_secs_f64();
+    let mut passed = PassedBy { poses: 0, corrected: 0, worst_position_m: 0.0, worst_angle_deg: 0.0, with_people: 0, longest_uncorrected_s: 0.0 };
+    let mut corrected_at = appeared;
+    let last = appeared + (for_s / FRAME_PERIOD.as_secs_f64()) as u64;
+    for frame in appeared..=last {
+        rig.person = Some(person_at(path(since(frame))));
+        // The pose model reports where the person was a few frames back, along the same path: a person already in view
+        // when the window starts has been reported before it.
+        if seen {
+            let captured = frame - POSE_LATENCY_FRAMES;
+            let people = colour_box(&rig, &person_at(path(since(captured))), rest_position, rest_rotation)
+                .map(|bbox| PersonPose { track_id: Some(1), score: 0.9, bbox, keypoints: vec![] })
+                .into_iter()
+                .collect();
+            rig.node.on_person_poses(&PersonPoses { frame_id: captured, captured_camera_ns: camera_ns(Rig::time(captured)), width: 1280, height: 720, people }).unwrap();
+        }
+        rig.send_imu(frame).unwrap();
+        let pose = match rig.send_depth(frame).unwrap() {
+            DepthOutcome::Tracked(FrameOutcome::Posed(pose)) => pose,
+            other => panic!("frame {frame}, {:.2} s after the person appeared: {other:?}", since(frame)),
+        };
+        passed.poses += 1;
+        passed.corrected += usize::from(pose.corrected);
+        if pose.corrected {
+            corrected_at = frame;
+        }
+        passed.longest_uncorrected_s = passed.longest_uncorrected_s.max(since(frame) - since(corrected_at));
+        passed.worst_position_m = passed.worst_position_m.max((pose.position_m - at_rest.position_m).length());
+        passed.worst_angle_deg = passed.worst_angle_deg.max(pose.orientation.angle_between(at_rest.orientation).to_degrees());
+    }
+    passed.with_people = rig.node.take_progress().with_people;
+    (rig, passed)
+}
+
+/// Where a person `ahead_m` in front of the resting camera and `aside_m` to its left stands, in the room.
+fn in_front(rig_heading: f64, ahead_m: f64, aside_m: f64) -> DVec3 {
+    let camera = Walk::on_a_robot(Duration::from_secs(3600)).position(0.0);
+    let (ahead, aside) = (DVec3::new(rig_heading.cos(), rig_heading.sin(), 0.0), DVec3::new(-rig_heading.sin(), rig_heading.cos(), 0.0));
+    DVec3::new(camera.x, camera.y, 0.0) + ahead * ahead_m + aside * aside_m
+}
+
+/// The resting camera's heading in the room.
+const HEADING_RAD: f64 = 0.4;
+
+/// Whether the map holds a surface anywhere on the face a person showed the camera along their path. The map's world
+/// frame is the body's at the start, which for a resting camera is the room's moved to the camera and turned by its
+/// heading; the levelling is left out, which moves a point a metre away by millimetres.
+fn map_holds_the_person(rig: &Rig, path: impl Fn(f64) -> DVec3, for_s: f64) -> Vec<DVec3> {
+    let map = rig.node.surface_map().expect("odometry runs");
+    let (start, heading) = (rig.walk.position(0.0), DQuat::from_rotation_z(HEADING_RAD));
+    let mut held = Vec::new();
+    for step in 0..=(for_s * 10.0) as usize {
+        let middle = path(step as f64 / 10.0);
+        let towards_camera = (DVec3::new(start.x, start.y, 0.0) - DVec3::new(middle.x, middle.y, 0.0)).normalize();
+        for height in [0.35, 0.5, 0.65, 0.8] {
+            for across in [-0.15, 0.0, 0.15] {
+                let on_face = middle + towards_camera * 0.15 + DVec3::new(-towards_camera.y, towards_camera.x, 0.0) * across + DVec3::Z * height;
+                let in_map = heading.conjugate() * (on_face - start);
+                if map.surface_near(in_map.as_vec3()).is_some() {
+                    held.push(on_face);
+                }
+            }
+        }
+    }
+    held
+}
+
+#[test]
+fn a_person_crossing_in_front_of_a_resting_camera_is_cut_out_and_neither_drags_the_pose_nor_stays_in_the_map() {
+    // From 1.6 m to the right to 1.6 m to the left, 1.2 m in front of the camera, at a walk.
+    let crossing = |seconds: f64| in_front(HEADING_RAD, 1.2, -1.6 + 1.2 * seconds);
+    let (rig, passed) = pass_by(crossing, 2.6, true);
+    assert!(passed.with_people > 40, "the person was cut out of {} frames", passed.with_people);
+    assert!(passed.worst_position_m < 0.01 && passed.worst_angle_deg < 0.3, "strayed {:.4} m, {:.3} deg", passed.worst_position_m, passed.worst_angle_deg);
+    assert!(passed.corrected > passed.poses * 9 / 10, "{} of {} frames corrected", passed.corrected, passed.poses);
+    let held = map_holds_the_person(&rig, crossing, 2.6);
+    assert!(held.is_empty(), "the map holds the person at {held:?}");
+}
+
+#[test]
+fn a_person_walking_up_to_a_resting_camera_until_they_fill_most_of_the_view_is_dead_reckoned_through() {
+    // From 3 m away up to 0.25 m in front of the lens, nearer than the camera reads depth, a pause, and away again.
+    let approach = |seconds: f64| {
+        let ahead_m = if seconds < 2.75 { 3.0 - seconds } else if seconds < 3.25 { 0.25 } else { 0.25 + (seconds - 3.25) };
+        in_front(HEADING_RAD, ahead_m + 0.15, 0.0)
+    };
+    let (rig, passed) = pass_by(approach, 5.9, true);
+    assert!(passed.with_people > 100, "the person was cut out of {} frames", passed.with_people);
+    assert!(passed.worst_position_m < 0.01 && passed.worst_angle_deg < 0.3, "strayed {:.4} m, {:.3} deg", passed.worst_position_m, passed.worst_angle_deg);
+    // Longer than odometry could go uncorrected under a fixed half second.
+    assert!(passed.longest_uncorrected_s > 0.6, "the view was blocked for {:.2} s", passed.longest_uncorrected_s);
+    let held = map_holds_the_person(&rig, approach, 5.9);
+    assert!(held.is_empty(), "the map holds the person at {held:?}");
+}
+
+#[test]
+fn a_person_the_pose_model_misses_does_not_drag_the_pose() {
+    let crossing = |seconds: f64| in_front(HEADING_RAD, 1.2, -1.6 + 1.2 * seconds);
+    let (_, passed) = pass_by(crossing, 2.6, false);
+    assert_eq!(passed.with_people, 0);
+    assert!(passed.worst_position_m < 0.01 && passed.worst_angle_deg < 0.3, "strayed {:.4} m, {:.3} deg", passed.worst_position_m, passed.worst_angle_deg);
 }

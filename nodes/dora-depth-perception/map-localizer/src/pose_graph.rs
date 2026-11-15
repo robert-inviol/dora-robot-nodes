@@ -2,7 +2,7 @@
 //!
 //! Each edge measures where one keyframe is in another's frame. The first node is the map's origin and stays
 //! fixed. Loop closures are weighed with a Huber loss, and one still further than `max_loop_sigmas` from the
-//! optimised graph is dropped as a false match before the graph is solved again. Nodes are numbered in the order keyframes arrive and edges join a keyframe to recent ones or, for a
+//! optimized graph is dropped as a false match before the graph is solved again. Nodes are numbered in the order keyframes arrive and edges join a keyframe to recent ones or, for a
 //! loop closure, to an older one, so the normal equations have a narrow envelope apart from the rows of loop
 //! closures; they are factorised by an envelope (skyline) Cholesky in that natural order.
 
@@ -16,7 +16,7 @@ pub struct NodeIndex(pub usize);
 pub enum EdgeKind {
     /// Registration of a keyframe against the recent map around the keyframe before it.
     Odometry,
-    /// Registration of a keyframe against older keyframes it revisits, or a relocalisation.
+    /// Registration of a keyframe against older keyframes it revisits, or a relocalization.
     LoopClosure,
     /// The gyro's turn and a held position across keyframes that did not register.
     DeadReckoning,
@@ -52,7 +52,7 @@ pub struct SolverSettings {
     pub max_iterations: usize,
     /// Loop closures whose whitened error is beyond this many standard deviations are weighted down (Huber).
     pub huber_sigmas: f64,
-    /// A loop closure still this many standard deviations from the optimised graph is dropped.
+    /// A loop closure still this many standard deviations from the optimized graph is dropped.
     pub max_loop_sigmas: f64,
     pub initial_damping: f64,
     /// Iteration stops once no variable moves more than this.
@@ -66,7 +66,7 @@ impl Default for SolverSettings {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Optimisation {
+pub struct PoseGraphOptimization {
     pub iterations: usize,
     pub initial_cost: f64,
     pub final_cost: f64,
@@ -318,7 +318,7 @@ impl PoseGraph {
 
     /// Moves every node but the first to minimise the robust cost of all edges, dropping loop closures the
     /// rest of the graph contradicts one at a time, worst first.
-    pub fn optimise(&mut self, settings: &SolverSettings) -> Optimisation {
+    pub fn optimize(&mut self, settings: &SolverSettings) -> PoseGraphOptimization {
         let start: Vec<State> = self.poses.iter().map(state_of).collect();
         let initial_cost = self.cost(&start, settings);
         let mut iterations = 0;
@@ -342,7 +342,7 @@ impl PoseGraph {
                 None => {
                     let final_cost = self.cost(&states, settings);
                     self.poses = states.iter().map(pose_of).collect();
-                    return Optimisation { iterations, initial_cost, final_cost, dropped_loops };
+                    return PoseGraphOptimization { iterations, initial_cost, final_cost, dropped_loops };
                 }
             }
         }
@@ -457,7 +457,7 @@ mod tests {
             sigma: LOOP,
             kind: EdgeKind::LoopClosure,
         });
-        let result = graph.optimise(&SolverSettings::default());
+        let result = graph.optimize(&SolverSettings::default());
         let after = worst_error(graph.poses(), &truth);
         let end = worst_error(&graph.poses()[last..], &truth[last..]);
         println!("worst before {:.3} m {:.2} deg, after {:.3} m {:.2} deg in {} iterations", before.0, before.1.to_degrees(), after.0, after.1.to_degrees(), result.iterations);
@@ -476,7 +476,7 @@ mod tests {
             graph.add_node(truth[k]);
             graph.add_edge(Edge { from: NodeIndex(k - 1), to: NodeIndex(k), measured: truth[k].relative_to(&truth[k - 1]), sigma: ODOMETRY, kind: EdgeKind::Odometry });
         }
-        graph.optimise(&SolverSettings::default());
+        graph.optimize(&SolverSettings::default());
         assert!(worst_error(graph.poses(), &truth).0 < 1e-5);
     }
 
@@ -491,7 +491,7 @@ mod tests {
         // One match puts the middle of the walk two metres from where it is.
         let false_measured = pose(2.0, 0.0, 0.0, 0.0).compose(&truth[20].relative_to(&truth[0]));
         graph.add_edge(Edge { from: NodeIndex(0), to: NodeIndex(20), measured: false_measured, sigma: LOOP, kind: EdgeKind::LoopClosure });
-        let result = graph.optimise(&SolverSettings::default());
+        let result = graph.optimize(&SolverSettings::default());
         let error = worst_error(graph.poses(), &truth);
         assert_eq!(result.dropped_loops, 1, "{result:?}");
         assert!(graph.edges().iter().all(|e| e.to != NodeIndex(20) || e.kind != EdgeKind::LoopClosure), "the false closure is the one dropped");

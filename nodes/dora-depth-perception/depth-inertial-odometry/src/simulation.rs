@@ -12,7 +12,7 @@ use rand::{Rng, SeedableRng};
 use crate::depth_image::PinholeIntrinsics;
 use crate::imu_pairing::{AccelReading, GyroReading};
 use crate::odometry::ImuSample;
-use crate::thinning::SensorMount;
+use crate::downsampling::SensorExtrinsics;
 
 /// An axis-aligned box in the world.
 #[derive(Clone, Copy, Debug)]
@@ -131,7 +131,7 @@ pub struct PinholeDepthCamera {
 }
 
 impl PinholeDepthCamera {
-    /// The mount of a sensor that looks along a body whose x is forward, y left and z up, from the
+    /// The extrinsics of a sensor that looks along a body whose x is forward, y left and z up, from the
     /// body's origin: the depth-to-IMU rotation, column major.
     pub const FACING_FORWARD: [f32; 9] = [0.0, -1.0, 0.0, 0.0, 0.0, -1.0, 1.0, 0.0, 0.0];
 
@@ -148,11 +148,11 @@ impl PinholeDepthCamera {
         }
     }
 
-    /// Fills `depth_mm` with the image the camera takes from a body pose through a mount, row major,
+    /// Fills `depth_mm` with the image the camera takes from a body pose through its extrinsics, row major,
     /// with depth noise.
-    pub fn image(&self, scene: &Scene, position: DVec3, rotation: DQuat, mount: &SensorMount, rng: &mut SmallRng, depth_mm: &mut Vec<u16>) {
+    pub fn image(&self, scene: &Scene, position: DVec3, rotation: DQuat, extrinsics: &SensorExtrinsics, rng: &mut SmallRng, depth_mm: &mut Vec<u16>) {
         let k = self.intrinsics;
-        let (origin, optical_to_world) = (position + rotation * mount.translation_m, rotation * mount.rotation);
+        let (origin, optical_to_world) = (position + rotation * extrinsics.translation_m, rotation * extrinsics.rotation);
         depth_mm.clear();
         depth_mm.reserve(k.width * k.height);
         for row in 0..k.height {
@@ -327,9 +327,9 @@ mod tests {
     fn a_level_pinhole_camera_images_the_wall_ahead_at_its_distance_in_millimetres() {
         let scene = Scene { room: Cuboid { min: DVec3::new(-3.0, -2.5, 0.0), max: DVec3::new(3.0, 2.5, 2.4) }, furniture: Vec::new() };
         let camera = PinholeDepthCamera { noise_per_square_m: 0.0, ..PinholeDepthCamera::d455(212, 120) };
-        let mount = SensorMount::from_depth_to_imu(PinholeDepthCamera::FACING_FORWARD, [0.0; 3]).expect("a rotation");
+        let extrinsics = SensorExtrinsics::from_depth_to_imu(PinholeDepthCamera::FACING_FORWARD, [0.0; 3]).expect("a rotation");
         let mut depth_mm = Vec::new();
-        camera.image(&scene, DVec3::new(0.0, 0.0, 1.0), DQuat::IDENTITY, &mount, &mut seeded(1), &mut depth_mm);
+        camera.image(&scene, DVec3::new(0.0, 0.0, 1.0), DQuat::IDENTITY, &extrinsics, &mut seeded(1), &mut depth_mm);
         assert_eq!(depth_mm.len(), 212 * 120);
         // Depth is along the optical axis, so the whole wall ahead reads its distance.
         assert_eq!(depth_mm[60 * 212 + 106], 3000);

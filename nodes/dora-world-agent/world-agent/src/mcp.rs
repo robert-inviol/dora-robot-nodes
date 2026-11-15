@@ -33,7 +33,7 @@ use crate::goals::{
 use crate::identity::{AgentId, AgentRegistry, Authenticated};
 use crate::model::{AnswererId, Duty};
 use crate::world::{
-    BadEntityRef, EntityRef, FindQuery, Landmark, Point, ReadOnlySql, RoomName, SqlRejected, Stamp, ViewKind,
+    BadEntityRef, EntityRef, FindQuery, Landmark, Point, ReadOnlySql, RoomName, SqlRejected, Timestamp, ViewKind,
     ViewRequest, WorldError, WorldModel,
 };
 
@@ -91,7 +91,7 @@ impl ToolAnswer {
     }
 }
 
-fn stamped(stamp: Stamp, key: &str, body: impl Serialize) -> Value {
+fn stamped(stamp: Timestamp, key: &str, body: impl Serialize) -> Value {
     let mut object = Map::new();
     object.insert("as_of".to_owned(), Value::String(clock::iso_time(stamp.as_of)));
     object.insert("map_version".to_owned(), Value::String(stamp.map_version.to_string()));
@@ -502,7 +502,7 @@ impl<W: WorldModel, G: GoalSink> WorldTools<W, G> {
         answer(self.context.route(params).await)
     }
 
-    #[tool(description = "Where and when a people track or an object was last seen. For a person: the heading, the doorways ahead, and each of their 17 joints (nose, eyes, ears, shoulders, elbows, wrists, hips, knees, ankles) that depth placed, with its map position and height above the floor.")]
+    #[tool(description = "Where and when a people track or an object was last seen. For a person: the heading, the speed (or that it is unknown), the doorways ahead, and each of their 17 joints (nose, eyes, ears, shoulders, elbows, wrists, hips, knees, ankles) that the skeleton fit found, with its map position and height above the floor.")]
     async fn last_seen(&self, Extension(parts): Extension<http::request::Parts>, Parameters(params): Parameters<LastSeenParams>) -> Result<CallToolResult, ErrorData> {
         caller(&parts)?;
         answer(self.context.last_seen(params).await)

@@ -1,7 +1,8 @@
 # On the camera's machine, everything the spatial server needs from it: the D455 through YOLOv8 pose on the Hailo-8,
-# odometry from its depth and IMU, the people placed in 3D in the odom frame, and keyframes, published on
-# rig/people_tracks, rig/odom_pose, rig/keyframe, rig/imu and rig/calibration. Paths are relative to this file. Build
-# `cargo build --release -p dora-realsense -p dora-keyframe-picker` in dora-realsense,
+# odometry from its depth and IMU, the people placed in 3D in the odom frame, keyframes, and posed depth frames (depth
+# at its exact odometry pose, ten a second), published on rig/people_tracks, rig/odom_pose, rig/keyframe, rig/imu,
+# rig/calibration and rig/posed_depth. Paths are relative to this file. Build
+# `cargo build --release -p dora-realsense -p dora-keyframe-selector -p dora-posed-depth` in dora-realsense,
 # `cargo build --release -p dora-depth-inertial-odometry` in dora-depth-perception, and `cargo build --release` in
 # dora-people-3d and dora-zenoh-bridge; the pose node needs the Pi's hailo-all and python3-gi. Hold the camera still
 # from the start until the odometry node logs that it started.
@@ -15,7 +16,7 @@ nodes:
     inputs:
       # Carries nothing; it keeps the node's events open so the dataflow can stop it.
       tick: dora/timer/millis/500
-      # Colour only for the frames the keyframe picker names.
+      # Colour only for the frames the keyframe selector names.
       request_color: keyframes/request_color
     outputs:
       - model_input
@@ -38,6 +39,10 @@ nodes:
       # The same message every second; the first one starts the node.
       calibration:
         source: camera/calibration
+        queue_size: 1
+      # People found in the colour image, cut out of the depth before it is tracked; only the newest matters.
+      person_poses:
+        source: pose/person_poses
         queue_size: 1
     outputs:
       - odom_pose
@@ -72,7 +77,7 @@ nodes:
 
   # A keyframe at least once a second, sooner on a turn, each led by every IMU sample since the last.
   - id: keyframes
-    path: ../target/release/dora-keyframe-picker
+    path: ../target/release/dora-keyframe-selector
     inputs:
       # Every imu message is needed: each keyframe carries all the samples since the last.
       imu:
@@ -92,17 +97,46 @@ nodes:
       - imu
       - keyframe
 
-  # The people, the odometry and the keyframes to the spatial server, which connects here.
-  - id: link
+  # Every third depth frame, halved each way, at the odometry's pose of the depth camera for exactly that frame.
+  - id: posed_depth
+    path: ../target/release/dora-posed-depth
+    inputs:
+      depth:
+        source: camera/depth
+        queue_size: 4
+      # Every pose is needed: a chosen frame is sent only with the pose of its own camera time.
+      odom_pose:
+        source: odometry/odom_pose
+        queue_size: 100
+      calibration:
+        source: camera/calibration
+        queue_size: 1
+    outputs:
+      - posed_depth
+
+  # The people, the odometry, the keyframes and the posed depth frames to the spatial server, which connects here.
+  - id: bridge
     path: ../../dora-zenoh-bridge/target/release/dora-zenoh-bridge
     env:
       ZENOH_LISTEN: tcp/0.0.0.0:7447
-      ZENOH_PUBLISH: people_tracks=rig/people_tracks,odom_pose=rig/odom_pose,keyframe=rig/keyframe,imu=rig/imu,calibration=rig/calibration
+      ZENOH_PUBLISH: people_tracks=rig/people_tracks,odom_pose=rig/odom_pose,keyframe=rig/keyframe,imu=rig/imu,calibration=rig/calibration,posed_depth=rig/posed_depth
+      # A late posed depth frame or people frame is worth nothing: a newer one replaces one still waiting to go out,
+      # and the replaced ones are counted in the log. Every other key waits for the Zenoh connection.
+      ZENOH_LATEST_ONLY: rig/posed_depth,rig/people_tracks
     inputs:
       people_tracks: people/people_tracks
-      odom_pose: odometry/odom_pose
-      keyframe: keyframes/keyframe
+      # Every pose is needed by the localizer.
+      odom_pose:
+        source: odometry/odom_pose
+        queue_size: 100
+      keyframe:
+        source: keyframes/keyframe
+        queue_size: 8
       calibration: camera/calibration
       imu:
         source: keyframes/imu
         queue_size: 100
+      # Only the newest matters.
+      posed_depth:
+        source: posed_depth/posed_depth
+        queue_size: 2

@@ -489,7 +489,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "dora-keyframe-picker"
+name = "dora-keyframe-selector"
 version = "0.1.0"
 dependencies = [
  "depth-perception",
@@ -499,6 +499,7 @@ dependencies = [
  "jpeg-encoder",
  "perception-wire",
  "rgbd-keyframes",
+ "shared-memory-outputs",
 ]
 
 [[package]]
@@ -550,6 +551,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "dora-posed-depth"
+version = "0.1.0"
+dependencies = [
+ "dora-node-api",
+ "eyre",
+ "glam",
+ "perception-wire",
+ "shared-memory-outputs",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "dora-realsense"
 version = "0.1.0"
 dependencies = [
@@ -560,6 +573,7 @@ dependencies = [
  "realsense-rust",
  "rgbd-frames",
  "rgbd-keyframes",
+ "shared-memory-outputs",
 ]
 
 [[package]]
@@ -1591,6 +1605,14 @@ dependencies = [
  "ryu",
  "serde",
  "unsafe-libyaml",
+]
+
+[[package]]
+name = "shared-memory-outputs"
+version = "0.1.0"
+dependencies = [
+ "dora-node-api",
+ "eyre",
 ]
 
 [[package]]

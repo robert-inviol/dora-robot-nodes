@@ -3,14 +3,15 @@
 //! For each registered keyframe, the odometry pose at the keyframe's camera time is interpolated from the
 //! odometry history, and the correction is the keyframe's map pose composed with that odometry pose's
 //! inverse. The estimate averages the corrections of the latest keyframes, each recomputed from the keyframe's
-//! current map pose, so an optimisation of the map moves it too; their spread gives the standard deviations.
+//! current map pose, so an optimization of the map moves it too; their spread gives the standard deviations.
 //! Odometry poses describe the same body as keyframe poses: the camera's gravity-aligned floor frame.
-//! `CameraMount` turns the odometry's IMU body pose into that floor frame.
+//! `CameraExtrinsics`, the colour camera's extrinsics on the IMU, turns the odometry's IMU body pose into that floor frame.
 
 use std::collections::VecDeque;
 
-use glam::{Quat, Vec3};
-use perception_wire::localization::{CameraNanos, FrameId, MapToOdom, Pose4};
+use glam::{Mat3, Quat, Vec3};
+use perception_wire::camera::{CameraCalibration, RigidTransform};
+use perception_wire::localization::{CameraNanos, FrameId, MapToOdom, Pose4Dof};
 use perception_wire::navigation::MapVersion;
 use room_map::pose::wrap_angle;
 use room_map::Pose;
@@ -18,18 +19,52 @@ use room_map::Pose;
 /// The shortest level part of the camera's forward direction that still gives its floor frame a heading.
 const MIN_LEVEL_FORWARD: f32 = 0.1;
 
-/// Where the colour camera sits on the IMU body, whose axes are the camera's (x right, y down, z forward).
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct CameraMount {
-    /// The camera's optical centre in IMU coordinates.
-    pub camera_in_imu_m: Vec3,
+/// A calibration transform's rotation is a rotation when it is orthonormal within this, entry by entry.
+const ROTATION_TOLERANCE: f32 = 1e-3;
+
+#[derive(Clone, Debug, PartialEq, thiserror::Error)]
+pub enum ExtrinsicsError {
+    #[error("the calibration's {transform} rotation {rotation:?} (column major) is not a rotation")]
+    NotARotation { transform: &'static str, rotation: [f32; 9] },
 }
 
-impl CameraMount {
+/// The colour camera's extrinsics on the IMU body: where it sits and how its axes (x right, y down, z forward)
+/// turn into the IMU's.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CameraExtrinsics {
+    /// The camera's optical centre in IMU coordinates.
+    pub camera_in_imu_m: Vec3,
+    /// Takes a direction in camera axes into IMU axes.
+    pub camera_to_imu: Quat,
+}
+
+fn rotation_of(transform: &RigidTransform, name: &'static str) -> Result<Mat3, ExtrinsicsError> {
+    let rotation = Mat3::from_cols_array(&transform.rotation);
+    let orthonormal = (rotation.transpose() * rotation).abs_diff_eq(Mat3::IDENTITY, ROTATION_TOLERANCE);
+    if !orthonormal || rotation.determinant() <= 0.0 {
+        return Err(ExtrinsicsError::NotARotation { transform: name, rotation: transform.rotation });
+    }
+    Ok(rotation)
+}
+
+impl CameraExtrinsics {
+    /// The colour camera's extrinsics from a calibration: its `depth_to_imu` after the inverse of `depth_to_color`.
+    pub fn from_calibration(calibration: &CameraCalibration) -> Result<CameraExtrinsics, ExtrinsicsError> {
+        let depth_to_imu = rotation_of(&calibration.depth_to_imu, "depth_to_imu")?;
+        let depth_to_color = rotation_of(&calibration.depth_to_color, "depth_to_color")?;
+        let camera_in_imu_m = calibration.depth_to_imu.apply(calibration.depth_to_color.inverse().apply(Vec3::ZERO));
+        Ok(CameraExtrinsics { camera_in_imu_m, camera_to_imu: Quat::from_mat3(&(depth_to_imu * depth_to_color.transpose())).normalize() })
+    }
+
+    /// The angle between two mounts' camera axes.
+    pub fn turn_from(&self, other: &CameraExtrinsics) -> f32 {
+        self.camera_to_imu.angle_between(other.camera_to_imu)
+    }
+
     /// The camera's floor frame in the odometry frame (z up), from the IMU body's pose there: at the camera, facing
     /// its forward direction made level. `None` when the camera faces too near straight up or down to have a heading.
     pub fn floor_pose(&self, imu_position: Vec3, imu_orientation: Quat) -> Option<Pose> {
-        let level_forward = (imu_orientation * Vec3::Z).truncate();
+        let level_forward = (imu_orientation * self.camera_to_imu * Vec3::Z).truncate();
         if level_forward.length() < MIN_LEVEL_FORWARD {
             return None;
         }
@@ -148,8 +183,8 @@ impl MapToOdomEstimator {
     }
 
     /// The correction from the recorded keyframes that are still in the map, with `map_pose` giving each one's
-    /// current map pose; `None` before any.
-    pub fn estimate(&self, map_version: MapVersion, map_pose: impl Fn(FrameId) -> Option<Pose>) -> Option<MapToOdom> {
+    /// current map pose; `None` before any. `odom_started` names the odom frame the recorded odometry is in.
+    pub fn estimate(&self, map_version: MapVersion, odom_started: CameraNanos, map_pose: impl Fn(FrameId) -> Option<Pose>) -> Option<MapToOdom> {
         let corrections: Vec<(CameraNanos, Pose)> =
             self.samples.iter().filter_map(|s| map_pose(s.frame).map(|map| (s.time, map.compose(&s.odom.inverse())))).collect();
         let valid_from = corrections.iter().map(|c| c.0).max()?;
@@ -164,7 +199,8 @@ impl MapToOdomEstimator {
         Some(MapToOdom {
             map_version,
             valid_from,
-            correction: Pose4 { x_m: mean_translation.x, y_m: mean_translation.y, z_m: mean_translation.z, yaw_rad: mean_yaw },
+            odom_started,
+            correction: Pose4Dof { x_m: mean_translation.x, y_m: mean_translation.y, z_m: mean_translation.z, yaw_rad: mean_yaw },
             sigma_xy_m: sigma_xy.max(self.settings.min_sigma_xy_m),
             sigma_z_m: sigma_z.max(self.settings.min_sigma_z_m),
             sigma_yaw_rad: sigma_yaw.max(self.settings.min_sigma_yaw_rad),
@@ -184,16 +220,46 @@ mod tests {
 
     #[test]
     fn the_floor_pose_faces_the_cameras_level_forward_and_sits_at_the_camera() {
-        let mount = CameraMount { camera_in_imu_m: Vec3::new(0.03, 0.0, 0.0) };
+        let extrinsics = CameraExtrinsics { camera_in_imu_m: Vec3::new(0.03, 0.0, 0.0), camera_to_imu: Quat::IDENTITY };
         // The camera's optical axes (x right, y down, z forward) turned to face the odometry frame's +x, level.
         let facing_x = Quat::from_mat3(&glam::Mat3::from_cols(Vec3::new(0.0, -1.0, 0.0), Vec3::new(0.0, 0.0, -1.0), Vec3::X));
-        let floor = mount.floor_pose(Vec3::new(1.0, 2.0, 0.5), facing_x).unwrap();
+        let floor = extrinsics.floor_pose(Vec3::new(1.0, 2.0, 0.5), facing_x).unwrap();
         assert!(wrap_angle(floor.yaw_rad + std::f32::consts::FRAC_PI_2).abs() < 1e-5, "floor y (forward) is odometry +x: {}", floor.yaw_rad);
         assert!((floor.translation - Vec3::new(1.0, 1.97, 0.5)).length() < 1e-5, "{:?}", floor.translation);
         let tilted_down = facing_x * Quat::from_rotation_x(-0.5);
-        assert!(wrap_angle(mount.floor_pose(Vec3::ZERO, tilted_down).unwrap().yaw_rad - floor.yaw_rad).abs() < 1e-5, "tilt leaves the heading");
+        assert!(wrap_angle(extrinsics.floor_pose(Vec3::ZERO, tilted_down).unwrap().yaw_rad - floor.yaw_rad).abs() < 1e-5, "tilt leaves the heading");
         let straight_down = facing_x * Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2);
-        assert_eq!(mount.floor_pose(Vec3::ZERO, straight_down), None);
+        assert_eq!(extrinsics.floor_pose(Vec3::ZERO, straight_down), None);
+    }
+
+    fn calibration(depth_to_color: RigidTransform, depth_to_imu: RigidTransform) -> CameraCalibration {
+        let intrinsics = perception_wire::camera::StreamIntrinsics { width: 4, height: 3, fx: 4.0, fy: 4.0, ppx: 1.5, ppy: 1.0 };
+        CameraCalibration { color: intrinsics, depth: intrinsics, depth_to_color, depth_to_imu }
+    }
+
+    #[test]
+    fn the_mount_applies_the_cameras_rotation_on_the_imu() {
+        // The IMU's axes are the camera's turned 90 degrees about the camera's optical axis.
+        let camera_to_imu = Mat3::from_rotation_z(std::f32::consts::FRAC_PI_2);
+        let depth_to_color = RigidTransform { rotation: Mat3::IDENTITY.to_cols_array(), translation_m: [-0.01, 0.0, 0.0] };
+        let depth_to_imu = RigidTransform { rotation: camera_to_imu.to_cols_array(), translation_m: [0.0, 0.02, 0.0] };
+        let extrinsics = CameraExtrinsics::from_calibration(&calibration(depth_to_color, depth_to_imu)).unwrap();
+        assert!((extrinsics.camera_in_imu_m - depth_to_imu.apply(Vec3::new(0.01, 0.0, 0.0))).length() < 1e-6, "{:?}", extrinsics.camera_in_imu_m);
+        // An IMU body turned so that the camera faces the odometry frame's +y, level.
+        let camera_facing_y = Quat::from_mat3(&Mat3::from_cols(Vec3::X, Vec3::NEG_Z, Vec3::Y));
+        let imu_orientation = camera_facing_y * extrinsics.camera_to_imu.inverse();
+        let floor = extrinsics.floor_pose(Vec3::ZERO, imu_orientation).unwrap();
+        assert!(wrap_angle(floor.yaw_rad).abs() < 1e-5, "the camera faces +y, yaw zero: {}", floor.yaw_rad);
+    }
+
+    #[test]
+    fn a_calibration_whose_rotation_is_not_a_rotation_is_refused() {
+        let sheared = RigidTransform { rotation: [1.0, 0.0, 0.0, 0.5, 1.0, 0.0, 0.0, 0.0, 1.0], translation_m: [0.0; 3] };
+        let identity = RigidTransform { rotation: Mat3::IDENTITY.to_cols_array(), translation_m: [0.0; 3] };
+        let refused = CameraExtrinsics::from_calibration(&calibration(identity, sheared)).unwrap_err();
+        assert_eq!(refused, ExtrinsicsError::NotARotation { transform: "depth_to_imu", rotation: sheared.rotation });
+        let mirrored = RigidTransform { rotation: [-1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0], translation_m: [0.0; 3] };
+        assert!(CameraExtrinsics::from_calibration(&calibration(mirrored, identity)).is_err(), "a reflection is not a rotation");
     }
 
     #[test]
@@ -221,10 +287,10 @@ mod tests {
             map_poses.insert(FrameId(k as u64), truth.compose(&odom));
             estimator.add_keyframe(FrameId(k as u64), time, &history).unwrap();
         }
-        let estimate = estimator.estimate(MapVersion(3), |frame| map_poses.get(&frame).copied()).unwrap();
+        let estimate = estimator.estimate(MapVersion(3), CameraNanos(0), |frame| map_poses.get(&frame).copied()).unwrap();
         let c = estimate.correction;
         assert!((c.x_m - 1.0).abs() < 1e-5 && (c.y_m + 0.5).abs() < 1e-5 && (c.yaw_rad - 0.4).abs() < 1e-5, "{c:?}");
-        assert_eq!((estimate.valid_from, estimate.map_version), (CameraNanos(700), MapVersion(3)));
+        assert_eq!((estimate.valid_from, estimate.odom_started, estimate.map_version), (CameraNanos(700), CameraNanos(0), MapVersion(3)));
         assert_eq!(estimate.sigma_xy_m, MapToOdomSettings::default().min_sigma_xy_m, "agreeing keyframes give the floor sigma");
     }
 
@@ -236,9 +302,9 @@ mod tests {
             history.push(OdomPose { time: CameraNanos(k * 100), pose: Pose::IDENTITY }).unwrap();
             estimator.add_keyframe(FrameId(k as u64), CameraNanos(k * 100), &history).unwrap();
         }
-        let estimate = estimator.estimate(MapVersion(1), |frame| Some(pose(if frame.0 % 2 == 0 { 0.2 } else { -0.2 }, 0.0, 0.0))).unwrap();
+        let estimate = estimator.estimate(MapVersion(1), CameraNanos(0), |frame| Some(pose(if frame.0 % 2 == 0 { 0.2 } else { -0.2 }, 0.0, 0.0))).unwrap();
         assert!(estimate.correction.x_m.abs() < 1e-6);
         assert!((estimate.sigma_xy_m - 0.2 / std::f32::consts::SQRT_2).abs() < 1e-5, "{}", estimate.sigma_xy_m);
-        assert!(estimator.estimate(MapVersion(1), |_| None).is_none(), "no keyframe left in the map, no estimate");
+        assert!(estimator.estimate(MapVersion(1), CameraNanos(0), |_| None).is_none(), "no keyframe left in the map, no estimate");
     }
 }

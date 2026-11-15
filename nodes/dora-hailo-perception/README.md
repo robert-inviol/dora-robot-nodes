@@ -55,7 +55,15 @@ second) and `GET /api/events`.
 The package's second command runs YOLOv8 pose (`yolov8s_pose_h8.hef`) on frames another node sends, such as
 `dora-realsense`'s letterboxed `model_input`, instead of reading a camera itself. Frames enter the same kind of
 GStreamer pipeline through `appsrc`; Hailo's `libyolov8pose_post.so` decodes the 17 COCO keypoints and
-`hailotracker` numbers the people. Each frame's `frame_id` rides through the pipeline as its buffer timestamp.
+`hailotracker` numbers the people. Each frame's `frame_id` rides through the pipeline as its buffer timestamp, and
+the main loop collects finished frames from an `appsink`.
+
+Nothing in the pipeline drops a frame. The node gives it at most three frames at a time, skips a frame that arrives
+while three are in flight, and expects every frame back in the order given. It stops with an error when a frame
+comes back out of turn, and exits with status 1 when the oldest frame in flight has waited 5 s for its result,
+printing every thread's stack first. A native timer (Python's `faulthandler`) also ends the process, with the same
+stacks headed `Timeout (0:00:07)!`, when the main loop itself has not come round for 7 s. A status line every 30 s
+counts the frames returned and skipped.
 
 | Input | What it carries |
 |---|---|
@@ -75,11 +83,13 @@ It also needs `dora-rig-messages`. On a Raspberry Pi 5 it keeps up with 30 fps u
 
 ## Known problems
 
-- About one start in twenty, the node (or `dora-hailo-pose`) wedges in its first two minutes: the port accepts
-  connections but never answers, and `ps` hangs. The Hailo kernel driver (hailo_pci, up to at
-  least 4.23) takes its board mutex and the process's memory-map lock in opposite orders in its
-  `mmap` and buffer-map paths, and two threads of this node can meet there while the pipeline
-  starts. Killing the node frees it; a reboot is not needed. Run it under something that restarts
-  it when `detections` go silent.
+- The Hailo driver in Raspberry Pi kernel 6.12.25 (in-tree `hailo_pci` 4.20.0) can deadlock the process. Its
+  buffer-map ioctl takes the process's memory-map lock for reading around `find_vma` and, still holding it, takes
+  it for reading again around `get_user_pages` (Raspberry Pi commit bc0a2321ad55; b5bed2815fc5 narrowed the first
+  lock to `find_vma` alone). When another thread of the process asks for the lock for writing in between (any
+  `mmap`, `munmap` or `brk`), the second read waits behind the writer and the writer waits for the first read.
+  hailonet maps about six user buffers per frame this way. The process then sits in uninterruptible sleep and
+  anything that reads its `/proc/<pid>/cmdline`, such as `ps`, hangs too; killing it frees it. `dora-hailo-pose`
+  exits on its own 5 s into such a stall. The driver from the `hailo-dkms` package takes the lock once.
 - Rarely, stopping while a browser is watching the video makes the node abort inside the
   GStreamer and Hailo teardown (`basic_string: construction from null`).

@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use common::{config, WorkDir, FAST, NOW, RECONCILER, SLOW_A, SLOW_B};
 use perception_wire::navigation::{
-    Asker, GoalTarget, NavGoal, ObjectId, PlaceId, QuestionId, Referent, Revision, SpaceAnswer, SpaceQuestion,
+    Asker, GoalTarget, NavGoal, ObjectId, PlaceId, QuestionId, Referent, Revision, SpatialAnswer, SpatialQuery,
 };
 use tokio::sync::mpsc;
 use world_agent::config::SpatialConfig;
@@ -21,7 +21,7 @@ const QUESTION: QuestionId = QuestionId(31);
 
 struct Harness {
     service: SpatialService<FakeWorld, ChannelGoalSink, FakeWorld>,
-    answers: mpsc::UnboundedReceiver<SpaceAnswer>,
+    answers: mpsc::UnboundedReceiver<SpatialAnswer>,
     goals: mpsc::UnboundedReceiver<SentGoal>,
     _work_dir: WorkDir,
 }
@@ -55,8 +55,8 @@ impl Harness {
     }
 
     /// Every message for the question, up to the final one.
-    async fn ask(&mut self, text: &str) -> Vec<SpaceAnswer> {
-        self.service.ask(SpaceQuestion {
+    async fn ask(&mut self, text: &str) -> Vec<SpatialAnswer> {
+        self.service.ask(SpatialQuery {
             question_id: QUESTION,
             asked: NOW,
             asker: Asker("planner".to_owned()),
@@ -86,7 +86,7 @@ impl Harness {
     }
 }
 
-fn summary(thread: &[SpaceAnswer]) -> Vec<(u32, bool, &str, &str)> {
+fn summary(thread: &[SpatialAnswer]) -> Vec<(u32, bool, &str, &str)> {
     thread.iter().map(|a| (a.revision.0, a.is_final, a.model.as_str(), a.text.as_str())).collect()
 }
 

@@ -1,14 +1,14 @@
-//! Keyframes, their poses and their segments in; object updates out.
+//! Keyframes, their poses and their instance masks in; object updates out.
 
 use std::path::Path;
 
 use eyre::{bail, Context, Result};
 use glam::Vec3;
-use object_map::{FrameJoiner, ObjectMap, ObjectMapSettings, Placement};
+use object_map::{FrameJoiner, ObjectMap, ObjectMapSettings, KeyframeMapPose};
 use dora_node_api::arrow::array::{Array, StructArray};
 use perception_wire::localization::{decode_keyframe_pose, KeyframePose, Tracking};
 use perception_wire::objects::encode_object_update;
-use perception_wire::{decode_keyframe, decode_segments, MessageContext};
+use perception_wire::{decode_keyframe, decode_instance_masks, MessageContext};
 use room_map::Pose;
 
 /// The environment variable naming the settings file; without it the settings are the defaults.
@@ -20,7 +20,7 @@ pub const OBJECT_UPDATE_OUTPUT: &str = "object_update";
 pub enum Input {
     Keyframe,
     KeyframePose,
-    Segments,
+    InstanceMasks,
 }
 
 impl Input {
@@ -28,7 +28,7 @@ impl Input {
         Ok(match id {
             "keyframe" => Input::Keyframe,
             "keyframe_pose" => Input::KeyframePose,
-            "segments" => Input::Segments,
+            "instance_masks" => Input::InstanceMasks,
             other => bail!("the object map has no input {other:?}"),
         })
     }
@@ -46,12 +46,14 @@ pub fn settings_from_environment() -> Result<ObjectMapSettings> {
     }
 }
 
-fn placement(pose: &KeyframePose) -> Placement {
+fn map_pose(pose: &KeyframePose) -> KeyframeMapPose {
     match pose.tracking {
-        Tracking::Lost => Placement::Lost,
-        Tracking::Tracking | Tracking::Relocalised => {
+        // Objects are not moved by pose graph updates, so only a registered keyframe places them: a restarted
+        // keyframe's pose is dead reckoning that a later loop closure would move.
+        Tracking::Restarted | Tracking::Lost => KeyframeMapPose::NotRegistered,
+        Tracking::Tracking | Tracking::Relocalized => {
             let p = pose.pose;
-            Placement::Placed {
+            KeyframeMapPose::Registered {
                 pose: Pose { yaw_rad: p.yaw_rad, translation: Vec3::new(p.x_m, p.y_m, p.z_m) },
                 map_version: pose.map_version,
             }
@@ -73,10 +75,10 @@ impl ObjectMapNode {
     pub fn on_input(&mut self, input: Input, data: &dyn Array) -> Result<Vec<StructArray>> {
         let ready = match input {
             Input::Keyframe => self.joiner.add_keyframe(decode_keyframe(data).for_message("keyframe")?)?,
-            Input::Segments => self.joiner.add_segments(decode_segments(data).for_message("segments")?)?,
+            Input::InstanceMasks => self.joiner.add_instance_masks(decode_instance_masks(data).for_message("instance_masks")?)?,
             Input::KeyframePose => {
                 let pose = decode_keyframe_pose(data).wrap_err("decoding a keyframe_pose message")?;
-                self.joiner.add_placement(pose.frame_id.0, placement(&pose))?
+                self.joiner.add_map_pose(pose.frame_id.0, map_pose(&pose))?
             }
         };
         let Some(frame) = ready else { return Ok(Vec::new()) };

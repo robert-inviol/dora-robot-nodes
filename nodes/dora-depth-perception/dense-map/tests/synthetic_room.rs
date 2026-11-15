@@ -2,7 +2,7 @@
 
 use dense_map::settings::{FloorSettings, TsdfSettings};
 use dense_map::synthetic::keyframe_at;
-use dense_map::{levels, slice_field, BlockTsdf, Cell, DistanceField, PosedDepth, Slice, SurfacePoint};
+use dense_map::{levels, slice_field, BlockTsdf, Cell, Tsdf, PosedDepth, Slice, SurfacePoint};
 use depth_perception::synthetic::SyntheticRoom;
 use glam::{IVec2, Vec2};
 use perception_wire::navigation::MapVersion;
@@ -17,7 +17,7 @@ fn living_room_field() -> (SyntheticRoom, BlockTsdf) {
         for quarter in 0..4 {
             frame_id += 1;
             let (keyframe, pose) = keyframe_at(&room, frame_id, position, quarter as f32 * std::f32::consts::FRAC_PI_2, MapVersion(1));
-            field.integrate(&PosedDepth::new(&keyframe, &pose));
+            field.fuse(&PosedDepth::new(&keyframe, &pose));
         }
     }
     (room, field)

@@ -204,8 +204,13 @@ impl PoseInformation {
     /// off a world plane with unit normal `normal_world`. `weight` is one over the measurement's variance.
     #[inline]
     pub fn add_point_to_plane(&mut self, body_point: DVec3, normal_world: DVec3, residual_m: f64, weight: f64, rotation: DMat3) {
-        let turn = body_point.cross(rotation.transpose() * normal_world);
-        let jacobian = [normal_world.x, normal_world.y, normal_world.z, turn.x, turn.y, turn.z];
+        self.add_row(&point_to_plane_jacobian(body_point, normal_world, rotation), residual_m, weight);
+    }
+
+    /// One measurement whose residual `residual_m` moves by `jacobian` per unit of position and
+    /// orientation error. `weight` is one over the measurement's variance.
+    #[inline]
+    pub fn add_row(&mut self, jacobian: &PoseVector, residual_m: f64, weight: f64) {
         for a in 0..6 {
             for b in 0..6 {
                 self.hessian[(a, b)] += weight * jacobian[a] * jacobian[b];
@@ -225,24 +230,33 @@ impl PoseInformation {
     }
 
     /// The direction of travel these measurements pin down least, and how well they pin it.
-    pub fn weakest_translation(&self) -> WeakestTranslation {
+    pub fn degenerate_translation(&self) -> DegenerateTranslation {
         let block = self.hessian.fixed_view::<3, 3>(0, 0).into_owned();
         let eigen = block.symmetric_eigen();
-        let weakest = (0..3).min_by(|&a, &b| eigen.eigenvalues[a].total_cmp(&eigen.eigenvalues[b])).expect("three eigenvalues");
-        let direction = eigen.eigenvectors.column(weakest);
+        let degenerate = (0..3).min_by(|&a, &b| eigen.eigenvalues[a].total_cmp(&eigen.eigenvalues[b])).expect("three eigenvalues");
+        let direction = eigen.eigenvectors.column(degenerate);
         let sigma = |information: f64| if information > 0.0 { 1.0 / information.sqrt() } else { f64::INFINITY };
-        WeakestTranslation {
+        DegenerateTranslation {
             direction_world: DVec3::new(direction[0], direction[1], direction[2]),
-            sigma_m: sigma(eigen.eigenvalues[weakest]),
+            sigma_m: sigma(eigen.eigenvalues[degenerate]),
             firmest_sigma_m: sigma(eigen.eigenvalues.max()),
         }
     }
 }
 
+/// How the distance of `body_point` off a world plane with unit normal `normal_world` moves with the
+/// position and orientation error of a state whose rotation is `rotation`. The distance does not
+/// depend on the rest of the error state.
+#[inline]
+pub fn point_to_plane_jacobian(body_point: DVec3, normal_world: DVec3, rotation: DMat3) -> PoseVector {
+    let turn = body_point.cross(rotation.transpose() * normal_world);
+    PoseVector::new(normal_world.x, normal_world.y, normal_world.z, turn.x, turn.y, turn.z)
+}
+
 /// The world direction a set of measurements constrains least. A wall seen alone leaves sliding along
 /// it free, which shows as a sigma far larger than the others.
 #[derive(Clone, Copy, Debug)]
-pub struct WeakestTranslation {
+pub struct DegenerateTranslation {
     pub direction_world: DVec3,
     /// One-sigma uncertainty the measurements alone leave along that direction.
     pub sigma_m: f64,
@@ -251,40 +265,41 @@ pub struct WeakestTranslation {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct CorrectionSettings {
+pub struct MeasurementUpdateSettings {
     pub max_iterations: usize,
     /// Iteration stops once a step moves the position less than this and turns it less than `settled_rad`.
     pub settled_m: f64,
     pub settled_rad: f64,
-    /// A correction from fewer measurements than this is refused.
+    /// A measurement update from fewer measurements than this is refused.
     pub min_rows: usize,
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct Correction {
+pub struct MeasurementUpdate {
     pub iterations: usize,
-    /// The measurements at the final estimate.
+    /// The measurements at the estimate the last step was taken from: the linearisation that set the
+    /// covariance the measurement update leaves.
     pub information: PoseInformation,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub enum CorrectionError {
+pub enum MeasurementUpdateError {
     /// The measurements were too few to trust; the state keeps its prediction.
     TooFewRows { rows: usize, needed: usize },
     /// The covariance or the normal equations could not be inverted.
     Singular,
 }
 
-impl std::fmt::Display for CorrectionError {
+impl std::fmt::Display for MeasurementUpdateError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            CorrectionError::TooFewRows { rows, needed } => write!(f, "{rows} measurements, {needed} needed"),
-            CorrectionError::Singular => write!(f, "the filter's covariance could not be inverted"),
+            MeasurementUpdateError::TooFewRows { rows, needed } => write!(f, "{rows} measurements, {needed} needed"),
+            MeasurementUpdateError::Singular => write!(f, "the filter's covariance could not be inverted"),
         }
     }
 }
 
-impl std::error::Error for CorrectionError {}
+impl std::error::Error for MeasurementUpdateError {}
 
 pub struct ErrorStateFilter {
     state: State,
@@ -333,6 +348,12 @@ impl ErrorStateFilter {
         &self.covariance
     }
 
+    /// The covariance of the position and orientation error, the block of the covariance a
+    /// point-to-plane measurement depends on.
+    pub fn pose_covariance(&self) -> PoseMatrix {
+        self.covariance.fixed_view::<6, 6>(POSITION, POSITION).into_owned()
+    }
+
     /// One-sigma uncertainty of the state's levelled pose.
     pub fn levelled_uncertainty(&self) -> LevelledUncertainty {
         self.state.levelled_uncertainty(&self.covariance)
@@ -343,6 +364,13 @@ impl ErrorStateFilter {
         let d = SVector::<f64, 3>::new(direction_world.x, direction_world.y, direction_world.z);
         let block = self.covariance.fixed_view::<3, 3>(POSITION, POSITION);
         (d.transpose() * block * d)[(0, 0)].max(0.0).sqrt()
+    }
+
+    /// One-sigma position uncertainty along the world direction where it is largest: how far the body may be from
+    /// where the estimate puts it against the map, which is laid down in the world frame.
+    pub fn largest_position_sigma_m(&self) -> f64 {
+        let block = self.covariance.fixed_view::<3, 3>(POSITION, POSITION).into_owned();
+        block.symmetric_eigenvalues().max().max(0.0).sqrt()
     }
 
     /// Moves the state on by `seconds` under one IMU reading, and grows the uncertainty to match.
@@ -387,15 +415,15 @@ impl ErrorStateFilter {
     /// Pulls the state towards what the measurements say, weighing them against the prediction's
     /// uncertainty. `linearise` gives the measurements' normal equations at an estimate; it is called
     /// again after each step, so the measurements follow the estimate as it moves.
-    pub fn correct(&mut self, settings: &CorrectionSettings, mut linearise: impl FnMut(&State) -> PoseInformation) -> Result<Correction, CorrectionError> {
+    pub fn update(&mut self, settings: &MeasurementUpdateSettings, mut linearise: impl FnMut(&State) -> PoseInformation) -> Result<MeasurementUpdate, MeasurementUpdateError> {
         let predicted = self.state;
-        let predicted_information = self.covariance.try_inverse().ok_or(CorrectionError::Singular)?;
+        let predicted_information = self.covariance.try_inverse().ok_or(MeasurementUpdateError::Singular)?;
         let mut estimate = predicted;
         let mut iterations = 0;
         loop {
             let information = linearise(&estimate);
             if information.rows < settings.min_rows {
-                return Err(CorrectionError::TooFewRows { rows: information.rows, needed: settings.min_rows });
+                return Err(MeasurementUpdateError::TooFewRows { rows: information.rows, needed: settings.min_rows });
             }
             let mut hessian = predicted_information;
             let mut pose = hessian.fixed_view_mut::<6, 6>(0, 0);
@@ -404,7 +432,7 @@ impl ErrorStateFilter {
             let mut pose = gradient.fixed_rows_mut::<6>(0);
             pose -= information.gradient;
 
-            let solved = hessian.cholesky().ok_or(CorrectionError::Singular)?;
+            let solved = hessian.cholesky().ok_or(MeasurementUpdateError::Singular)?;
             let step = solved.solve(&gradient);
             estimate = estimate.plus(&step);
             iterations += 1;
@@ -413,7 +441,7 @@ impl ErrorStateFilter {
             if settled || iterations >= settings.max_iterations {
                 self.state = estimate;
                 self.covariance = solved.inverse();
-                return Ok(Correction { iterations, information });
+                return Ok(MeasurementUpdate { iterations, information });
             }
         }
     }
@@ -703,6 +731,32 @@ mod tests {
     }
 
     #[test]
+    fn the_point_to_plane_innovation_variance_from_the_state_needs_only_the_pose_block() {
+        let state = in_motion();
+        let (body_point, normal) = (DVec3::new(1.5, 0.4, -0.3), DVec3::new(0.2, -0.5, 0.8).normalize());
+        let residual = |s: &State| normal.dot(s.to_world(body_point)) - 0.7;
+        // A covariance with every error correlated, so a residual that depended on more than the pose
+        // would show.
+        let mut spread = ErrorCovariance::zeros();
+        for (index, value) in spread.iter_mut().enumerate() {
+            *value = 0.01 * ((index * 7 % 13) as f64 - 6.0);
+        }
+        let covariance = spread * spread.transpose() + ErrorCovariance::identity() * 1e-4;
+        let mut numeric = ErrorVector::zeros();
+        for axis in 0..ERROR_DIMENSIONS {
+            let mut step = ErrorVector::zeros();
+            step[axis] = 1e-6;
+            numeric[axis] = (residual(&state.plus(&step)) - residual(&state)) / 1e-6;
+        }
+        let full = (numeric.transpose() * covariance * numeric)[(0, 0)];
+        let jacobian = point_to_plane_jacobian(body_point, normal, DMat3::from_quat(state.rotation));
+        let pose_block = covariance.fixed_view::<6, 6>(POSITION, POSITION).into_owned();
+        let from_pose = jacobian.dot(&(pose_block * jacobian));
+        assert!(numeric.rows(VELOCITY, ERROR_DIMENSIONS - VELOCITY).amax() < 1e-6, "{numeric}");
+        assert!((full - from_pose).abs() < 1e-6 * full, "{full} from the whole state against {from_pose} from the pose block");
+    }
+
+    #[test]
     fn three_walls_pull_a_wrong_position_back() {
         let truth = at_rest(DQuat::IDENTITY);
         let start = State { position: DVec3::new(0.05, -0.04, 0.03), ..truth };
@@ -717,9 +771,9 @@ mod tests {
                 measured.push((on_plane, normal, offset));
             }
         }
-        let settings = CorrectionSettings { max_iterations: 5, settled_m: 1e-6, settled_rad: 1e-6, min_rows: 10 };
+        let settings = MeasurementUpdateSettings { max_iterations: 5, settled_m: 1e-6, settled_rad: 1e-6, min_rows: 10 };
         filter
-            .correct(&settings, |state| {
+            .update(&settings, |state| {
                 let rotation = DMat3::from_quat(state.rotation);
                 let mut information = PoseInformation::default();
                 for &(body_point, normal, offset) in &measured {
@@ -739,7 +793,7 @@ mod tests {
             let body_point = DVec3::new(2.0, (i % 10) as f64 * 0.2 - 1.0, (i / 10) as f64 * 0.2 - 0.5);
             information.add_point_to_plane(body_point, DVec3::X, 0.0, 1e4, DMat3::IDENTITY);
         }
-        let weakest = information.weakest_translation();
-        assert!(weakest.direction_world.x.abs() < 1e-6 && weakest.sigma_m > 1e3, "{weakest:?}");
+        let degenerate = information.degenerate_translation();
+        assert!(degenerate.direction_world.x.abs() < 1e-6 && degenerate.sigma_m > 1e3, "{degenerate:?}");
     }
 }

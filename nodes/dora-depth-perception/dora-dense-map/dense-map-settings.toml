@@ -19,18 +19,22 @@ fraction_of_peak = 0.3
 min_ceiling_height_m = 1.8
 min_ceiling_points = 20
 
-[free_space]
-# The height band above the floor that free space is sliced through.
+[occupancy_grid]
+# The height band above the floor that the occupancy grid is sliced through.
 band_min_m = 0.05
 band_max_m = 0.6
 occupied_below_m = 0.025
 period_s = 1.0
 
-[surface]
-# The shortest time between two surface_patches messages.
-period_s = 1.0
-# A block whose triangles are the same is sent again only once a vertex has moved further than this.
-min_vertex_move_m = 0.01
+[mesh]
+# The shortest time between two mesh_blocks messages.
+period_s = 0.2
+# A block is sent again when a vertex moved further than this from where it was last sent,
+min_vertex_move_m = 0.02
+# or more than this fraction of its cells holding a vertex appeared or went,
+min_changed_cells = 0.1
+# and no sooner than this after it was last sent.
+min_block_period_s = 0.5
 
 [topology]
 door_width_m = 1.1
@@ -48,3 +52,15 @@ margin_m = 0.15
 
 [buffers]
 max_awaiting_pose = 64
+
+[keyframes]
+# Keyframe poses fall in cells this wide along x, y and z, and this wide in yaw; a cell keeps only its newest keyframe.
+pose_cell_m = 0.3
+pose_cell_yaw_deg = 20.0
+# Past this many kept keyframes the oldest with a kept neighbour one cell away goes, or the oldest when none has.
+max_kept = 500
+# Keyframes no longer kept are remembered by the blocks they were fused into, so a move of one rebuilds those blocks.
+max_forgotten_footprints = 20000
+# A keyframe that moves less than this and turns less than this is not rebuilt.
+rebuild_min_move_m = 0.01
+rebuild_min_turn_deg = 0.25

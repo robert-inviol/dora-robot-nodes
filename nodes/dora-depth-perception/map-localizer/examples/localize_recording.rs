@@ -36,26 +36,26 @@ fn main() -> eyre::Result<()> {
     let (mut times_ms, mut states, mut loops, mut gyro_gaps) = (Vec::new(), Vec::new(), 0, 0);
     for (index, keyframe) in keyframes.iter().enumerate() {
         let started = Instant::now();
-        let heading = match &imu {
+        let yaw_prior = match &imu {
             Some(imu) => {
-                gyro.add(&imu[index]);
-                let timing = KeyframeTiming { camera_time: CameraNanos(imu[index].keyframe_camera_ns), gravity_reaction: keyframe.gravity_reaction };
+                gyro.add(&imu[index])?;
+                let timing = KeyframeTiming { camera_time: CameraNanos(imu[index].keyframe_camera_ns), specific_force: keyframe.specific_force };
                 let heading = gyro.keyframe_heading(previous, timing, without_gyro);
                 previous = Some(timing);
                 if let Some(problem) = &heading.gyro_problem {
                     eprintln!("keyframe {}: {problem}; handled as {without_gyro:?}", keyframe.frame_id);
                 }
                 gyro_gaps += heading.gyro_problem.is_some() as usize;
-                heading.hint
+                heading.yaw_prior
             }
-            None => without_gyro.hint(),
+            None => without_gyro.yaw_prior(),
         };
         let cloud = registration_cloud(keyframe, &CloudSettings::default());
         let estimate = localizer.localize(LocalizerInput {
             frame_id: FrameId(keyframe.frame_id),
             captured: UnixNanos(keyframe.captured_unix_ns),
             cloud,
-            heading,
+            yaw_prior,
         });
         times_ms.push(started.elapsed().as_secs_f64() * 1e3);
         states.push(estimate.tracking);
@@ -65,10 +65,11 @@ fn main() -> eyre::Result<()> {
     let mut sorted = times_ms.clone();
     sorted.sort_by(f64::total_cmp);
     println!(
-        "{} keyframes: {} tracking, {} relocalised, {} lost; {} in the map; {loops} loop closures; map version {}; {gyro_gaps} gyro gaps",
+        "{} keyframes: {} tracking, {} relocalized, {} restarted, {} lost; {} in the map; {loops} loop closures; map version {}; {gyro_gaps} gyro gaps",
         keyframes.len(),
         count(Tracking::Tracking),
-        count(Tracking::Relocalised),
+        count(Tracking::Relocalized),
+        count(Tracking::Restarted),
         count(Tracking::Lost),
         localizer.graph().len(),
         localizer.map_version().0

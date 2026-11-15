@@ -2,7 +2,7 @@
 //!
 //! The sensor frame is the depth stream's optical frame: the origin at the pinhole, x to the right of
 //! the image, y down it and z forward along the optical axis. It is the frame a camera's depth-to-IMU
-//! transform starts from, so [`crate::thinning::SensorMount::from_depth_to_imu`] takes these points to
+//! transform starts from, so [`crate::downsampling::SensorExtrinsics::from_depth_to_imu`] takes these points to
 //! the body.
 
 use std::num::NonZeroUsize;

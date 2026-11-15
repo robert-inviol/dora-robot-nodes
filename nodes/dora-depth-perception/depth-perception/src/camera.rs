@@ -57,7 +57,7 @@ pub struct FloorFrame {
 
 impl FloorFrame {
     /// The accelerometer at rest reports the reaction to gravity, which points up, in camera coordinates.
-    pub fn from_gravity_reaction(accel_camera: Vec3) -> FloorFrame {
+    pub fn from_specific_force(accel_camera: Vec3) -> FloorFrame {
         let up = accel_camera.normalize();
         let optical_axis = Vec3::Z;
         let forward = (optical_axis - optical_axis.dot(up) * up).normalize();

@@ -1,7 +1,7 @@
 [package]
 name = "dora-dense-map"
 version = "0.1.0"
-description = "dora node that fuses depth into the dense map and publishes free space, topology and keep-out zones"
+description = "dora node that fuses depth into the dense map and publishes the occupancy grid, topology and keep-out zones"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

@@ -9,7 +9,7 @@ use glam::Vec3;
 
 use crate::grid::voxel_downsample;
 use crate::pose::{wrap_angle, Pose};
-use crate::keyframe_gaps::{contradicts, GapSettings, GapTurn};
+use crate::timing_yaw_prior::{contradicts, TimingYawPriorSettings, TimingYawPrior};
 use crate::registration::{register, register_near_yaw, Registration, RegistrationSettings, Target, YawPrior};
 
 #[derive(Clone, Debug)]
@@ -39,8 +39,8 @@ pub struct TrackingSettings {
     pub gyro_yaw_weight: f64,
     /// With a gyro: a registration turning further than this from the gyro's heading is a false match.
     pub max_gyro_disagreement_deg: f32,
-    /// Without a gyro: how a keyframe's gap from the last bounds its turn (see `keyframe_gaps`).
-    pub gap: GapSettings,
+    /// Without a gyro: how a keyframe's gap from the last bounds its turn (see `timing_yaw_prior`).
+    pub timing_yaw_prior: TimingYawPriorSettings,
     /// With a gyro: a keyframe that fails to register but has at least this many points starts the local
     /// model afresh at its gyro heading, so tracking takes hold again in parts of the room not yet seen.
     pub min_restart_points: usize,
@@ -63,7 +63,7 @@ impl Default for TrackingSettings {
             gyro_yaw_weight: 2000.0,
             max_gyro_disagreement_deg: 5.0,
             min_restart_points: 500,
-            gap: GapSettings::default(),
+            timing_yaw_prior: TimingYawPriorSettings::default(),
         }
     }
 }
@@ -130,8 +130,8 @@ fn walking_step(best: &Registration, previous: Pose, settings: &TrackingSettings
 /// Tracking from depth alone: keyframe clouds, already downsampled, in their own floor frames, and for each
 /// keyframe from the second on what its gap says about its turn; a registration whose turn contradicts it
 /// is rejected.
-pub fn track(clouds: &[Vec<Vec3>], gap_turns: &[GapTurn], settings: &TrackingSettings) -> Vec<TrackedKeyframe> {
-    assert_eq!(gap_turns.len() + 1, clouds.len(), "a gap bound between every pair of keyframes");
+pub fn track(clouds: &[Vec<Vec3>], timing_yaw_priors: &[TimingYawPrior], settings: &TrackingSettings) -> Vec<TrackedKeyframe> {
+    assert_eq!(timing_yaw_priors.len() + 1, clouds.len(), "a gap bound between every pair of keyframes");
     let mut tracked: Vec<TrackedKeyframe> = Vec::with_capacity(clouds.len());
     for (index, cloud) in clouds.iter().enumerate() {
         if index == 0 {
@@ -146,7 +146,7 @@ pub fn track(clouds: &[Vec<Vec3>], gap_turns: &[GapTurn], settings: &TrackingSet
         let turn = wrap_angle(best.pose.yaw_rad - previous.yaw_rad);
         let accepted = walking_step(&best, previous, settings)
             && best.fitness >= settings.accept_fitness
-            && !contradicts(gap_turns[index - 1], turn, &settings.gap);
+            && !contradicts(timing_yaw_priors[index - 1], turn, &settings.timing_yaw_prior);
         let registered = accepted && best.fitness >= settings.min_fitness;
         tracked.push(TrackedKeyframe {
             pose: if accepted { best.pose } else { previous },
@@ -164,7 +164,7 @@ pub fn track(clouds: &[Vec<Vec3>], gap_turns: &[GapTurn], settings: &TrackingSet
 /// and is not registered at all. Otherwise registration
 /// starts at the gyro's heading and is held near it. Where registration fails, the gyro alone moves the
 /// heading on, the position stays put, and a keyframe with enough points restarts the local model, so the
-/// next keyframes register against it; placement later fits each restarted run to the map.
+/// next keyframes register against it; run alignment later fits each restarted run to the map.
 pub fn track_with_gyro(clouds: &[Vec<Vec3>], turns: &[f32], still: &[bool], settings: &TrackingSettings) -> Vec<TrackedKeyframe> {
     assert_eq!(turns.len() + 1, clouds.len(), "a gyro turn between every pair of keyframes");
     assert_eq!(still.len(), turns.len(), "a stillness flag between every pair of keyframes");

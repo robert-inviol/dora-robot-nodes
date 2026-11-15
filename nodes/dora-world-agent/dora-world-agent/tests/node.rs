@@ -1,4 +1,4 @@
-//! The node without dora: encoded map, object and pose messages go into a real world store, a space question is
+//! The node without dora: encoded map, object and pose messages go into a real world store, a spatial query is
 //! answered by `fake-claude` from that store, and the goal the answer sends is recorded in it.
 
 use std::future::Future;
@@ -7,18 +7,18 @@ use std::path::Path;
 use std::time::Duration;
 
 use dora_node_api::arrow::array::StructArray;
-use dora_world_agent::node::{Outputs, SpatialNode, SPACE_QUESTION_INPUT};
+use dora_world_agent::node::{Outputs, SpatialNode, SPATIAL_QUERY_INPUT};
 use dora_world_agent::world::{SqliteWorld, StoreInput};
 use glam::{Vec2, Vec3};
-use perception_wire::localization::{encode_keyframe_pose, encode_map_to_odom, CameraNanos, FrameId, KeyframePose, MapToOdom, Pose4, Tracking};
+use perception_wire::localization::{encode_keyframe_pose, encode_map_to_odom, CameraNanos, FrameId, KeyframePose, MapToOdom, Pose4Dof, Tracking};
 use perception_wire::navigation::{
-    encode_goal_status, encode_space_question, Asker, GoalState, GoalStatus, MapVersion, NavGoal, NonNegative, ObjectId,
-    PlaceId, QuestionId, Reference, Referent, RoomId, SpaceAnswer, SpaceQuestion, TrackId, UnixNanos,
+    encode_goal_status, encode_spatial_query, Asker, GoalState, GoalStatus, MapVersion, NavGoal, NonNegative, ObjectId,
+    PlaceId, QuestionId, Reference, Referent, RoomId, SpatialAnswer, SpatialQuery, TrackId, UnixNanos,
 };
 use perception_wire::objects::{encode_object_update, ObjectExtent, ObjectUpdate, ObjectUpdateKind};
 use perception_wire::people::{self, encode_people_tracks, Keypoint, PeopleTracks, PersonTrack, PixelBox, PositionFrame, TrackState};
 use perception_wire::space_map::{
-    encode_free_space, encode_topology, Doorway, DoorwayId, FreeSpace, HeightBand, Place, PlaceEdge, Topology, TopologyRoom,
+    encode_occupancy_grid, encode_topology, Doorway, DoorwayId, OccupancyGrid, HeightBand, Place, PlaceEdge, Topology, TopologyRoom,
 };
 use world_agent::clock;
 use world_agent::config::{
@@ -102,8 +102,8 @@ fn topology(built: UnixNanos) -> StructArray {
     })
 }
 
-fn free_space(built: UnixNanos) -> StructArray {
-    encode_free_space(&FreeSpace {
+fn occupancy_grid(built: UnixNanos) -> StructArray {
+    encode_occupancy_grid(&OccupancyGrid {
         map_version: VERSION,
         built,
         origin: Vec2::ZERO,
@@ -148,7 +148,7 @@ fn keyframe_pose(at: UnixNanos) -> StructArray {
         frame_id: FrameId(4),
         captured: at,
         map_version: VERSION,
-        pose: Pose4 { x_m: 3.2, y_m: 2.5, z_m: 0.0, yaw_rad: 1.5 },
+        pose: Pose4Dof { x_m: 3.2, y_m: 2.5, z_m: 0.0, yaw_rad: 1.5 },
         tracking: Tracking::Tracking,
         residual_m: 0.01,
         inlier_fraction: 0.9,
@@ -172,7 +172,7 @@ async fn rows(world: &SqliteWorld, sql: &str) -> Vec<Vec<SqlValue>> {
 }
 
 /// Every answer up to the final one, recording each goal sent on the way as the dora loop does.
-async fn thread(spatial: &SpatialNode<SqliteWorld>, outputs: &mut Outputs) -> (Vec<SpaceAnswer>, Vec<NavGoal>) {
+async fn thread(spatial: &SpatialNode<SqliteWorld>, outputs: &mut Outputs) -> (Vec<SpatialAnswer>, Vec<NavGoal>) {
     let (mut answers, mut goals) = (Vec::new(), Vec::new());
     tokio::time::timeout(Duration::from_secs(20), async {
         loop {
@@ -207,7 +207,7 @@ async fn a_question_is_answered_from_the_ingested_world_and_its_goal_is_recorded
 
     let now = clock::now();
     spatial.on_input(StoreInput::Topology.input_id(), &topology(now)).await.unwrap();
-    spatial.on_input(StoreInput::FreeSpace.input_id(), &free_space(now)).await.unwrap();
+    spatial.on_input(StoreInput::OccupancyGrid.input_id(), &occupancy_grid(now)).await.unwrap();
     spatial.on_input(StoreInput::ObjectUpdate.input_id(), &appeared(TABLE, "table", Vec2::new(2.0, 1.5), (1.6, 0.9, 0.74), now)).await.unwrap();
     spatial.on_input(StoreInput::ObjectUpdate.input_id(), &appeared(MUG, "mug", Vec2::new(2.2, 1.6), (0.1, 0.1, 0.1), now)).await.unwrap();
     spatial.on_input(StoreInput::KeyframePose.input_id(), &keyframe_pose(now)).await.unwrap();
@@ -220,7 +220,7 @@ async fn a_question_is_answered_from_the_ingested_world_and_its_goal_is_recorded
     .await;
     assert_eq!(named, [vec![SqlValue::Integer(1), SqlValue::Text("kitchen".to_owned())]]);
 
-    let question = SpaceQuestion {
+    let question = SpatialQuery {
         question_id: QUESTION,
         asked: now,
         asker: Asker("planner".to_owned()),
@@ -231,7 +231,7 @@ async fn a_question_is_answered_from_the_ingested_world_and_its_goal_is_recorded
         ]
         .join("\n"),
     };
-    spatial.on_input(SPACE_QUESTION_INPUT, &encode_space_question(&question)).await.unwrap();
+    spatial.on_input(SPATIAL_QUERY_INPUT, &encode_spatial_query(&question)).await.unwrap();
     let (answers, goals) = thread(&spatial, &mut outputs).await;
 
     assert_eq!(answers.len(), 1, "{answers:#?}");
@@ -276,12 +276,15 @@ async fn an_input_that_does_not_decode_is_an_error() {
     let config = config(dir.path());
     let world = SqliteWorld::open(&config.world_store).unwrap();
     let (spatial, _outputs) = SpatialNode::start(&config, world).await.unwrap();
-    let error = spatial.on_input(StoreInput::Topology.input_id(), &free_space(clock::now())).await.unwrap_err();
+    let error = spatial.on_input(StoreInput::Topology.input_id(), &occupancy_grid(clock::now())).await.unwrap_err();
     assert!(format!("{error:#}").contains("decoding a topology"), "{error:#}");
-    let error = spatial.on_input("keep_out", &free_space(clock::now())).await.unwrap_err();
+    let error = spatial.on_input("keep_out", &occupancy_grid(clock::now())).await.unwrap_err();
     assert!(error.to_string().contains("unexpected input keep_out"), "{error}");
     spatial.shutdown().await.unwrap();
 }
+
+/// The odom frame odometry started first, at camera time 0.
+const ODOM: PositionFrame = PositionFrame::Odom { odom_started: CameraNanos(0) };
 
 /// One confirmed person in the odometry frame at (1, 0), every joint 1.5 m up, and one tentative person.
 fn people_tracks(position_frame: PositionFrame) -> StructArray {
@@ -303,13 +306,13 @@ fn people_tracks(position_frame: PositionFrame) -> StructArray {
         width: 1280,
         height: 720,
         position_frame,
-        gravity_reaction: None,
+        specific_force: None,
         tracks: vec![person(7, TrackState::Confirmed), person(8, TrackState::Tentative)],
     })
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn people_in_odometry_are_placed_once_the_localizer_sends_its_correction() {
+async fn people_in_odometry_are_transformed_once_the_localizer_sends_its_correction() {
     let dir = tempfile::tempdir().unwrap();
     let config = config(dir.path());
     let mut store_config = StoreConfig::at(&config.world_store.path);
@@ -319,27 +322,65 @@ async fn people_in_odometry_are_placed_once_the_localizer_sends_its_correction()
     let now = clock::now();
     spatial.on_input(StoreInput::Topology.input_id(), &topology(now)).await.unwrap();
     let people = StoreInput::PeopleTracks.input_id();
-    spatial.on_input(people, &people_tracks(PositionFrame::Odom)).await.unwrap();
+    spatial.on_input(people, &people_tracks(ODOM)).await.unwrap();
     spatial.on_input(people, &people_tracks(PositionFrame::Camera)).await.unwrap();
     let correction = MapToOdom {
         map_version: VERSION,
         valid_from: CameraNanos(0),
-        correction: Pose4 { x_m: 1.0, y_m: 1.0, z_m: 0.0, yaw_rad: 0.0 },
+        odom_started: CameraNanos(0),
+        correction: Pose4Dof { x_m: 1.0, y_m: 1.0, z_m: 0.0, yaw_rad: 0.0 },
         sigma_xy_m: 0.02,
         sigma_z_m: 0.01,
         sigma_yaw_rad: 0.01,
     };
     spatial.on_input(StoreInput::MapToOdom.input_id(), &encode_map_to_odom(&correction)).await.unwrap();
-    spatial.on_input(people, &people_tracks(PositionFrame::Odom)).await.unwrap();
-    let placed = eventually("the person being recorded", || async {
-        let placed = rows(&world, "SELECT track_id, x_m, y_m FROM track_pose").await;
-        (!placed.is_empty()).then_some(placed)
+    spatial.on_input(people, &people_tracks(ODOM)).await.unwrap();
+    let recorded = eventually("the person being recorded", || async {
+        let recorded = rows(&world, "SELECT track_id, x_m, y_m FROM track_pose").await;
+        (!recorded.is_empty()).then_some(recorded)
     })
     .await;
-    assert_eq!(placed, [vec![SqlValue::Integer(7), SqlValue::Real(2.0), SqlValue::Real(1.0)]], "only the confirmed person, once");
-    let sighting = world.last_seen(EntityRef::Track(TrackId(7))).await.unwrap();
-    assert_eq!(sighting.room, world_store::unnamed_room_name(KITCHEN), "the unnamed kitchen");
-    assert_eq!(sighting.joints.len(), Joint::ALL.len());
-    assert_eq!(sighting.joints[0].height_above_floor_m, Some(1.5));
+    assert_eq!(recorded, [vec![SqlValue::Integer(7), SqlValue::Real(2.0), SqlValue::Real(1.0)]], "only the confirmed person, once");
+    let observation = world.last_seen(EntityRef::Track(TrackId(7))).await.unwrap();
+    assert_eq!(observation.room, world_store::unnamed_room_name(KITCHEN), "the unnamed kitchen");
+    assert_eq!(observation.joints.len(), Joint::ALL.len());
+    assert_eq!(observation.joints[0].height_above_floor_m, Some(1.5));
+    spatial.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn after_an_odometry_restart_people_wait_for_a_correction_in_the_new_odom_frame() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = config(dir.path());
+    let mut store_config = StoreConfig::at(&config.world_store.path);
+    store_config.batch_interval = Duration::from_millis(20);
+    let world = SqliteWorld::open_with(store_config).unwrap();
+    let (spatial, _outputs) = SpatialNode::start(&config, world.clone()).await.unwrap();
+    spatial.on_input(StoreInput::Topology.input_id(), &topology(clock::now())).await.unwrap();
+    let correction = |odom_started: i64, x_m: f32| MapToOdom {
+        map_version: VERSION,
+        valid_from: CameraNanos(odom_started),
+        odom_started: CameraNanos(odom_started),
+        correction: Pose4Dof { x_m, y_m: 1.0, z_m: 0.0, yaw_rad: 0.0 },
+        sigma_xy_m: 0.02,
+        sigma_z_m: 0.01,
+        sigma_yaw_rad: 0.01,
+    };
+    let (people, map_to_odom) = (StoreInput::PeopleTracks.input_id(), StoreInput::MapToOdom.input_id());
+    spatial.on_input(map_to_odom, &encode_map_to_odom(&correction(0, 1.0))).await.unwrap();
+    let restarted = PositionFrame::Odom { odom_started: CameraNanos(500) };
+    spatial.on_input(people, &people_tracks(restarted)).await.unwrap();
+    spatial.on_input(map_to_odom, &encode_map_to_odom(&correction(500, 4.0))).await.unwrap();
+    spatial.on_input(people, &people_tracks(restarted)).await.unwrap();
+    let recorded = eventually("the person being recorded", || async {
+        let recorded = rows(&world, "SELECT track_id, x_m, y_m FROM track_pose").await;
+        (!recorded.is_empty()).then_some(recorded)
+    })
+    .await;
+    assert_eq!(
+        recorded,
+        [vec![SqlValue::Integer(7), SqlValue::Real(5.0), SqlValue::Real(1.0)]],
+        "transformed only with the new odom frame's correction, not at (2, 1) with the old one"
+    );
     spatial.shutdown().await.unwrap();
 }

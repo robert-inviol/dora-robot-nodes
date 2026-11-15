@@ -1,9 +1,14 @@
 //! A RealSense D400 with an IMU as a dora node that owns the camera and publishes every frame: the detector's
 //! letterboxed `model_input`, raw `depth`, the `imu` samples leading up to the frame, and periodically the
 //! `calibration` that relates them; full-size `color` when a dataflow lists it. Every stamp is on the camera's own
-//! clock. Outputs a dataflow does not list cost nothing. Video and motion run on pipelines and threads of their own:
-//! a pipeline that also carries video hands over only the newest motion sample per video frame, while a motion-only
-//! one delivers every sample. The video thread sends straight to dora, so a frame waits on no timer.
+//! clock. Framesets go out once the accelerometer and gyro have both delivered a sample, and every frameset that goes
+//! out has its colour and depth captured within `COLOR_DEPTH_GAP_LIMIT` (`rgbd_frames::frameset`); one further apart
+//! stops the node. Outputs a dataflow does not list cost nothing. Video runs on a pipeline, which pairs colour with depth;
+//! motion comes straight from the same device's motion sensor on a thread of its own, since a pipeline that also
+//! carries video hands over only the newest motion sample per video frame. The video thread sends straight to dora,
+//! so a frame waits on no timer.
+
+mod motion_sensor;
 
 use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -21,13 +26,16 @@ use perception_wire::{encode_imu, Imu};
 use realsense_rust::base::{Rs2Extrinsics, Rs2Intrinsics};
 use realsense_rust::config::Config;
 use realsense_rust::context::Context as RealsenseContext;
-use realsense_rust::frame::{AccelFrame, ColorFrame, DepthFrame, FrameEx, GyroFrame};
+use realsense_rust::frame::{ColorFrame, DepthFrame, FrameEx};
 use realsense_rust::kind::{Rs2Format, Rs2Option, Rs2StreamKind, Rs2TimestampDomain};
 use realsense_rust::pipeline::{ActivePipeline, InactivePipeline};
+use motion_sensor::{MotionSample, MotionStream, MotionStreamRate};
 use realsense_rust::stream_profile::StreamProfile;
+use rgbd_frames::frameset::{frameset_disposition, FramesetDisposition};
 use rgbd_frames::imu_calibration::ImuCalibration;
 use rgbd_frames::letterbox::Letterbox;
 use rgbd_keyframes::GravityEstimate;
+use shared_memory_outputs::SharedMemoryOutputs;
 
 const MODEL_INPUT_OUTPUT: &str = "model_input";
 const DEPTH_OUTPUT: &str = "depth";
@@ -50,18 +58,19 @@ const VIDEO_FPS: usize = 30;
 /// The D455's highest IMU rates.
 const ACCEL_HZ: usize = 200;
 const GYRO_HZ: usize = 400;
+/// Motion samples the motion sensor's queue keeps for the motion thread: one second of both streams.
+const MOTION_QUEUE_CAPACITY: usize = ACCEL_HZ + GYRO_HZ;
 /// `calibration` goes out with the first frame and then once a second, so a node that starts late still gets it.
 const CALIBRATION_EVERY_FRAMES: u64 = VIDEO_FPS as u64;
 const GRAVITY_TIME_CONSTANT: Duration = Duration::from_millis(500);
 const FRAME_WAIT: Duration = Duration::from_secs(2);
+/// The most shared-memory samples of one output its receivers may hold unreleased: four seconds of frames, several
+/// times what the dataflow's receivers and dora's region cache keep at once.
+const UNRELEASED_SAMPLES_LIMIT: usize = 4 * VIDEO_FPS;
 const EVENT_WAIT: Duration = Duration::from_millis(200);
 
 fn camera_ns(frame: &impl FrameEx) -> i64 {
     (frame.timestamp() * 1e6).round() as i64
-}
-
-fn on_camera_clock(frame: &impl FrameEx) -> bool {
-    frame.timestamp_domain() == Rs2TimestampDomain::HardwareClock
 }
 
 /// The pixels of a video frame, which librealsense packs row by row with no padding for these formats.
@@ -77,13 +86,6 @@ struct MotionSamples {
     gyro: Vec<(i64, Vec3)>,
 }
 
-/// The motion-only pipeline, handed to the motion thread.
-struct MotionPipeline(ActivePipeline);
-
-// SAFETY: librealsense pipelines are thread-safe C objects; the wrapper only lacks Send because it holds raw
-// pointers. The pipeline is used by one thread at a time and is joined before its context is dropped.
-unsafe impl Send for MotionPipeline {}
-
 fn start_pipeline(context: &RealsenseContext, config: Config, what: &str) -> Result<ActivePipeline> {
     let pipeline = InactivePipeline::try_from(context)
         .and_then(|pipeline| pipeline.start(Some(config)))
@@ -93,7 +95,7 @@ fn start_pipeline(context: &RealsenseContext, config: Config, what: &str) -> Res
 }
 
 /// librealsense's host-synced global time drifts apart between the motion and video sensors, so it is turned off on
-/// the sensors a pipeline streams from, which are the only ones whose setting it reads.
+/// every sensor of the pipeline's device, the motion sensor included.
 fn use_camera_clock(pipeline: &ActivePipeline) -> Result<()> {
     for mut sensor in pipeline.profile().device().sensors() {
         if sensor.supports_option(Rs2Option::GlobalTimeEnabled) {
@@ -103,42 +105,61 @@ fn use_camera_clock(pipeline: &ActivePipeline) -> Result<()> {
     Ok(())
 }
 
-/// Whether a motion frame is one not seen before: the pipeline pairs each new sample of one stream with the
-/// latest of the other, so most framesets repeat a sample.
-fn is_new(frame: &impl FrameEx, last_frame_number: &mut Option<u64>) -> bool {
-    let number = frame.frame_number();
-    if !on_camera_clock(frame) || last_frame_number.is_some_and(|last| number <= last) {
-        return false;
+/// The frame numbers one stream has delivered. A pipeline pairs each new frame of one stream with the latest of the
+/// others, so framesets repeat frames, and this tells a new frame from a repeated one.
+struct FrameSequence {
+    stream: &'static str,
+    last_number: Option<u64>,
+}
+
+impl FrameSequence {
+    fn new(stream: &'static str) -> FrameSequence {
+        FrameSequence { stream, last_number: None }
     }
-    *last_frame_number = Some(number);
-    true
+
+    /// Whether `frame` is one this stream has not delivered before. Every stamp has to be on the camera's own clock,
+    /// so a frame stamped on any other is an error.
+    fn is_new(&mut self, frame: &impl FrameEx) -> Result<bool> {
+        let number = frame.frame_number();
+        let domain = frame.timestamp_domain();
+        if domain != Rs2TimestampDomain::HardwareClock {
+            bail!("{} frame {number} is stamped on the {domain:?} clock, not the camera's hardware clock", self.stream);
+        }
+        if self.last_number.is_some_and(|last| number <= last) {
+            return Ok(false);
+        }
+        self.last_number = Some(number);
+        Ok(true)
+    }
 }
 
 fn stream_motion(
-    mut motion: MotionPipeline,
+    mut motion: MotionStream,
     calibration: &ImuCalibration,
     samples: &Mutex<MotionSamples>,
     stopping: &AtomicBool,
 ) -> Result<()> {
-    let (mut last_accel, mut last_gyro) = (None, None);
+    let (mut accel_frames, mut gyro_frames) = (FrameSequence::new("accel"), FrameSequence::new("gyro"));
     while !stopping.load(Ordering::Relaxed) {
-        let frames = motion.0.wait(Some(FRAME_WAIT)).map_err(|e| eyre!("waiting for motion samples: {e}"))?;
-        let mut shared = samples.lock().expect("motion samples lock");
-        for accel in frames.frames_of_type::<AccelFrame>() {
-            if is_new(&accel, &mut last_accel) {
-                shared.accel.push((camera_ns(&accel), calibration.accel.apply(Vec3::from_array(*accel.acceleration()))));
+        match motion.next_sample(FRAME_WAIT)? {
+            MotionSample::Accel(accel) => {
+                if accel_frames.is_new(&accel)? {
+                    let sample = calibration.accel.apply(Vec3::from_array(*accel.acceleration()));
+                    samples.lock().expect("motion samples lock").accel.push((camera_ns(&accel), sample));
+                }
             }
-        }
-        for gyro in frames.frames_of_type::<GyroFrame>() {
-            if is_new(&gyro, &mut last_gyro) {
-                shared.gyro.push((camera_ns(&gyro), calibration.gyro.apply(Vec3::from_array(*gyro.rotational_velocity()))));
+            MotionSample::Gyro(gyro) => {
+                if gyro_frames.is_new(&gyro)? {
+                    let sample = calibration.gyro.apply(Vec3::from_array(*gyro.rotational_velocity()));
+                    samples.lock().expect("motion samples lock").gyro.push((camera_ns(&gyro), sample));
+                }
             }
         }
     }
     Ok(())
 }
 
-fn stream_profile<'a>(pipeline: &'a ActivePipeline, kind: Rs2StreamKind) -> Result<&'a StreamProfile> {
+fn stream_profile(pipeline: &ActivePipeline, kind: Rs2StreamKind) -> Result<&StreamProfile> {
     pipeline.profile().streams().iter().find(|s| s.kind() == kind).ok_or_else(|| eyre!("no {kind:?} stream is running"))
 }
 
@@ -155,6 +176,17 @@ fn transform(from: &StreamProfile, to: &StreamProfile) -> Result<RigidTransform>
 
 /// Intrinsics come from the running streams. Transforms are per stream, not per mode, and librealsense only relates
 /// profiles of different pipelines through the device's own profile lists, so the IMU transform is read from those.
+/// The depth sensor's unit in millimetres, read once: nothing in the node changes it.
+fn read_depth_units_mm(video: &ActivePipeline) -> Result<f32> {
+    let sensors = video.profile().device().sensors();
+    let depth_sensor = sensors
+        .iter()
+        .find(|sensor| sensor.supports_option(Rs2Option::DepthUnits))
+        .ok_or_else(|| eyre!("the camera has no sensor with depth units"))?;
+    let units_m = depth_sensor.get_option(Rs2Option::DepthUnits).ok_or_else(|| eyre!("reading depth units"))?;
+    Ok(units_m * 1e3)
+}
+
 fn read_calibration(video: &ActivePipeline) -> Result<CameraCalibration> {
     let (color, depth) = (stream_profile(video, Rs2StreamKind::Color)?, stream_profile(video, Rs2StreamKind::Depth)?);
     let device_profiles: Vec<StreamProfile> =
@@ -199,13 +231,13 @@ impl Wanted {
     }
 }
 
-fn image_parameters(encoding: &str, width: usize, height: usize, frame_id: u64, frame_camera_ns: i64) -> MetadataParameters {
+fn image_parameters(encoding: &str, width: usize, height: usize, frame_id: u64, captured_camera_ns: i64) -> MetadataParameters {
     let mut parameters = MetadataParameters::default();
     parameters.insert("encoding".to_owned(), Parameter::String(encoding.to_owned()));
     parameters.insert("width".to_owned(), Parameter::Integer(width as i64));
     parameters.insert("height".to_owned(), Parameter::Integer(height as i64));
     parameters.insert("frame_id".to_owned(), Parameter::Integer(frame_id as i64));
-    parameters.insert("camera_ns".to_owned(), Parameter::Integer(frame_camera_ns));
+    parameters.insert("camera_ns".to_owned(), Parameter::Integer(captured_camera_ns));
     parameters
 }
 
@@ -218,35 +250,40 @@ fn capture(
     let wanted = Wanted::from_node(&node)?;
     let context = RealsenseContext::new().wrap_err("creating the librealsense context")?;
     eyre::ensure!(!context.query_devices(HashSet::new()).is_empty(), "no RealSense camera found");
-    let mut motion_config = Config::new();
-    motion_config.enable_stream(Rs2StreamKind::Accel, None, 0, 0, Rs2Format::MotionXyz32F, ACCEL_HZ)?;
-    motion_config.enable_stream(Rs2StreamKind::Gyro, None, 0, 0, Rs2Format::MotionXyz32F, GYRO_HZ)?;
-    let motion = start_pipeline(&context, motion_config, "motion")?;
     let mut video_config = Config::new();
     video_config.enable_stream(Rs2StreamKind::Color, None, COLOR_SIZE.0, COLOR_SIZE.1, Rs2Format::Rgb8, VIDEO_FPS)?;
     video_config.enable_stream(Rs2StreamKind::Depth, None, DEPTH_SIZE.0, DEPTH_SIZE.1, Rs2Format::Z16, VIDEO_FPS)?;
-    let video = start_pipeline(&context, video_config, "colour and depth")?;
+    let mut video = start_pipeline(&context, video_config, "colour and depth")?;
     let calibration = read_calibration(&video)?;
+    let depth_units_mm = read_depth_units_mm(&video)?;
+    // The motion sensor is the one of the device the video pipeline opened, which the first frameset names.
+    let first_frames = video.wait(Some(FRAME_WAIT)).map_err(|e| eyre!("waiting for the first camera frames: {e}"))?;
+    let motion_rates = [MotionStreamRate::accel(ACCEL_HZ), MotionStreamRate::gyro(GYRO_HZ)];
+    let motion = MotionStream::start(first_frames, &motion_rates, MOTION_QUEUE_CAPACITY)?;
     let motion_samples = Mutex::new(MotionSamples::default());
-    let motion = MotionPipeline(motion);
     std::thread::scope(|scope| {
         let motion = scope.spawn(|| stream_motion(motion, &imu_calibration, &motion_samples, &stopping));
-        let sent = stream_video(&mut node, video, &wanted, &calibration, &motion_samples, &stopping, &color_requests, || {
-            motion.is_finished()
-        });
+        let camera = CameraStreams { calibration: &calibration, depth_units_mm, motion_samples: &motion_samples };
+        let sent = stream_video(&mut node, video, &wanted, camera, &stopping, &color_requests, || motion.is_finished());
         stopping.store(true, Ordering::Relaxed);
         let motion = motion.join().map_err(|_| eyre!("the motion thread panicked"))?;
         sent.and(motion)
     })
 }
 
-#[allow(clippy::too_many_arguments)]
+/// What the video thread reads besides its frames: the calibration and depth units read at start, and the motion
+/// samples the motion thread delivers.
+struct CameraStreams<'a> {
+    calibration: &'a CameraCalibration,
+    depth_units_mm: f32,
+    motion_samples: &'a Mutex<MotionSamples>,
+}
+
 fn stream_video(
     node: &mut DoraNode,
     mut pipeline: ActivePipeline,
     wanted: &Wanted,
-    calibration: &CameraCalibration,
-    motion_samples: &Mutex<MotionSamples>,
+    camera: CameraStreams,
     stopping: &AtomicBool,
     color_requests: &Mutex<Vec<u64>>,
     motion_finished: impl Fn() -> bool,
@@ -254,7 +291,8 @@ fn stream_video(
     let output = |name: &str| DataId::from(name.to_owned());
     let mut gravity = GravityEstimate::new(GRAVITY_TIME_CONSTANT);
     let mut last_accel_ns: Option<i64> = None;
-    let mut last_depth: Option<u64> = None;
+    let (mut depth_frames, mut color_frames) = (FrameSequence::new("depth"), FrameSequence::new("colour"));
+    let mut outputs = SharedMemoryOutputs::new(node, UNRELEASED_SAMPLES_LIMIT)?;
     let mut frame_id = 0u64;
     let mut pending = Imu::default();
     // The camera can still hold motion samples from an earlier session; only those after the first depth frame count.
@@ -273,13 +311,35 @@ fn stream_video(
         }
         let frames = pipeline.wait(Some(FRAME_WAIT)).map_err(|e| eyre!("waiting for camera frames: {e}"))?;
         // A frameset can repeat the previous depth frame beside a new colour one; each depth frame is sent once.
-        let Some(depth) = frames.frames_of_type::<DepthFrame>().into_iter().next().filter(|d| is_new(d, &mut last_depth)) else {
+        let Some(depth) = frames.frames_of_type::<DepthFrame>().into_iter().next() else { continue };
+        if !depth_frames.is_new(&depth)? {
             continue;
-        };
+        }
         let Some(color) = frames.frames_of_type::<ColorFrame>().into_iter().next() else { continue };
-        let frame_camera_ns = camera_ns(&depth);
-        let start_ns = *session_start_ns.get_or_insert(frame_camera_ns);
-        let delivered = std::mem::take(&mut *motion_samples.lock().expect("motion samples lock"));
+        // It can also repeat the previous colour frame beside a new depth one. That colour already went out with the
+        // frame before, so this depth frame is not sent.
+        if !color_frames.is_new(&color)? {
+            eprintln!(
+                "[realsense] depth frame {} came with colour frame {} again; that depth frame is not sent",
+                depth.frame_number(),
+                color.frame_number()
+            );
+            continue;
+        }
+        let depth_camera_ns = camera_ns(&depth);
+        let color_camera_ns = camera_ns(&color);
+        let mut motion_samples = camera.motion_samples.lock().expect("motion samples lock");
+        let motion_delivering =
+            session_start_ns.is_some() || (!motion_samples.accel.is_empty() && !motion_samples.gyro.is_empty());
+        let disposition = frameset_disposition(motion_delivering, color_camera_ns, depth_camera_ns).wrap_err_with(|| {
+            format!("colour frame {} and depth frame {}", color.frame_number(), depth.frame_number())
+        })?;
+        if disposition == FramesetDisposition::AwaitingMotion {
+            continue;
+        }
+        let delivered = std::mem::take(&mut *motion_samples);
+        drop(motion_samples);
+        let start_ns = *session_start_ns.get_or_insert(depth_camera_ns);
         for (t, sample) in delivered.accel.into_iter().filter(|(t, _)| *t >= start_ns) {
             gravity.add(sample, Duration::from_nanos(last_accel_ns.map_or(0, |last| (t - last).max(0) as u64)));
             last_accel_ns = Some(t);
@@ -292,23 +352,23 @@ fn stream_video(
         }
 
         // The imu message goes first, so a consumer has the samples before the frame they lead up to.
-        let imu = Imu { frame_id, keyframe_camera_ns: frame_camera_ns, ..std::mem::take(&mut pending) };
-        node.send_output(output(IMU_OUTPUT), MetadataParameters::default(), encode_imu(&imu))?;
+        let imu = Imu { frame_id, keyframe_camera_ns: depth_camera_ns, ..std::mem::take(&mut pending) };
+        outputs.send_array(node, &output(IMU_OUTPUT), MetadataParameters::default(), encode_imu(&imu))?;
         if frame_id % CALIBRATION_EVERY_FRAMES == 0 {
-            node.send_output(output(CALIBRATION_OUTPUT), MetadataParameters::default(), encode_camera_calibration(calibration))?;
+            outputs.send_array(node, &output(CALIBRATION_OUTPUT), MetadataParameters::default(), encode_camera_calibration(camera.calibration))?;
         }
 
         let rgb: &[u8] = pixels(unsafe { color.get_data() }, color.get_data_size());
         if let Some(letterbox) = &wanted.model_input {
             let started = Instant::now();
-            let mut parameters = image_parameters("rgb8", letterbox.side, letterbox.side, frame_id, frame_camera_ns);
+            let mut parameters = image_parameters("rgb8", letterbox.side, letterbox.side, frame_id, color_camera_ns);
             parameters.insert("source_width".to_owned(), Parameter::Integer(letterbox.source_width as i64));
             parameters.insert("source_height".to_owned(), Parameter::Integer(letterbox.source_height as i64));
             parameters.insert("shrink".to_owned(), Parameter::Integer(letterbox.factor as i64));
             parameters.insert("pad_x".to_owned(), Parameter::Integer(letterbox.pad_x as i64));
             parameters.insert("pad_y".to_owned(), Parameter::Integer(letterbox.pad_y as i64));
             let mut letterbox_ms = 0.0;
-            node.send_output_raw(output(MODEL_INPUT_OUTPUT), parameters, letterbox.output_len(), |out| {
+            outputs.send_raw(node, &output(MODEL_INPUT_OUTPUT), parameters, letterbox.output_len(), |out| {
                 letterbox.fill(rgb, out);
                 letterbox_ms = started.elapsed().as_secs_f64() * 1e3;
             })?;
@@ -317,28 +377,28 @@ fn stream_video(
             }
         }
         if wanted.depth {
-            let units_mm = depth.depth_units().map_err(|e| eyre!("reading depth units: {e}"))? * 1e3;
+            let units_mm = camera.depth_units_mm;
             let raw: &[u16] = pixels(unsafe { depth.get_data() }, depth.get_data_size());
             let depth_mm: UInt16Array = if (units_mm - 1.0).abs() > 1e-6 {
                 raw.iter().map(|&d| (d as f32 * units_mm).round().min(u16::MAX as f32) as u16).collect()
             } else {
                 UInt16Array::from(raw.to_vec())
             };
-            let mut parameters = image_parameters("mono16", depth.width(), depth.height(), frame_id, frame_camera_ns);
-            if let Some(reaction) = gravity.reaction() {
-                parameters.insert("gravity_reaction".to_owned(), Parameter::ListFloat(reaction.to_array().map(f64::from).to_vec()));
+            let mut parameters = image_parameters("mono16", depth.width(), depth.height(), frame_id, depth_camera_ns);
+            if let Some(specific_force) = gravity.specific_force() {
+                parameters.insert("specific_force".to_owned(), Parameter::ListFloat(specific_force.to_array().map(f64::from).to_vec()));
             }
-            node.send_output(output(DEPTH_OUTPUT), parameters, depth_mm)?;
+            outputs.send_array(node, &output(DEPTH_OUTPUT), parameters, depth_mm)?;
         }
         if wanted.color && !wanted.color_on_request {
-            let parameters = image_parameters("rgb8", color.width(), color.height(), frame_id, frame_camera_ns);
-            node.send_output_raw(output(COLOR_OUTPUT), parameters, rgb.len(), |out| out.copy_from_slice(rgb))?;
+            let parameters = image_parameters("rgb8", color.width(), color.height(), frame_id, color_camera_ns);
+            outputs.send_raw(node, &output(COLOR_OUTPUT), parameters, rgb.len(), |out| out.copy_from_slice(rgb))?;
         }
         if wanted.color && wanted.color_on_request {
             let mut pixels = if kept_colors.len() == COLOR_FRAMES_KEPT { kept_colors.pop_front().expect("full").2 } else { Vec::new() };
             pixels.clear();
             pixels.extend_from_slice(rgb);
-            kept_colors.push_back((frame_id, frame_camera_ns, pixels));
+            kept_colors.push_back((frame_id, color_camera_ns, pixels));
             waiting_requests.append(&mut color_requests.lock().expect("colour requests lock"));
             let mut still_waiting = Vec::new();
             for requested in waiting_requests.drain(..) {
@@ -350,7 +410,7 @@ fn stream_video(
                     bail!("colour for frame {requested} was asked for after it was dropped; the camera keeps the last {COLOR_FRAMES_KEPT}");
                 };
                 let parameters = image_parameters("rgb8", color.width(), color.height(), requested, *requested_ns);
-                node.send_output_raw(output(COLOR_OUTPUT), parameters, pixels.len(), |out| out.copy_from_slice(pixels))?;
+                outputs.send_raw(node, &output(COLOR_OUTPUT), parameters, pixels.len(), |out| out.copy_from_slice(pixels))?;
             }
             waiting_requests = still_waiting;
         }

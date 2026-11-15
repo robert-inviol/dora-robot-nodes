@@ -1,18 +1,17 @@
 [package]
-name = "dora-keyframe-picker"
+name = "dora-posed-depth"
 version = "0.1.0"
-description = "dora node that picks keyframes from dora-realsense's frames: depth aligned to colour, with the IMU samples since the last one"
+description = "dora node that sends depth frames downsampled for mapping, each with its exact odometry pose"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 readme = "../README.md"
 
 [dependencies]
-rgbd-keyframes = { path = "../rgbd-keyframes" }
 perception-wire = { path = "../../dora-depth-perception/perception-wire" }
-depth-perception = { path = "../../dora-depth-perception/depth-perception" }
+shared-memory-outputs = { path = "../shared-memory-outputs" }
 # The node API has to match the version of the dora CLI that runs the dataflow.
 dora-node-api = { version = "=0.3.13", default-features = false }
 eyre = "0.6"
 glam = "0.29"
-jpeg-encoder = "0.6"
+thiserror = "2"

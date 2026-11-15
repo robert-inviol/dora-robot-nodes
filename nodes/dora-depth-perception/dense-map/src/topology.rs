@@ -1,4 +1,4 @@
-//! Rooms, doorways and places cut from the free-space grid.
+//! Rooms, doorways and places cut from the occupancy grid.
 //!
 //! Clearance here is the distance to the nearest cell that is not known free, so the frontier of what has been
 //! seen bounds rooms as walls do. Small unknown pockets bordered mostly by free cells, such as the floor under
@@ -16,7 +16,7 @@ use perception_wire::space_map::{Doorway, DoorwayId, Place, PlaceEdge, RoomId, T
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::grid::{squared_distance_transform, Cell, CellGrid, GridGeometry};
+use crate::grid::{squared_distance_transform, Cell, OccupancyCells, GridGeometry};
 use crate::outline::{outer_outline, simplify};
 use crate::settings::TopologySettings;
 
@@ -46,7 +46,7 @@ impl Segmentation {
 }
 
 /// Cuts free space into a topology, keeping ids stable from one cut to the next.
-pub struct Topologist {
+pub struct TopologyBuilder {
     settings: TopologySettings,
     previous: Option<Segmentation>,
     previous_doorways: Vec<Doorway>,
@@ -76,7 +76,7 @@ const NO_REGION: u32 = u32::MAX;
 
 struct Field<'a> {
     geometry: GridGeometry,
-    grid: &'a CellGrid,
+    grid: &'a OccupancyCells,
     /// Distance in cells to the nearest cell that is not free.
     clearance: Vec<f32>,
 }
@@ -100,9 +100,9 @@ impl Field<'_> {
     }
 }
 
-impl Topologist {
-    pub fn new(settings: TopologySettings) -> Topologist {
-        Topologist {
+impl TopologyBuilder {
+    pub fn new(settings: TopologySettings) -> TopologyBuilder {
+        TopologyBuilder {
             settings,
             previous: None,
             previous_doorways: Vec::new(),
@@ -119,7 +119,7 @@ impl Topologist {
     }
 
     /// Cuts the grid into rooms at a floor height, with ceiling heights from the ceiling points over each room.
-    pub fn cut(&mut self, grid: &CellGrid, floor_m: f32, ceiling_points: &[Vec3], min_ceiling_points: usize) -> TopologyPlan {
+    pub fn cut(&mut self, grid: &OccupancyCells, floor_m: f32, ceiling_points: &[Vec3], min_ceiling_points: usize) -> TopologyPlan {
         let filled = fill_holes(grid, self.settings.max_hole_area_m2);
         let grid = &filled;
         let geometry = grid.geometry;
@@ -408,7 +408,7 @@ impl Topologist {
 
 /// The grid with every unknown pocket that does not reach the grid's edge, covers at most `max_area_m2` and has
 /// at least as many free cells as occupied ones around it made free.
-fn fill_holes(grid: &CellGrid, max_area_m2: f32) -> CellGrid {
+fn fill_holes(grid: &OccupancyCells, max_area_m2: f32) -> OccupancyCells {
     let geometry = grid.geometry;
     let max_cells = (max_area_m2 / (geometry.resolution_m * geometry.resolution_m)) as usize;
     let mut cells = grid.cells.clone();
@@ -444,7 +444,7 @@ fn fill_holes(grid: &CellGrid, max_area_m2: f32) -> CellGrid {
             }
         }
     }
-    CellGrid { geometry, cells }
+    OccupancyCells { geometry, cells }
 }
 
 /// The lowest clearance along a straight line, in metres, or None if it leaves the free space.
@@ -653,8 +653,8 @@ mod tests {
             self.set(low.into(), high.into(), Cell::Free)
         }
 
-        fn grid(&self) -> CellGrid {
-            CellGrid { geometry: self.geometry, cells: self.cells.clone() }
+        fn grid(&self) -> OccupancyCells {
+            OccupancyCells { geometry: self.geometry, cells: self.cells.clone() }
         }
     }
 
@@ -663,8 +663,8 @@ mod tests {
         Plan::new(8.1, 4.0).free((0.0, 0.0), (4.0, 4.0)).free((4.1, 0.0), (8.1, 4.0)).free((3.9, 1.6), (4.2, 2.4))
     }
 
-    fn cut(topologist: &mut Topologist, plan: &Plan) -> TopologyPlan {
-        topologist.cut(&plan.grid(), -1.0, &[], 1)
+    fn cut(topology_builder: &mut TopologyBuilder, plan: &Plan) -> TopologyPlan {
+        topology_builder.cut(&plan.grid(), -1.0, &[], 1)
     }
 
     fn area(polygon: &[Vec2]) -> f32 {
@@ -690,7 +690,7 @@ mod tests {
 
     #[test]
     fn two_rooms_are_cut_at_the_door_between_them() {
-        let plan = cut(&mut Topologist::new(TopologySettings::default()), &two_rooms());
+        let plan = cut(&mut TopologyBuilder::new(TopologySettings::default()), &two_rooms());
         assert_eq!(plan.rooms.len(), 2, "{:?}", plan.rooms);
         for room in &plan.rooms {
             assert!((area(&room.polygon) - 16.0).abs() < 0.8, "{room:?}");
@@ -705,7 +705,7 @@ mod tests {
 
     #[test]
     fn places_cover_both_rooms_and_their_edges_join_through_the_door() {
-        let plan = cut(&mut Topologist::new(TopologySettings::default()), &two_rooms());
+        let plan = cut(&mut TopologyBuilder::new(TopologySettings::default()), &two_rooms());
         for room in &plan.rooms {
             assert!(plan.places.iter().filter(|p| p.room_id == room.room_id).count() >= 4, "{:?}", plan.places);
         }
@@ -721,8 +721,8 @@ mod tests {
 
     #[test]
     fn room_ids_survive_a_rebuild_that_grows_a_room_and_new_rooms_get_new_ids() {
-        let mut topologist = Topologist::new(TopologySettings::default());
-        let first = cut(&mut topologist, &two_rooms());
+        let mut topology_builder = TopologyBuilder::new(TopologySettings::default());
+        let first = cut(&mut topology_builder, &two_rooms());
         let ids_at = |plan: &TopologyPlan, points: &[Vec2]| -> Vec<RoomId> {
             points.iter().map(|p| topologist_room(plan, *p)).collect()
         };
@@ -735,7 +735,7 @@ mod tests {
             .free((3.9, 1.6), (4.2, 2.4))
             .free((8.2, 0.0), (12.2, 4.0))
             .free((8.0, 0.4), (8.3, 1.2));
-        let second = cut(&mut topologist, &grown);
+        let second = cut(&mut topology_builder, &grown);
         assert_eq!(second.rooms.len(), 3, "{:?}", second.rooms);
         assert_eq!(ids_at(&second, &left_and_right), before);
         let new_room = topologist_room(&second, Vec2::new(10.0, 2.0));
@@ -744,7 +744,7 @@ mod tests {
         let first_door = first.doorways[0].doorway_id;
         assert!(second.doorways.iter().any(|d| d.doorway_id == first_door));
 
-        let third = cut(&mut topologist, &grown);
+        let third = cut(&mut topology_builder, &grown);
         assert_eq!(third.rooms.iter().map(|r| r.room_id).collect::<Vec<_>>(), second.rooms.iter().map(|r| r.room_id).collect::<Vec<_>>());
         assert_eq!(third.places.iter().map(|p| p.place_id).collect::<Vec<_>>(), second.places.iter().map(|p| p.place_id).collect::<Vec<_>>());
     }
@@ -759,28 +759,28 @@ mod tests {
 
     #[test]
     fn a_corridor_as_narrow_as_a_door_stays_one_room() {
-        let plan = cut(&mut Topologist::new(TopologySettings::default()), &Plan::new(6.0, 1.0).free((0.0, 0.0), (6.0, 1.0)));
+        let plan = cut(&mut TopologyBuilder::new(TopologySettings::default()), &Plan::new(6.0, 1.0).free((0.0, 0.0), (6.0, 1.0)));
         assert_eq!((plan.rooms.len(), plan.doorways.len()), (1, 0), "{:?}", plan.doorways);
     }
 
     #[test]
     fn a_sofa_out_from_the_wall_does_not_split_the_room() {
         let plan = Plan::new(5.0, 5.0).free((0.0, 0.0), (5.0, 5.0)).set(Vec2::new(1.5, 0.6), Vec2::new(3.5, 1.4), Cell::Occupied);
-        let plan = cut(&mut Topologist::new(TopologySettings::default()), &plan);
+        let plan = cut(&mut TopologyBuilder::new(TopologySettings::default()), &plan);
         assert_eq!((plan.rooms.len(), plan.doorways.len()), (1, 0), "{:?}", plan.doorways);
     }
 
     #[test]
     fn a_cupboard_smaller_than_a_room_merges_into_its_neighbour() {
         let plan = Plan::new(5.1, 4.0).free((0.0, 0.0), (4.0, 4.0)).free((4.1, 1.0), (5.1, 2.0)).free((3.9, 1.2), (4.2, 1.8));
-        let plan = cut(&mut Topologist::new(TopologySettings::default()), &plan);
+        let plan = cut(&mut TopologyBuilder::new(TopologySettings::default()), &plan);
         assert_eq!((plan.rooms.len(), plan.doorways.len()), (1, 0), "{:?}", plan.rooms);
     }
 
     #[test]
     fn unknown_space_bounds_a_room_as_a_wall_does() {
         let plan = Plan::new(4.0, 4.0).free((0.0, 0.0), (4.0, 4.0)).set(Vec2::new(2.0, 0.0), Vec2::new(4.0, 4.0), Cell::Unknown);
-        let plan = cut(&mut Topologist::new(TopologySettings::default()), &plan);
+        let plan = cut(&mut TopologyBuilder::new(TopologySettings::default()), &plan);
         assert_eq!(plan.rooms.len(), 1);
         assert!((area(&plan.rooms[0].polygon) - 8.0).abs() < 0.3, "{:?}", plan.rooms[0]);
     }
@@ -788,7 +788,7 @@ mod tests {
     #[test]
     fn an_unseen_patch_in_a_doorway_does_not_hide_the_door() {
         let plan = two_rooms().set(Vec2::new(3.95, 1.9), Vec2::new(4.15, 2.1), Cell::Unknown);
-        let plan = cut(&mut Topologist::new(TopologySettings::default()), &plan);
+        let plan = cut(&mut TopologyBuilder::new(TopologySettings::default()), &plan);
         assert_eq!((plan.rooms.len(), plan.doorways.len()), (2, 1), "{:?}", plan.doorways);
     }
 
@@ -798,7 +798,7 @@ mod tests {
             .free((0.0, 0.0), (4.0, 4.0))
             .set(Vec2::new(1.0, 1.0), Vec2::new(2.0, 2.0), Cell::Occupied)
             .set(Vec2::new(1.1, 1.1), Vec2::new(1.9, 1.9), Cell::Unknown);
-        let plan = cut(&mut Topologist::new(TopologySettings::default()), &plan);
+        let plan = cut(&mut TopologyBuilder::new(TopologySettings::default()), &plan);
         assert!((area(&plan.rooms[0].polygon) - 16.0).abs() < 0.5);
         assert!(plan.places.iter().all(|p| !(p.position.cmpgt(Vec2::splat(1.0)).all() && p.position.cmplt(Vec2::splat(2.0)).all())));
     }
@@ -806,7 +806,7 @@ mod tests {
     #[test]
     fn a_ceiling_over_a_room_gives_its_height() {
         let ceiling: Vec<Vec3> = (0..30).map(|i| Vec3::new(1.0 + 0.05 * i as f32, 1.0, 1.4)).collect();
-        let plan = Topologist::new(TopologySettings::default()).cut(&two_rooms().grid(), -1.0, &ceiling, 20);
+        let plan = TopologyBuilder::new(TopologySettings::default()).cut(&two_rooms().grid(), -1.0, &ceiling, 20);
         let left = topologist_room(&plan, Vec2::new(1.0, 1.0));
         for room in &plan.rooms {
             assert_eq!(room.ceiling_m, (room.room_id == left).then_some(1.4));

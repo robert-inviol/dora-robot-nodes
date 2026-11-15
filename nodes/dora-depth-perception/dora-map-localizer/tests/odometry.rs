@@ -2,7 +2,7 @@ use depth_perception::synthetic::SyntheticRoom;
 use dora_map_localizer::config::{NodeSettings, OdometrySettings};
 use dora_map_localizer::{LocalizerNode, OdometryInputError, OdometryRestart};
 use glam::{Mat3, Quat, Vec3};
-use map_localizer::map_to_odom::{CameraMount, MapToOdomSettings, OdomError};
+use map_localizer::map_to_odom::{CameraExtrinsics, MapToOdomSettings, OdomError};
 use map_localizer::synthetic::{ellipse_poses, render_walk};
 use perception_wire::camera::{CameraCalibration, RigidTransform, StreamIntrinsics};
 use perception_wire::localization::{decode_map_to_odom, encode_map_to_odom, CameraNanos, FrameId, MapToOdom};
@@ -11,7 +11,7 @@ use perception_wire::{decode_keyframe, encode_keyframe};
 use room_map::pose::wrap_angle;
 use room_map::Pose;
 
-const MOUNT: CameraMount = CameraMount { camera_in_imu_m: Vec3::new(0.03, -0.005, 0.01) };
+const EXTRINSICS: CameraExtrinsics = CameraExtrinsics { camera_in_imu_m: Vec3::new(0.03, -0.005, 0.01), camera_to_imu: Quat::IDENTITY };
 
 fn with_odometry() -> NodeSettings {
     let odometry = OdometrySettings { retention_ns: OdometrySettings::DEFAULT_RETENTION_NS, estimator: MapToOdomSettings::default() };
@@ -32,7 +32,7 @@ fn calibration_with_camera_at(camera_in_imu_m: Vec3) -> CameraCalibration {
 /// A node with odometry that has had the camera's calibration.
 fn odometry_node() -> LocalizerNode {
     let mut node = LocalizerNode::new(with_odometry());
-    node.on_calibration(&calibration_with_camera_at(MOUNT.camera_in_imu_m)).unwrap();
+    node.on_calibration(&calibration_with_camera_at(EXTRINSICS.camera_in_imu_m)).unwrap();
     node
 }
 
@@ -50,7 +50,7 @@ fn odom_pose_in(started_ns: i64, camera_ns: i64, floor: Pose) -> OdomPose {
         camera_ns,
         odom_started_camera_ns: started_ns,
         depth_frame_id: 0,
-        position_m: floor.translation - orientation * MOUNT.camera_in_imu_m,
+        position_m: floor.translation - orientation * EXTRINSICS.camera_in_imu_m,
         orientation,
         velocity_m_s: Vec3::ZERO,
         position_sigma_m: Vec3::splat(0.01),
@@ -58,7 +58,7 @@ fn odom_pose_in(started_ns: i64, camera_ns: i64, floor: Pose) -> OdomPose {
         heading_sigma_rad: 0.002,
         corrected: true,
         matched_points: 900,
-        weakest: None,
+        degenerate: None,
     };
     decode_odom_pose(&encode_odom_pose(&pose)).unwrap()
 }
@@ -72,7 +72,7 @@ fn odometry_in_a_drifted_frame_gives_the_correction_back_to_the_map() {
     let mut node = odometry_node();
     let mut sent: Vec<MapToOdom> = Vec::new();
     for (index, (keyframe, imu)) in walk.keyframes.iter().zip(&walk.imu).enumerate() {
-        node.on_imu(imu);
+        node.on_imu(imu).unwrap();
         let handled = node.on_keyframe(decode_keyframe(&encode_keyframe(keyframe)).unwrap());
         // Odometry starts after the first keyframe, and each pose arrives after the keyframe it is for.
         if index == 0 {
@@ -108,10 +108,10 @@ fn keyframes_that_odometry_never_reaches_are_given_up_after_the_retention() {
     let retention_ns = walk.imu[1].keyframe_camera_ns - walk.imu[0].keyframe_camera_ns - 1;
     settings.odometry.as_mut().unwrap().retention_ns = retention_ns;
     let mut node = LocalizerNode::new(settings);
-    node.on_calibration(&calibration_with_camera_at(MOUNT.camera_in_imu_m)).unwrap();
+    node.on_calibration(&calibration_with_camera_at(EXTRINSICS.camera_in_imu_m)).unwrap();
     let mut unjoined = Vec::new();
     for (keyframe, imu) in walk.keyframes.iter().zip(&walk.imu) {
-        node.on_imu(imu);
+        node.on_imu(imu).unwrap();
         let handled = node.on_keyframe(decode_keyframe(&encode_keyframe(keyframe)).unwrap());
         assert!(handled.map_to_odom.is_none());
         unjoined.extend(handled.unjoined);
@@ -146,7 +146,7 @@ fn odometry_that_starts_again_in_a_new_frame_gives_the_correction_to_the_new_fra
     let mut restarts = Vec::new();
     let mut after_restart: Vec<MapToOdom> = Vec::new();
     for (index, (keyframe, imu)) in walk.keyframes.iter().zip(&walk.imu).enumerate() {
-        node.on_imu(imu);
+        node.on_imu(imu).unwrap();
         node.on_keyframe(decode_keyframe(&encode_keyframe(keyframe)).unwrap());
         let (started_ns, correction) = if index < RESTART { (0, first) } else { (restart_ns, second) };
         let pose = odom_pose_in(started_ns, imu.keyframe_camera_ns, correction.inverse().compose(&walk.truth[index]));
@@ -159,6 +159,7 @@ fn odometry_that_starts_again_in_a_new_frame_gives_the_correction_to_the_new_fra
     assert_eq!(restarts, [OdometryRestart { previous_start: CameraNanos(0), start: CameraNanos(restart_ns) }]);
     assert_eq!(after_restart.len(), walk.keyframes.len() - RESTART, "every keyframe from the restart joins the new frame");
     for sent in &after_restart {
+        assert_eq!(sent.odom_started, CameraNanos(restart_ns), "the correction names the new odom frame");
         let c = sent.correction;
         let position = (Vec3::new(c.x_m, c.y_m, c.z_m) - second.translation).length();
         let heading = wrap_angle(c.yaw_rad - second.yaw_rad).abs().to_degrees();
@@ -192,7 +193,25 @@ fn odometry_before_the_calibration_is_left_out() {
 #[test]
 fn a_calibration_that_moves_the_camera_on_the_imu_stops_the_node() {
     let mut node = odometry_node();
-    node.on_calibration(&calibration_with_camera_at(MOUNT.camera_in_imu_m)).unwrap();
+    node.on_calibration(&calibration_with_camera_at(EXTRINSICS.camera_in_imu_m)).unwrap();
     let moved = node.on_calibration(&calibration_with_camera_at(Vec3::new(0.05, 0.0, 0.0)));
     assert!(matches!(moved, Err(OdometryInputError::CameraMoved { .. })), "{moved:?}");
+}
+
+#[test]
+fn a_calibration_that_turns_the_camera_on_the_imu_stops_the_node() {
+    let mut node = odometry_node();
+    let mut turned = calibration_with_camera_at(EXTRINSICS.camera_in_imu_m);
+    turned.depth_to_imu.rotation = Mat3::from_rotation_y(0.01).to_cols_array();
+    let refused = node.on_calibration(&turned);
+    assert!(matches!(refused, Err(OdometryInputError::CameraMoved { turned_deg, .. }) if turned_deg > 0.5), "{refused:?}");
+}
+
+#[test]
+fn a_calibration_whose_rotation_is_not_a_rotation_stops_the_node() {
+    let mut node = LocalizerNode::new(with_odometry());
+    let mut sheared = calibration_with_camera_at(EXTRINSICS.camera_in_imu_m);
+    sheared.depth_to_imu.rotation = [1.0, 0.0, 0.0, 0.5, 1.0, 0.0, 0.0, 0.0, 1.0];
+    let refused = node.on_calibration(&sheared);
+    assert!(matches!(refused, Err(OdometryInputError::Extrinsics(_))), "{refused:?}");
 }

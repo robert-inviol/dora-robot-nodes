@@ -10,6 +10,7 @@ from enum import Enum
 
 import pyarrow as pa
 
+from .localization import CameraNanos
 from .status import TrackId
 from .wire import one_row, only_row
 
@@ -69,9 +70,13 @@ PEOPLE_TRACKS_TYPE = pa.struct(
         _required("captured_camera_ns", pa.int64()),
         _required("width", pa.uint16()),
         _required("height", pa.uint16()),
+        # "camera" or "odom".
         _required("position_frame", pa.string()),
+        # The odom frame of the positions, named as odom poses name it: set when position_frame is "odom", null
+        # when it is "camera".
+        pa.field("odom_started_camera_ns", pa.int64()),
         # The accelerometer smoothed over half a second, in its own axes (see camera_calibration.depth_to_imu); null once positions are in odom.
-        pa.field("gravity_reaction", _list_of(pa.float32())),
+        pa.field("specific_force", _list_of(pa.float32())),
         _required("tracks", _list_of(PERSON_TRACK_TYPE)),
     ]
 )
@@ -181,11 +186,21 @@ class TrackState(Enum):
     LOST = "lost"
 
 
-class PositionFrame(Enum):
-    # The colour camera: x right, y down, z forward.
-    CAMERA = "camera"
-    # Odometry: origin where the robot started, z up.
-    ODOM = "odom"
+@dataclass(frozen=True)
+class CameraFrame:
+    """The colour camera: x right, y down, z forward."""
+
+
+@dataclass(frozen=True)
+class OdomFrame:
+    """Odometry: origin where the robot started, z up. `odom_started_camera_ns` names the odom frame as odom poses
+    name it, so a receiver knows which map_to_odom correction applies."""
+
+    odom_started_camera_ns: CameraNanos
+
+
+# The frame a people tracks message's positions are in.
+PositionFrame = CameraFrame | OdomFrame
 
 
 @dataclass(frozen=True)
@@ -218,7 +233,7 @@ class PeopleTracks:
     width: int
     height: int
     position_frame: PositionFrame
-    gravity_reaction: tuple[float, float, float] | None
+    specific_force: tuple[float, float, float] | None
     tracks: tuple[PersonTrack, ...]
 
     def to_arrow(self) -> pa.Array:
@@ -229,8 +244,11 @@ class PeopleTracks:
                 "captured_camera_ns": self.captured_camera_ns,
                 "width": self.width,
                 "height": self.height,
-                "position_frame": self.position_frame.value,
-                "gravity_reaction": None if self.gravity_reaction is None else list(self.gravity_reaction),
+                "position_frame": "odom" if isinstance(self.position_frame, OdomFrame) else "camera",
+                "odom_started_camera_ns": (
+                    self.position_frame.odom_started_camera_ns if isinstance(self.position_frame, OdomFrame) else None
+                ),
+                "specific_force": None if self.specific_force is None else list(self.specific_force),
                 "tracks": [
                     {
                         "track_id": track.track_id,
@@ -252,17 +270,17 @@ class PeopleTracks:
     @classmethod
     def from_arrow(cls, array: pa.Array) -> "PeopleTracks":
         row = only_row(array, PEOPLE_TRACKS_TYPE)
-        gravity = row["gravity_reaction"]
+        gravity = row["specific_force"]
         if gravity is not None and len(gravity) != 3:
-            raise ValueError(f"people tracks gravity reaction has {len(gravity)} values, not 3")
+            raise ValueError(f"people tracks specific force has {len(gravity)} values, not 3")
         point = lambda value: None if value is None else Point(**value)
         return cls(
             frame_id=row["frame_id"],
             captured_camera_ns=row["captured_camera_ns"],
             width=row["width"],
             height=row["height"],
-            position_frame=PositionFrame(row["position_frame"]),
-            gravity_reaction=None if gravity is None else tuple(gravity),
+            position_frame=_position_frame(row["position_frame"], row["odom_started_camera_ns"]),
+            specific_force=None if gravity is None else tuple(gravity),
             tracks=tuple(
                 PersonTrack(
                     track_id=TrackId(track["track_id"]),
@@ -278,6 +296,20 @@ class PeopleTracks:
                 for track in row["tracks"]
             ),
         )
+
+
+def _position_frame(name: str, odom_started_camera_ns: int | None) -> PositionFrame:
+    match name, odom_started_camera_ns:
+        case "camera", None:
+            return CameraFrame()
+        case "odom", int(started):
+            return OdomFrame(CameraNanos(started))
+        case "camera", _:
+            raise ValueError("people tracks in the camera frame carry an odom_started_camera_ns")
+        case "odom", None:
+            raise ValueError("people tracks in the odom frame carry no odom_started_camera_ns")
+        case _:
+            raise ValueError(f"people tracks position_frame is {name!r}, not camera or odom")
 
 
 _EXAMPLE_KEYPOINTS = tuple(Keypoint(400.0 + 8.0 * i, 140.0 + 24.0 * i, 0.75 if i % 4 else 0.25) for i in range(17))
@@ -300,8 +332,8 @@ FIXTURE_EXAMPLES: dict[str, PersonPoses | PeopleTracks] = {
         captured_camera_ns=1_762_560_000_100_000_000,
         width=1280,
         height=720,
-        position_frame=PositionFrame.CAMERA,
-        gravity_reaction=(-0.0625, -9.75, -0.375),
+        position_frame=CameraFrame(),
+        specific_force=(-0.0625, -9.75, -0.375),
         tracks=(
             PersonTrack(
                 TrackId(3), TrackState.CONFIRMED, 0.875, PixelBox(400.0, 120.0, 180.0, 520.0), _EXAMPLE_KEYPOINTS,
@@ -318,6 +350,6 @@ FIXTURE_EXAMPLES: dict[str, PersonPoses | PeopleTracks] = {
     ),
     "people_tracks_in_odom": PeopleTracks(
         frame_id=43, captured_camera_ns=1_762_560_000_133_333_333, width=1280, height=720,
-        position_frame=PositionFrame.ODOM, gravity_reaction=None, tracks=(),
+        position_frame=OdomFrame(CameraNanos(1_762_559_990_000_000_000)), specific_force=None, tracks=(),
     ),
 }

@@ -1,7 +1,7 @@
 [package]
 name = "dora-world-agent"
 version = "0.1.0"
-description = "dora node that answers space questions from the world store with several Claude Code models and sends their nav goals"
+description = "dora node that answers spatial queries from the world store with several Claude Code models and sends their nav goals"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

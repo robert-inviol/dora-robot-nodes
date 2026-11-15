@@ -11,7 +11,7 @@ from transformers import Sam3Model, Sam3Processor
 from transformers.modeling_outputs import BaseModelOutputWithPooling
 from transformers.models.sam3.modeling_sam3 import Sam3VisionEncoderOutput
 
-from dora_rig_messages.perception import NO_SEGMENT
+from dora_rig_messages.perception import NO_INSTANCE
 
 MODEL_ID = "facebook/sam3"
 
@@ -58,12 +58,12 @@ class Sam3Segmenter:
         embeds = self.model.get_vision_features(pixel_values=inputs.pixel_values.to(torch.bfloat16))
         return EncodedImage(frame_id, embeds, (image.height, image.width))
 
-    def _text(self, concept: str) -> tuple[object, torch.Tensor]:
-        if concept not in self._text_features:
-            tokens = self.processor(text=concept, return_tensors="pt").to(self.device)
+    def _text(self, label: str) -> tuple[object, torch.Tensor]:
+        if label not in self._text_features:
+            tokens = self.processor(text=label, return_tensors="pt").to(self.device)
             features = self.model.get_text_features(input_ids=tokens.input_ids, attention_mask=tokens.attention_mask, return_dict=True)
-            self._text_features[concept] = (features, tokens.attention_mask)
-        return self._text_features[concept]
+            self._text_features[label] = (features, tokens.attention_mask)
+        return self._text_features[label]
 
     @staticmethod
     def _repeated(embeds: Sam3VisionEncoderOutput, count: int) -> Sam3VisionEncoderOutput:
@@ -76,9 +76,9 @@ class Sam3Segmenter:
         )
 
     @torch.inference_mode()
-    def search(self, image: EncodedImage, concepts: list[str]) -> list[str]:
-        """Searches for each concept not yet searched for in this image; returns the ones it searched for."""
-        new = [c for c in concepts if c not in image.found]
+    def search(self, image: EncodedImage, labels: list[str]) -> list[str]:
+        """Searches for each label not yet searched for in this image; returns the ones it searched for."""
+        new = [c for c in labels if c not in image.found]
         for start in range(0, len(new), self.settings.batch_size):
             batch = new[start : start + self.settings.batch_size]
             texts = [self._text(c) for c in batch]
@@ -94,19 +94,19 @@ class Sam3Segmenter:
                 mask_threshold=self.settings.mask_threshold,
                 target_sizes=[image.size_hw] * len(batch),
             )
-            for concept, result in zip(batch, results):
-                image.found[concept] = [
-                    Detection(concept, float(score), mask.bool()) for score, mask in zip(result["scores"], result["masks"])
+            for label, result in zip(batch, results):
+                image.found[label] = [
+                    Detection(label, float(score), mask.bool()) for score, mask in zip(result["scores"], result["masks"])
                 ]
         return new
 
     @torch.inference_mode()
-    def segment_ids(self, image: EncodedImage) -> tuple[list[str], list[float], np.ndarray]:
-        """Every detection so far as one segment map: duplicates dropped, smaller masks painted over larger ones."""
+    def instance_ids(self, image: EncodedImage) -> tuple[list[str], list[float], np.ndarray]:
+        """Every detection so far as one set of instance masks: duplicates dropped, smaller masks painted over larger ones."""
         detections = sorted((d for found in image.found.values() for d in found), key=lambda d: -d.score)
         height, width = image.size_hw
         if not detections:
-            return [], [], np.full((height, width), NO_SEGMENT, np.int16)
+            return [], [], np.full((height, width), NO_INSTANCE, np.int16)
         masks = torch.stack([d.mask for d in detections]).reshape(len(detections), -1)
         flat = masks.to(torch.float16)
         areas = flat.sum(dim=1)
@@ -116,7 +116,7 @@ class Sam3Segmenter:
         for index in range(len(detections)):
             if areas[index] > 0 and all(iou[index, k] < self.settings.duplicate_iou for k in kept):
                 kept.append(index)
-        ids = torch.full((height * width,), NO_SEGMENT, dtype=torch.int16, device=masks.device)
+        ids = torch.full((height * width,), NO_INSTANCE, dtype=torch.int16, device=masks.device)
         for position in sorted(range(len(kept)), key=lambda p: -float(areas[kept[p]])):
             ids[masks[kept[position]]] = position
         return (

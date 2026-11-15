@@ -1,0 +1,12 @@
+[package]
+name = "dora-odometry-input-recorder"
+version = "0.1.0"
+description = "dora node that records what the odometry node takes (depth frames, imu messages, calibrations, person poses) for replaying offline"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+dora-depth-inertial-odometry = { path = "../dora-depth-inertial-odometry" }
+dora-node-api.workspace = true
+eyre.workspace = true

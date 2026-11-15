@@ -11,18 +11,18 @@ seen in them.
 
 | Input | What it carries |
 |---|---|
-| `space_question` | A question from another agent or a person (`dora-rig-messages` navigation) |
+| `spatial_query` | A question from another agent or a person (`dora-rig-messages` navigation) |
 | `goal_status` | The robot's report on a goal: it shows in the next digest and is recorded in the world store |
 | `topology` | Rooms, doorways, places and their graph (space_map); the room namer then looks at the rooms again |
-| `free_space` | The clearance grid (space_map), for clearances between places |
+| `occupancy_grid` | The clearance grid (space_map), for clearances between places |
 | `object_update` | An object appeared, updated, moved, disappeared or merged (objects) |
-| `keyframe_pose` | The robot's map pose (localization); a pose taken while the localizer is lost is not recorded, so the robot pose goes stale in the digest |
+| `keyframe_pose` | The robot's map pose (localization); a `lost` or `restarted` pose is dead reckoning and is not recorded, so the robot pose goes stale in the digest |
 | `map_to_odom` | The localizer's correction from odometry to the map (localization), which places people tracks |
-| `people_tracks` | The people tracker's confirmed people with their 17 joints (people). Only odometry-frame tracks are placed, once a `map_to_odom` has arrived; a person is recorded at most every 0.25 s, timed by when the frame arrived. Camera-frame tracks are not placed, so people tracking goes stale in the digest |
+| `people_tracks` | The people tracker's confirmed people with their 17 joints (people). Only odometry-frame tracks are transformed into the map frame, with a `map_to_odom` made in the odom frame the tracks name; a person is recorded at most every 0.25 s, timed by when the frame arrived. Camera-frame tracks are not placed, so people tracking goes stale in the digest |
 
 | Output | What it carries |
 |---|---|
-| `space_answer` | Revision 0 from the fast model at once, then each revision; the last has `is_final`. `references` places every object, place, people track and room the answer names, and its goal's target |
+| `spatial_answer` | Revision 0 from the fast model at once, then each revision; the last has `is_final`. `references` places every object, place, people track and room the answer names, and its goal's target |
 | `nav_goal` | The fast model's goals at once, and a stop and the new goal when a revision changes the goal. Every goal sent is recorded in the world store with the agent and model that sent it |
 
 A failure is always an answer: a failed model, a reconciler that fails or replies with something that is not a
@@ -38,16 +38,16 @@ input that does not decode stops the node.
   env:
     SPATIAL_AGENT_CONFIG: world-agent/spatial-agent.example.toml
   inputs:
-    space_question: planner/space_question
+    spatial_query: planner/spatial_query
     goal_status: navigator/goal_status
     topology: dense_map/topology
-    free_space: dense_map/free_space
+    occupancy_grid: dense_map/occupancy_grid
     object_update: objects/object_update
     keyframe_pose: localizer/keyframe_pose
     map_to_odom: localizer/map_to_odom
     people_tracks: people/people_tracks
   outputs:
-    - space_answer
+    - spatial_answer
     - nav_goal
 ```
 

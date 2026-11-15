@@ -187,7 +187,7 @@ impl EntityRef {
 
 /// When a fact was true and which map it belongs to; every answer carries one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Stamp {
+pub struct Timestamp {
     pub as_of: UnixNanos,
     pub map_version: MapVersion,
 }
@@ -213,7 +213,8 @@ pub struct PersonTrack {
     pub position: Point,
     /// The direction they walk in, or face when standing; absent when neither is known.
     pub heading_deg: Option<f32>,
-    pub speed_m_s: f32,
+    /// How fast they move across the floor; absent when the people tracker had not measured it.
+    pub speed_m_s: Option<f32>,
     pub last_seen: UnixNanos,
     pub liveness: TrackLiveness,
 }
@@ -287,7 +288,7 @@ pub struct StaleSource {
 /// Everything the per-turn digest is made from.
 #[derive(Clone, Debug, PartialEq)]
 pub struct WorldSnapshot {
-    pub stamp: Stamp,
+    pub stamp: Timestamp,
     /// When the map the objects come from was last fused.
     pub map_fused: UnixNanos,
     pub robot: RobotState,
@@ -331,7 +332,7 @@ pub struct Relation {
 
 /// Where an object stood over one interval; `until` is None while it still stands there.
 #[derive(Clone, Debug, PartialEq, Serialize)]
-pub struct Placement {
+pub struct LocationInterval {
     pub room: RoomName,
     pub position: Point,
     #[serde(serialize_with = "serialize_unix_nanos")]
@@ -354,7 +355,7 @@ pub struct ObjectDescription {
     pub summary: ObjectSummary,
     pub caption: Option<String>,
     pub relations: Vec<Relation>,
-    pub history: Vec<Placement>,
+    pub history: Vec<LocationInterval>,
     /// The best views of the object, cropped from keyframes.
     pub views: Vec<PngImage>,
 }
@@ -379,7 +380,7 @@ pub struct Route {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
-pub struct Sighting {
+pub struct Observation {
     pub subject: String,
     pub room: RoomName,
     pub position: Point,
@@ -389,9 +390,30 @@ pub struct Sighting {
     pub heading_deg: Option<f32>,
     /// Doorways ahead in the direction of travel, nearest first.
     pub exits_ahead: Vec<String>,
-    /// For a person, every joint placed when they were last seen; empty for anything else.
+    /// For a person, every fitted joint when they were last seen; empty for anything else.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub joints: Vec<JointPosition>,
+    /// For a person, how fast they moved when last seen; absent for anything else.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speed: Option<PersonSpeed>,
+}
+
+/// How fast a person moved across the floor when last seen.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PersonSpeed {
+    Measured { m_s: f32 },
+    /// The people tracker had not measured how fast they moved.
+    Unknown,
+}
+
+impl From<Option<f32>> for PersonSpeed {
+    fn from(speed_m_s: Option<f32>) -> PersonSpeed {
+        match speed_m_s {
+            Some(m_s) => PersonSpeed::Measured { m_s },
+            None => PersonSpeed::Unknown,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -492,7 +514,7 @@ pub enum WorldError {
     Unsupported(&'static str),
     #[error("the world model has no {0} yet")]
     NotMapped(&'static str),
-    #[error("the free-space map has no data at ({:.2}, {:.2})", .0.x_m, .0.y_m)]
+    #[error("the occupancy grid has no data at ({:.2}, {:.2})", .0.x_m, .0.y_m)]
     Unmapped(Point),
     #[error("the query failed: {0}")]
     BadQuery(String),
@@ -507,7 +529,7 @@ pub enum WorldError {
 pub trait WorldModel: Send + Sync + 'static {
     fn snapshot(&self) -> impl Future<Output = Result<WorldSnapshot, WorldError>> + Send;
 
-    fn stamp(&self) -> impl Future<Output = Result<Stamp, WorldError>> + Send;
+    fn stamp(&self) -> impl Future<Output = Result<Timestamp, WorldError>> + Send;
 
     fn find(&self, query: FindQuery) -> impl Future<Output = Result<Vec<FoundObject>, WorldError>> + Send;
 
@@ -517,7 +539,7 @@ pub trait WorldModel: Send + Sync + 'static {
 
     fn route(&self, from: Landmark, to: Landmark) -> impl Future<Output = Result<Route, WorldError>> + Send;
 
-    fn last_seen(&self, subject: EntityRef) -> impl Future<Output = Result<Sighting, WorldError>> + Send;
+    fn last_seen(&self, subject: EntityRef) -> impl Future<Output = Result<Observation, WorldError>> + Send;
 
     fn changes_since(
         &self,

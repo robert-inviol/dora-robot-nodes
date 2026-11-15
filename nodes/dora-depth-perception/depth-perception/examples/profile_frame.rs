@@ -1,8 +1,8 @@
 //! Times every stage on a recorded frame and prints what it found.
 //!
 //! Usage: cargo run --release --example profile_frame -- <frame dir> [repeats]
-//! A frame dir holds frame.txt ("width height fx fy ppx ppy accel_x accel_y accel_z segment_count"),
-//! depth_m.f32 (little-endian, row major) and segment_ids.i16 (-1 where no segment).
+//! A frame dir holds frame.txt ("width height fx fy ppx ppy accel_x accel_y accel_z instance_count"),
+//! depth_m.f32 (little-endian, row major) and instance_ids.i16 (-1 where no segment).
 
 use std::time::{Duration, Instant};
 use std::{env, fs, path::Path};
@@ -37,13 +37,13 @@ fn main() {
     let (width, height) = (fields[0] as usize, fields[1] as usize);
     let intrinsics = CameraIntrinsics { fx: fields[2] as f32, fy: fields[3] as f32, ppx: fields[4] as f32, ppy: fields[5] as f32 };
     let accel = Vec3::new(fields[6] as f32, fields[7] as f32, fields[8] as f32);
-    let segment_count = fields[9] as usize;
+    let instance_count = fields[9] as usize;
     let depth_m = read_le(&dir.join("depth_m.f32"), f32::from_le_bytes);
-    let segment_ids = read_le(&dir.join("segment_ids.i16"), i16::from_le_bytes);
+    let instance_ids = read_le(&dir.join("instance_ids.i16"), i16::from_le_bytes);
     let depth = DepthImage::new(width, height, &depth_m);
-    let masks: Vec<Vec<bool>> = (0..segment_count).map(|s| segment_ids.iter().map(|&id| id == s as i16).collect()).collect();
+    let masks: Vec<Vec<bool>> = (0..instance_count).map(|s| instance_ids.iter().map(|&id| id == s as i16).collect()).collect();
 
-    let floor = FloorFrame::from_gravity_reaction(accel);
+    let floor = FloorFrame::from_specific_force(accel);
     let (t_cloud, cloud) = median_time(repeats, || sample_point_cloud(&depth, &intrinsics, &floor, RangeLimits::D455, 2));
     let (t_planes, fit) = median_time(repeats, || find_planes(&cloud.points, &PlaneSettings::default()));
     let (t_room, room) = median_time(repeats, || infer_room(&fit.planes, &cloud.points, &RoomSettings::default()));
@@ -54,8 +54,8 @@ fn main() {
     let (t_serial, _) = median_time(repeats, || masks.iter().map(footprint).collect::<Vec<_>>());
     let (t_parallel, footprints) = median_time(repeats, || masks.par_iter().map(footprint).collect::<Vec<_>>());
 
-    println!("{}: {} points, {} planes, {} segments ({} with footprints)",
-        dir.display(), cloud.points.len(), fit.planes.len(), segment_count, footprints.iter().flatten().count());
+    println!("{}: {} points, {} planes, {} instance_masks ({} with footprints)",
+        dir.display(), cloud.points.len(), fit.planes.len(), instance_count, footprints.iter().flatten().count());
     println!("  point cloud        {:>8.2} ms", t_cloud.as_secs_f64() * 1e3);
     println!("  planes             {:>8.2} ms", t_planes.as_secs_f64() * 1e3);
     println!("  room               {:>8.2} ms", t_room.as_secs_f64() * 1e3);

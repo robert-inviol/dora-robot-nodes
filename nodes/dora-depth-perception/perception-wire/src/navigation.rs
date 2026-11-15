@@ -517,7 +517,7 @@ impl fmt::Display for RoomId {
 pub struct Asker(pub String);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SpaceQuestion {
+pub struct SpatialQuery {
     pub question_id: QuestionId,
     pub asked: UnixNanos,
     pub asker: Asker,
@@ -609,7 +609,7 @@ pub struct Reference {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct SpaceAnswer {
+pub struct SpatialAnswer {
     pub question_id: QuestionId,
     pub revision: Revision,
     /// Set on the last message for the question.
@@ -622,7 +622,7 @@ pub struct SpaceAnswer {
     pub goal_id: Option<GoalId>,
 }
 
-pub fn space_question_fields() -> Fields {
+pub fn spatial_query_fields() -> Fields {
     Fields::from(vec![
         field("question_id", DataType::UInt64),
         field("asked_unix_ns", DataType::Int64),
@@ -644,7 +644,7 @@ fn reference_item() -> Arc<Field> {
     Arc::new(Field::new("item", DataType::Struct(reference_fields()), false))
 }
 
-pub fn space_answer_fields() -> Fields {
+pub fn spatial_answer_fields() -> Fields {
     Fields::from(vec![
         field("question_id", DataType::UInt64),
         field("revision", DataType::UInt32),
@@ -660,9 +660,9 @@ fn required_str(row: &StructArray, name: &'static str) -> Result<String, WireErr
     required(optional_str(row, name), name).map(str::to_owned)
 }
 
-pub fn decode_space_question(array: &dyn Array) -> Result<SpaceQuestion, WireError> {
-    let row = checked(array, space_question_fields(), "space question")?;
-    Ok(SpaceQuestion {
+pub fn decode_spatial_query(array: &dyn Array) -> Result<SpatialQuery, WireError> {
+    let row = checked(array, spatial_query_fields(), "spatial query")?;
+    Ok(SpatialQuery {
         question_id: QuestionId(required(optional_u64(row, "question_id"), "question_id")?),
         asked: UnixNanos(required(optional_i64(row, "asked_unix_ns"), "asked_unix_ns")?),
         asker: Asker(required_str(row, "asker")?),
@@ -670,14 +670,14 @@ pub fn decode_space_question(array: &dyn Array) -> Result<SpaceQuestion, WireErr
     })
 }
 
-pub fn encode_space_question(question: &SpaceQuestion) -> StructArray {
+pub fn encode_spatial_query(question: &SpatialQuery) -> StructArray {
     let columns: Vec<ArrayRef> = vec![
         Arc::new(UInt64Array::from(vec![question.question_id.0])),
         Arc::new(Int64Array::from(vec![question.asked.0])),
         Arc::new(StringArray::from(vec![question.asker.0.as_str()])),
         Arc::new(StringArray::from(vec![question.text.as_str()])),
     ];
-    StructArray::new(space_question_fields(), columns, None)
+    StructArray::new(spatial_query_fields(), columns, None)
 }
 
 fn decode_references(row: &StructArray) -> Result<Vec<Reference>, WireError> {
@@ -702,11 +702,11 @@ fn decode_references(row: &StructArray) -> Result<Vec<Reference>, WireError> {
         .collect()
 }
 
-pub fn decode_space_answer(array: &dyn Array) -> Result<SpaceAnswer, WireError> {
-    let row = checked(array, space_answer_fields(), "space answer")?;
+pub fn decode_spatial_answer(array: &dyn Array) -> Result<SpatialAnswer, WireError> {
+    let row = checked(array, spatial_answer_fields(), "spatial answer")?;
     let revision = column(row, "revision").as_primitive::<UInt32Type>();
     let is_final = column(row, "is_final").as_boolean();
-    Ok(SpaceAnswer {
+    Ok(SpatialAnswer {
         question_id: QuestionId(required(optional_u64(row, "question_id"), "question_id")?),
         revision: Revision(required(revision.is_valid(0).then(|| revision.value(0)), "revision")?),
         is_final: required(is_final.is_valid(0).then(|| is_final.value(0)), "is_final")?,
@@ -728,7 +728,7 @@ fn references_column(references: &[Reference]) -> ArrayRef {
     Arc::new(ListArray::new(reference_item(), OffsetBuffer::from_lengths([references.len()]), Arc::new(items), None))
 }
 
-pub fn encode_space_answer(answer: &SpaceAnswer) -> StructArray {
+pub fn encode_spatial_answer(answer: &SpatialAnswer) -> StructArray {
     let columns: Vec<ArrayRef> = vec![
         Arc::new(UInt64Array::from(vec![answer.question_id.0])),
         Arc::new(UInt32Array::from(vec![answer.revision.0])),
@@ -738,7 +738,7 @@ pub fn encode_space_answer(answer: &SpaceAnswer) -> StructArray {
         references_column(&answer.references),
         Arc::new(UInt64Array::from(vec![answer.goal_id.map(|g| g.0)])),
     ];
-    StructArray::new(space_answer_fields(), columns, None)
+    StructArray::new(spatial_answer_fields(), columns, None)
 }
 
 #[cfg(test)]
@@ -860,28 +860,28 @@ mod tests {
     }
 
     #[test]
-    fn the_space_question_fixture_decodes_and_encodes_back_to_itself() {
-        let golden = fixture("space_question");
-        let question = decode_space_question(&golden).unwrap();
+    fn the_spatial_query_fixture_decodes_and_encodes_back_to_itself() {
+        let golden = fixture("spatial_query");
+        let question = decode_spatial_query(&golden).unwrap();
         assert_eq!(
             question,
-            SpaceQuestion {
+            SpatialQuery {
                 question_id: QuestionId(31),
                 asked: UnixNanos(1_762_560_000_250_000_000),
                 asker: Asker("planner".to_owned()),
                 text: "Where is my blue mug?".to_owned(),
             }
         );
-        assert_eq!(encode_space_question(&question), golden);
+        assert_eq!(encode_spatial_query(&question), golden);
     }
 
     #[test]
-    fn the_first_space_answer_fixture_decodes_and_encodes_back_to_itself() {
-        let golden = fixture("space_answer_first");
-        let answer = decode_space_answer(&golden).unwrap();
+    fn the_first_spatial_answer_fixture_decodes_and_encodes_back_to_itself() {
+        let golden = fixture("spatial_answer_first");
+        let answer = decode_spatial_answer(&golden).unwrap();
         assert_eq!(
             answer,
-            SpaceAnswer {
+            SpatialAnswer {
                 question_id: QuestionId(31),
                 revision: Revision::FIRST,
                 is_final: false,
@@ -894,13 +894,13 @@ mod tests {
                 goal_id: Some(GoalId(17)),
             }
         );
-        assert_eq!(encode_space_answer(&answer), golden);
+        assert_eq!(encode_spatial_answer(&answer), golden);
     }
 
     #[test]
-    fn the_final_space_answer_fixture_carries_a_room_a_pose_and_no_goal() {
-        let golden = fixture("space_answer_final");
-        let answer = decode_space_answer(&golden).unwrap();
+    fn the_final_spatial_answer_fixture_carries_a_room_a_pose_and_no_goal() {
+        let golden = fixture("spatial_answer_final");
+        let answer = decode_spatial_answer(&golden).unwrap();
         assert_eq!((answer.revision, answer.is_final, answer.goal_id), (Revision(2), true, None));
         assert_eq!(
             answer.references,
@@ -909,12 +909,12 @@ mod tests {
                 Reference { referent: Referent::Pose, x_m: 0.75, y_m: 2.5 },
             ]
         );
-        assert_eq!(encode_space_answer(&answer), golden);
+        assert_eq!(encode_spatial_answer(&answer), golden);
     }
 
     #[test]
     fn an_answer_without_references_survives_the_trip() {
-        let answer = SpaceAnswer {
+        let answer = SpatialAnswer {
             question_id: QuestionId(1),
             revision: Revision::FIRST.next(),
             is_final: true,
@@ -923,7 +923,7 @@ mod tests {
             references: Vec::new(),
             goal_id: None,
         };
-        assert_eq!(decode_space_answer(&encode_space_answer(&answer)).unwrap(), answer);
+        assert_eq!(decode_spatial_answer(&encode_spatial_answer(&answer)).unwrap(), answer);
     }
 
     #[test]
@@ -934,8 +934,8 @@ mod tests {
     }
 
     #[test]
-    fn a_space_answer_of_another_wire_type_is_rejected() {
-        let error = decode_space_answer(&fixture("space_question")).unwrap_err();
-        assert!(matches!(error, WireError::WrongType { message: "space answer", .. }), "{error}");
+    fn a_spatial_answer_of_another_wire_type_is_rejected() {
+        let error = decode_spatial_answer(&fixture("spatial_query")).unwrap_err();
+        assert!(matches!(error, WireError::WrongType { message: "spatial answer", .. }), "{error}");
     }
 }

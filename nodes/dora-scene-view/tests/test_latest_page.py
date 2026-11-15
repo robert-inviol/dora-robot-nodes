@@ -1,6 +1,6 @@
 import numpy as np
 
-from dora_rig_messages.perception import CameraIntrinsics, Keyframe, Scene, Segments
+from dora_rig_messages.perception import CameraIntrinsics, Keyframe, Scene, InstanceMasks
 from dora_scene_view.node import LatestPage
 
 JPEG_1X1 = bytes.fromhex(
@@ -12,16 +12,16 @@ def keyframe(frame_id: int) -> Keyframe:
     return Keyframe(frame_id, 0, CameraIntrinsics(1.0, 1.0, 0.5, 0.5), (0.0, -9.8, 0.0), np.full((1, 1), 1000, np.uint16), JPEG_1X1)
 
 
-def test_the_page_draws_the_frame_its_segments_belong_to_not_the_newest_keyframe():
+def test_the_page_draws_the_frame_its_instance_masks_belong_to_not_the_newest_keyframe():
     page = LatestPage()
     for frame_id in range(4):
         page.add_keyframe(keyframe(frame_id))
-    page.add_segments(Segments(1, ("sofa",), (0.9,), np.zeros((1, 1), np.int16)))
+    page.add_instance_masks(InstanceMasks(1, ("sofa",), (0.9,), np.zeros((1, 1), np.int16)))
 
     assert '"name": "frame 1"' in page.html()
 
 
-def test_before_any_segments_the_newest_keyframe_is_drawn():
+def test_before_any_instance_masks_the_newest_keyframe_is_drawn():
     page = LatestPage()
     page.add_keyframe(keyframe(0))
     page.add_keyframe(keyframe(1))
@@ -29,7 +29,7 @@ def test_before_any_segments_the_newest_keyframe_is_drawn():
     assert '"name": "frame 1"' in page.html()
 
 
-def test_a_structure_scene_does_not_replace_a_scene_with_objects():
+def test_a_room_layout_scene_does_not_replace_a_scene_with_objects():
     page = LatestPage()
     page.add_keyframe(keyframe(0))
     full = Scene(0, 0, (0.0, 1.0, 0.0), (0.0, 0.0, 1.0), (), None, "no floor", ())

@@ -14,7 +14,7 @@ use dora_node_api::dora_core::config::DataId;
 use dora_node_api::{DoraNode, Event, MetadataParameters, Parameter};
 use eyre::{bail, Result};
 use map_localizer::HeadingWithoutGyro;
-use perception_wire::localization::{encode_keyframe_pose, encode_keyframe_poses_moved, encode_map_to_odom};
+use perception_wire::localization::{encode_keyframe_pose, encode_pose_graph_update, encode_map_to_odom};
 use perception_wire::camera::decode_camera_calibration;
 use perception_wire::odometry::decode_odom_pose;
 use perception_wire::{decode_imu, decode_keyframe, MessageContext};
@@ -27,12 +27,12 @@ const ODOM_POSE_INPUT: &str = "odom_pose";
 const CALIBRATION_INPUT: &str = "calibration";
 const KEYFRAME_POSE_OUTPUT: &str = "keyframe_pose";
 const MAP_TO_ODOM_OUTPUT: &str = "map_to_odom";
-const KEYFRAME_POSES_MOVED_OUTPUT: &str = "keyframe_poses_moved";
+const KEYFRAME_POSES_MOVED_OUTPUT: &str = "pose_graph_update";
 
 struct Outputs {
     keyframe_pose: DataId,
     map_to_odom: DataId,
-    keyframe_poses_moved: DataId,
+    pose_graph_update: DataId,
 }
 
 fn settings() -> Result<NodeSettings> {
@@ -43,13 +43,13 @@ fn settings() -> Result<NodeSettings> {
 }
 
 fn log_gyro_gap(gap: &GyroGap) {
-    let (frame_id, problem) = (gap.frame_id.0, &gap.problem);
+    let (frame_id, problem, gyro_gaps) = (gap.frame_id.0, &gap.problem, gap.count);
     match gap.handled_by {
         HeadingWithoutGyro::Refuse => {
-            tracing::error!(frame_id, %problem, "keyframe lost: the gyro cannot give its turn and heading_without_gyro is refuse")
+            tracing::error!(frame_id, %problem, gyro_gaps, "keyframe lost: the gyro cannot give its turn and heading_without_gyro is refuse")
         }
         HeadingWithoutGyro::Search => {
-            tracing::warn!(frame_id, %problem, "the gyro cannot give this keyframe's turn; searching every heading (heading_without_gyro is search)")
+            tracing::warn!(frame_id, %problem, gyro_gaps, "the gyro cannot give this keyframe's turn; searching every heading (heading_without_gyro is search)")
         }
     }
 }
@@ -82,21 +82,22 @@ fn send(node: &mut DoraNode, outputs: &Outputs, handled: Handled, started: Insta
         tracing::info!(
             frame_id = estimate.frame_id.0,
             tracking = estimate.tracking.wire_name(),
+            selection = ?estimate.selection,
             ?fitness,
             ?inlier_rmse_m,
             x_m = estimate.pose.translation.x,
             y_m = estimate.pose.translation.y,
             yaw_deg = estimate.pose.yaw_rad.to_degrees(),
             submap = estimate.submap.len(),
-            "keyframe localised"
+            "keyframe localized"
         );
         let mut parameters = MetadataParameters::default();
         parameters.insert("localize_ms".to_owned(), Parameter::Float(started.elapsed().as_secs_f64() * 1e3));
         node.send_output(outputs.keyframe_pose.clone(), parameters, encode_keyframe_pose(&estimate.to_message()))?;
     }
     if let Some(moved) = handled.moved {
-        tracing::info!(map_version = moved.map_version.0, keyframes = moved.keyframes.len(), "optimisation moved keyframes already sent");
-        node.send_output(outputs.keyframe_poses_moved.clone(), MetadataParameters::default(), encode_keyframe_poses_moved(&moved))?;
+        tracing::info!(map_version = moved.map_version.0, keyframes = moved.keyframes.len(), "optimization moved keyframes already sent");
+        node.send_output(outputs.pose_graph_update.clone(), MetadataParameters::default(), encode_pose_graph_update(&moved))?;
     }
     if let Some(correction) = handled.map_to_odom {
         node.send_output(outputs.map_to_odom.clone(), MetadataParameters::default(), encode_map_to_odom(&correction))?;
@@ -118,7 +119,7 @@ fn main() -> Result<()> {
     let mut localizer = LocalizerNode::new(settings);
     let (mut node, mut events) = DoraNode::init_from_env()?;
     let outputs = Outputs { keyframe_pose: DataId::from(KEYFRAME_POSE_OUTPUT.to_owned()), map_to_odom: DataId::from(MAP_TO_ODOM_OUTPUT.to_owned()),
-        keyframe_poses_moved: DataId::from(KEYFRAME_POSES_MOVED_OUTPUT.to_owned()),
+        pose_graph_update: DataId::from(KEYFRAME_POSES_MOVED_OUTPUT.to_owned()),
     };
     while let Some(event) = events.recv() {
         match event {
@@ -129,7 +130,7 @@ fn main() -> Result<()> {
                     IMU_INPUT if localizer.imu_stream() == ImuStream::Absent => {
                         bail!("an {IMU_INPUT} message arrived but the settings say imu = \"absent\"")
                     }
-                    IMU_INPUT => localizer.on_imu(&decode_imu(data.as_ref()).for_message(IMU_INPUT)?),
+                    IMU_INPUT => localizer.on_imu(&decode_imu(data.as_ref()).for_message(IMU_INPUT)?)?,
                     CALIBRATION_INPUT => {
                         localizer.on_calibration(&decode_camera_calibration(data.as_ref()).for_message(CALIBRATION_INPUT)?)?;
                         continue;

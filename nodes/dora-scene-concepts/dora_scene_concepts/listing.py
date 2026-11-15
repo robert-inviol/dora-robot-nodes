@@ -23,7 +23,7 @@ REQUEST_TIMEOUT_S = 60
 MAX_REPLY_TOKENS = 1000
 
 
-class ConceptLines:
+class LabelLines:
     """Collects streamed text and yields each finished, normalised, not-yet-seen line."""
 
     def __init__(self) -> None:
@@ -40,16 +40,16 @@ class ConceptLines:
         return [c for c in [self._normalise(last)] if c]
 
     def _normalise(self, line: str) -> str | None:
-        concept = line.strip().strip("-*\u2022").strip().lower()
-        if not concept or concept in self._seen:
+        label = line.strip().strip("-*\u2022").strip().lower()
+        if not label or label in self._seen:
             return None
-        self._seen.add(concept)
-        return concept
+        self._seen.add(label)
+        return label
 
 
-def stream_concepts(client: anthropic.Anthropic, model: str, color_jpeg: bytes) -> Iterator[str]:
+def stream_labels(client: anthropic.Anthropic, model: str, color_jpeg: bytes) -> Iterator[str]:
     image = {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": base64.standard_b64encode(color_jpeg).decode()}}
-    lines = ConceptLines()
+    lines = LabelLines()
     with client.messages.stream(
         model=model,
         max_tokens=MAX_REPLY_TOKENS,
@@ -61,13 +61,13 @@ def stream_concepts(client: anthropic.Anthropic, model: str, color_jpeg: bytes) 
             yield from lines.feed(text)
         final = stream.get_final_message()
     if final.stop_reason != "end_turn":
-        raise RuntimeError(f"{model} stopped listing concepts early: stop_reason={final.stop_reason}")
+        raise RuntimeError(f"{model} stopped listing labels early: stop_reason={final.stop_reason}")
     yield from lines.finish()
 
 
-def stream_concepts_with_claude_cli(model: str, color_jpeg: bytes) -> Iterator[str]:
+def stream_labels_with_claude_cli(model: str, color_jpeg: bytes) -> Iterator[str]:
     """The same request through the signed-in Claude Code CLI, which reads the image from a file."""
-    lines = ConceptLines()
+    lines = LabelLines()
     with tempfile.TemporaryDirectory() as scratch:
         image_path = Path(scratch) / "keyframe.jpg"
         image_path.write_bytes(color_jpeg)
@@ -89,5 +89,5 @@ def stream_concepts_with_claude_cli(model: str, color_jpeg: bytes) -> Iterator[s
                     outcome = event
             process.wait(timeout=REQUEST_TIMEOUT_S)
     if process.returncode != 0 or outcome is None or outcome.get("is_error"):
-        raise RuntimeError(f"claude CLI did not list concepts: exit {process.returncode}, {str(outcome)[:300]}")
+        raise RuntimeError(f"claude CLI did not list labels: exit {process.returncode}, {str(outcome)[:300]}")
     yield from lines.finish()

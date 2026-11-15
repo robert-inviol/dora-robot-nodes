@@ -22,20 +22,63 @@ pub use crate::navigation::RoomId;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct DoorwayId(pub u64);
 
+/// The number of a mesh_blocks message within one run of the dense map: 0 first, one up per message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct MeshSequence(pub u64);
+
+impl MeshSequence {
+    pub fn next(self) -> MeshSequence {
+        MeshSequence(self.0 + 1)
+    }
+}
+
+impl fmt::Display for MeshSequence {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// What a mesh_blocks message holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum MeshBlocksKind {
+    /// The blocks whose surface changed since the last message, each with its whole new surface; a mesh block without
+    /// triangles says its block has no surface now.
+    Changes,
+    /// Every block that has surface, each with its whole surface: it replaces every block the receiver holds.
+    Snapshot,
+}
+
+impl MeshBlocksKind {
+    pub fn wire_name(self) -> &'static str {
+        match self {
+            MeshBlocksKind::Changes => "changes",
+            MeshBlocksKind::Snapshot => "snapshot",
+        }
+    }
+
+    fn from_wire_name(name: &str) -> Result<MeshBlocksKind, SpaceMapError> {
+        match name {
+            "changes" => Ok(MeshBlocksKind::Changes),
+            "snapshot" => Ok(MeshBlocksKind::Snapshot),
+            other => Err(SpaceMapError::UnknownMeshBlocksKind(other.to_owned())),
+        }
+    }
+}
+
 impl fmt::Display for DoorwayId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "d{}", self.0)
     }
 }
 
-/// The height band above the floor that a free-space cell describes.
+/// The height band above the floor that a occupancy grid cell describes.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct HeightBand {
     pub min_m: f32,
     pub max_m: f32,
 }
 
-/// What the free-space grid says about one cell.
+/// What the occupancy grid says about one cell.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Clearance {
     Occupied,
@@ -69,7 +112,7 @@ impl Clearance {
 
 /// Which floor cells the robot can occupy, sliced through a height band above the floor.
 #[derive(Clone, Debug, PartialEq)]
-pub struct FreeSpace {
+pub struct OccupancyGrid {
     pub map_version: MapVersion,
     pub built: UnixNanos,
     /// The outer corner of cell (row 0, column 0); columns run along x, rows along y.
@@ -82,7 +125,7 @@ pub struct FreeSpace {
     pub clearance_mm: Vec<u16>,
 }
 
-impl FreeSpace {
+impl OccupancyGrid {
     pub fn cell(&self, column: u32, row: u32) -> Clearance {
         Clearance::from_wire(self.clearance_mm[(row * self.width + column) as usize])
     }
@@ -158,9 +201,9 @@ pub struct KeepOut {
     pub zones: Vec<KeepOutZone>,
 }
 
-/// The dense map's surface inside one block; a patch without triangles says the block has no surface now.
+/// The dense map's surface inside one block; a mesh block without triangles says the block has no surface now.
 #[derive(Clone, Debug, PartialEq)]
-pub struct SurfacePatch {
+pub struct MeshBlock {
     /// Block (x, y, z) spans `[x, x + 1) * block_voxels * voxel_m` along x, and likewise along y and z.
     pub block: IVec3,
     pub positions_m: Vec<Vec3>,
@@ -168,14 +211,30 @@ pub struct SurfacePatch {
     pub triangles: Vec<[u32; 3]>,
 }
 
-/// The blocks of the dense map whose surface changed since the last message, each with its whole new surface.
+/// The dense map's surface, block by block: the blocks whose surface changed since the last message, or, in a
+/// snapshot, every block that has surface, replacing every block the receiver holds.
+///
+/// The messages of one run of the dense map share `run_started` and number from `sequence` 0 up by one, snapshots
+/// included, so a receiver that sees a gap in the sequence knows it missed blocks.
 #[derive(Clone, Debug, PartialEq)]
-pub struct SurfacePatches {
+pub struct MeshBlocks {
     pub map_version: MapVersion,
     pub built: UnixNanos,
+    /// When the dense map that sent the message started: a later value is a new run whose blocks replace every
+    /// block of the last.
+    pub run_started: UnixNanos,
+    pub sequence: MeshSequence,
+    pub kind: MeshBlocksKind,
     pub voxel_m: f32,
     pub block_voxels: u32,
-    pub patches: Vec<SurfacePatch>,
+    pub blocks: Vec<MeshBlock>,
+}
+
+/// A receiver of mesh_blocks asking the dense map to send its whole surface as the next message, a snapshot,
+/// because it missed a message or joined the run late.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MeshSnapshotRequest {
+    pub requested: UnixNanos,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq)]
@@ -186,7 +245,7 @@ pub enum SpaceMapError {
     NotOneRow { message: &'static str, rows: usize },
     #[error("{field} is null")]
     Null { field: &'static str },
-    #[error("free space has {cells} cells for {width}x{height}")]
+    #[error("occupancy grid has {cells} cells for {width}x{height}")]
     CellsDoNotFillGrid { cells: usize, width: u32, height: u32 },
     #[error("a polygon has {0} points, expected at least 3")]
     DegeneratePolygon(usize),
@@ -194,6 +253,10 @@ pub enum SpaceMapError {
     NotTriples { field: &'static str, count: usize },
     #[error("block {block:?} has a triangle corner beyond its {vertices} vertices")]
     CornerBeyondVertices { block: [i32; 3], vertices: usize },
+    #[error("mesh blocks kind {0:?} is neither changes nor snapshot")]
+    UnknownMeshBlocksKind(String),
+    #[error("a mesh snapshot holds only blocks with surface; block {block:?} has none")]
+    SnapshotBlockWithoutSurface { block: [i32; 3] },
 }
 
 fn item(data_type: DataType) -> Arc<Field> {
@@ -212,7 +275,7 @@ fn point_fields() -> Fields {
     Fields::from(vec![field("x_m", DataType::Float32), field("y_m", DataType::Float32)])
 }
 
-pub fn free_space_fields() -> Fields {
+pub fn occupancy_grid_fields() -> Fields {
     Fields::from(vec![
         field("map_version", DataType::UInt64),
         field("built_unix_ns", DataType::Int64),
@@ -290,7 +353,7 @@ pub fn keep_out_fields() -> Fields {
     Fields::from(vec![field("map_version", DataType::UInt64), field("zones", items(DataType::Struct(zone_fields())))])
 }
 
-fn surface_patch_fields() -> Fields {
+fn mesh_block_fields() -> Fields {
     Fields::from(vec![
         field("block_x", DataType::Int32),
         field("block_y", DataType::Int32),
@@ -300,14 +363,21 @@ fn surface_patch_fields() -> Fields {
     ])
 }
 
-pub fn surface_patches_fields() -> Fields {
+pub fn mesh_blocks_fields() -> Fields {
     Fields::from(vec![
         field("map_version", DataType::UInt64),
         field("built_unix_ns", DataType::Int64),
+        field("run_started_unix_ns", DataType::Int64),
+        field("sequence", DataType::UInt64),
+        field("kind", DataType::Utf8),
         field("voxel_m", DataType::Float32),
         field("block_voxels", DataType::UInt32),
-        field("patches", items(DataType::Struct(surface_patch_fields()))),
+        field("blocks", items(DataType::Struct(mesh_block_fields()))),
     ])
+}
+
+pub fn mesh_snapshot_request_fields() -> Fields {
+    Fields::from(vec![field("requested_unix_ns", DataType::Int64)])
 }
 
 // Encoding.
@@ -341,20 +411,20 @@ fn polygons<'a>(polygons: impl Iterator<Item = &'a [Vec2]> + Clone) -> ArrayRef 
     list_of(point_array, polygons.map(<[Vec2]>::len))
 }
 
-pub fn encode_free_space(free_space: &FreeSpace) -> StructArray {
+pub fn encode_occupancy_grid(occupancy_grid: &OccupancyGrid) -> StructArray {
     let columns: Vec<ArrayRef> = vec![
-        ids([free_space.map_version.0]),
-        Arc::new(Int64Array::from(vec![free_space.built.0])),
-        floats([free_space.origin.x]),
-        floats([free_space.origin.y]),
-        floats([free_space.resolution_m]),
-        Arc::new(UInt32Array::from(vec![free_space.width])),
-        Arc::new(UInt32Array::from(vec![free_space.height])),
-        floats([free_space.band.min_m]),
-        floats([free_space.band.max_m]),
-        one_list(Arc::new(UInt16Array::from(free_space.clearance_mm.clone()))),
+        ids([occupancy_grid.map_version.0]),
+        Arc::new(Int64Array::from(vec![occupancy_grid.built.0])),
+        floats([occupancy_grid.origin.x]),
+        floats([occupancy_grid.origin.y]),
+        floats([occupancy_grid.resolution_m]),
+        Arc::new(UInt32Array::from(vec![occupancy_grid.width])),
+        Arc::new(UInt32Array::from(vec![occupancy_grid.height])),
+        floats([occupancy_grid.band.min_m]),
+        floats([occupancy_grid.band.max_m]),
+        one_list(Arc::new(UInt16Array::from(occupancy_grid.clearance_mm.clone()))),
     ];
-    StructArray::new(free_space_fields(), columns, None)
+    StructArray::new(occupancy_grid_fields(), columns, None)
 }
 
 pub fn encode_topology(topology: &Topology) -> StructArray {
@@ -412,26 +482,34 @@ pub fn encode_keep_out(keep_out: &KeepOut) -> StructArray {
     StructArray::new(keep_out_fields(), columns, None)
 }
 
-pub fn encode_surface_patches(surface: &SurfacePatches) -> StructArray {
-    let patches = &surface.patches;
-    let block = |axis: fn(IVec3) -> i32| -> ArrayRef { Arc::new(patches.iter().map(|p| axis(p.block)).collect::<Int32Array>()) };
-    let positions = floats(patches.iter().flat_map(|p| p.positions_m.iter().flat_map(|v| v.to_array())));
-    let triangles: ArrayRef = Arc::new(patches.iter().flat_map(|p| p.triangles.iter().flatten().copied()).collect::<UInt32Array>());
+pub fn encode_mesh_blocks(surface: &MeshBlocks) -> StructArray {
+    let mesh_blocks = &surface.blocks;
+    let block = |axis: fn(IVec3) -> i32| -> ArrayRef { Arc::new(mesh_blocks.iter().map(|p| axis(p.block)).collect::<Int32Array>()) };
+    let positions = floats(mesh_blocks.iter().flat_map(|p| p.positions_m.iter().flat_map(|v| v.to_array())));
+    let triangles: ArrayRef = Arc::new(mesh_blocks.iter().flat_map(|p| p.triangles.iter().flatten().copied()).collect::<UInt32Array>());
     let patch_columns: Vec<ArrayRef> = vec![
         block(|b| b.x),
         block(|b| b.y),
         block(|b| b.z),
-        list_of(positions, patches.iter().map(|p| 3 * p.positions_m.len())),
-        list_of(triangles, patches.iter().map(|p| 3 * p.triangles.len())),
+        list_of(positions, mesh_blocks.iter().map(|p| 3 * p.positions_m.len())),
+        list_of(triangles, mesh_blocks.iter().map(|p| 3 * p.triangles.len())),
     ];
     let columns: Vec<ArrayRef> = vec![
         ids([surface.map_version.0]),
         Arc::new(Int64Array::from(vec![surface.built.0])),
+        Arc::new(Int64Array::from(vec![surface.run_started.0])),
+        ids([surface.sequence.0]),
+        Arc::new(StringArray::from(vec![surface.kind.wire_name()])),
         floats([surface.voxel_m]),
         Arc::new(UInt32Array::from(vec![surface.block_voxels])),
-        one_list(structs(surface_patch_fields(), patch_columns)),
+        one_list(structs(mesh_block_fields(), patch_columns)),
     ];
-    StructArray::new(surface_patches_fields(), columns, None)
+    StructArray::new(mesh_blocks_fields(), columns, None)
+}
+
+pub fn encode_mesh_snapshot_request(request: &MeshSnapshotRequest) -> StructArray {
+    let columns: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(vec![request.requested.0]))];
+    StructArray::new(mesh_snapshot_request_fields(), columns, None)
 }
 
 // Decoding.
@@ -540,8 +618,8 @@ fn each<T>(rows: &StructArray, decode: impl Fn(&Rows, usize) -> Result<T, SpaceM
     (0..rows.len()).map(|i| decode(&rows, i)).collect()
 }
 
-pub fn decode_free_space(array: &dyn Array) -> Result<FreeSpace, SpaceMapError> {
-    let row = Rows(checked(array, free_space_fields(), "free space")?);
+pub fn decode_occupancy_grid(array: &dyn Array) -> Result<OccupancyGrid, SpaceMapError> {
+    let row = Rows(checked(array, occupancy_grid_fields(), "occupancy grid")?);
     let (width, height) = (row.u32("width", 0)?, row.u32("height", 0)?);
     let list = row.column("clearance_mm").as_list::<i32>();
     if list.is_null(0) {
@@ -551,7 +629,7 @@ pub fn decode_free_space(array: &dyn Array) -> Result<FreeSpace, SpaceMapError> 
     if clearance_mm.len() != width as usize * height as usize {
         return Err(SpaceMapError::CellsDoNotFillGrid { cells: clearance_mm.len(), width, height });
     }
-    Ok(FreeSpace {
+    Ok(OccupancyGrid {
         map_version: MapVersion(row.u64("map_version", 0)?),
         built: UnixNanos(row.i64("built_unix_ns", 0)?),
         origin: Vec2::new(row.f32("origin_x_m", 0)?, row.f32("origin_y_m", 0)?),
@@ -619,23 +697,38 @@ pub fn decode_keep_out(array: &dyn Array) -> Result<KeepOut, SpaceMapError> {
     })
 }
 
-pub fn decode_surface_patches(array: &dyn Array) -> Result<SurfacePatches, SpaceMapError> {
-    let row = Rows(checked(array, surface_patches_fields(), "surface patches")?);
-    Ok(SurfacePatches {
+pub fn decode_mesh_blocks(array: &dyn Array) -> Result<MeshBlocks, SpaceMapError> {
+    let row = Rows(checked(array, mesh_blocks_fields(), "mesh blocks")?);
+    let kind = MeshBlocksKind::from_wire_name(row.str("kind", 0)?)?;
+    let surface = MeshBlocks {
         map_version: MapVersion(row.u64("map_version", 0)?),
         built: UnixNanos(row.i64("built_unix_ns", 0)?),
+        run_started: UnixNanos(row.i64("run_started_unix_ns", 0)?),
+        sequence: MeshSequence(row.u64("sequence", 0)?),
+        kind,
         voxel_m: row.f32("voxel_m", 0)?,
         block_voxels: row.u32("block_voxels", 0)?,
-        patches: each(&row.list("patches", 0)?, |r, i| {
+        blocks: each(&row.list("blocks", 0)?, |r, i| {
             let block = IVec3::new(r.i32("block_x", i)?, r.i32("block_y", i)?, r.i32("block_z", i)?);
             let positions_m: Vec<Vec3> = r.triples::<Float32Type>("positions_m", i)?.into_iter().map(Vec3::from_array).collect();
             let triangles = r.triples::<UInt32Type>("triangles", i)?;
             if triangles.iter().flatten().any(|&corner| corner as usize >= positions_m.len()) {
                 return Err(SpaceMapError::CornerBeyondVertices { block: block.to_array(), vertices: positions_m.len() });
             }
-            Ok(SurfacePatch { block, positions_m, triangles })
+            Ok(MeshBlock { block, positions_m, triangles })
         })?,
-    })
+    };
+    if kind == MeshBlocksKind::Snapshot {
+        if let Some(empty) = surface.blocks.iter().find(|mesh_block| mesh_block.triangles.is_empty()) {
+            return Err(SpaceMapError::SnapshotBlockWithoutSurface { block: empty.block.to_array() });
+        }
+    }
+    Ok(surface)
+}
+
+pub fn decode_mesh_snapshot_request(array: &dyn Array) -> Result<MeshSnapshotRequest, SpaceMapError> {
+    let row = Rows(checked(array, mesh_snapshot_request_fields(), "mesh snapshot request")?);
+    Ok(MeshSnapshotRequest { requested: UnixNanos(row.i64("requested_unix_ns", 0)?) })
 }
 
 #[cfg(test)]
@@ -657,12 +750,12 @@ mod tests {
     }
 
     #[test]
-    fn the_free_space_fixture_decodes_and_encodes_back_to_itself() {
-        let golden = fixture("free_space");
-        let free_space = decode_free_space(&golden).unwrap();
+    fn the_occupancy_grid_fixture_decodes_and_encodes_back_to_itself() {
+        let golden = fixture("occupancy_grid");
+        let occupancy_grid = decode_occupancy_grid(&golden).unwrap();
         assert_eq!(
-            free_space,
-            FreeSpace {
+            occupancy_grid,
+            OccupancyGrid {
                 map_version: MapVersion(412),
                 built: UnixNanos(1_762_560_002_000_000_000),
                 origin: Vec2::new(-1.25, 0.5),
@@ -673,12 +766,12 @@ mod tests {
                 clearance_mm: vec![0, 50, 100, 65535, 70, 0],
             }
         );
-        assert_eq!(free_space.cell(0, 1), Clearance::Unknown);
-        assert_eq!(free_space.cell(2, 0), Clearance::Free { mm: 100 });
-        assert_eq!(free_space.cell(2, 1), Clearance::Occupied);
-        assert_eq!(free_space.cell_at(Vec2::new(-1.0, 0.6)), None);
-        assert_eq!(free_space.cell_at(Vec2::new(-1.1, 0.6)), Some((2, 1)));
-        assert_eq!(encode_free_space(&free_space), golden);
+        assert_eq!(occupancy_grid.cell(0, 1), Clearance::Unknown);
+        assert_eq!(occupancy_grid.cell(2, 0), Clearance::Free { mm: 100 });
+        assert_eq!(occupancy_grid.cell(2, 1), Clearance::Occupied);
+        assert_eq!(occupancy_grid.cell_at(Vec2::new(-1.0, 0.6)), None);
+        assert_eq!(occupancy_grid.cell_at(Vec2::new(-1.1, 0.6)), Some((2, 1)));
+        assert_eq!(encode_occupancy_grid(&occupancy_grid), golden);
     }
 
     #[test]
@@ -734,11 +827,11 @@ mod tests {
     }
 
     #[test]
-    fn free_space_whose_cells_do_not_fill_the_grid_is_rejected() {
-        let mut free_space = decode_free_space(&fixture("free_space")).unwrap();
-        free_space.clearance_mm.pop();
+    fn occupancy_grid_whose_cells_do_not_fill_the_grid_is_rejected() {
+        let mut occupancy_grid = decode_occupancy_grid(&fixture("occupancy_grid")).unwrap();
+        occupancy_grid.clearance_mm.pop();
         assert_eq!(
-            decode_free_space(&encode_free_space(&free_space)),
+            decode_occupancy_grid(&encode_occupancy_grid(&occupancy_grid)),
             Err(SpaceMapError::CellsDoNotFillGrid { cells: 5, width: 3, height: 2 })
         );
     }
@@ -757,24 +850,53 @@ mod tests {
     }
 
     #[test]
-    fn the_surface_patches_fixture_decodes_and_encodes_back_to_itself() {
-        let golden = fixture("surface_patches");
-        let surface = decode_surface_patches(&golden).unwrap();
+    fn the_mesh_blocks_fixture_decodes_and_encodes_back_to_itself() {
+        let golden = fixture("mesh_blocks");
+        let surface = decode_mesh_blocks(&golden).unwrap();
         assert_eq!((surface.map_version, surface.voxel_m, surface.block_voxels), (MapVersion(412), 0.0625, 8));
-        let floor = &surface.patches[0];
+        assert_eq!((surface.run_started, surface.sequence), (UnixNanos(1_762_559_990_000_000_000), MeshSequence(17)));
+        assert_eq!(surface.kind, MeshBlocksKind::Changes);
+        let floor = &surface.blocks[0];
         assert_eq!(floor.block, IVec3::new(0, 1, -1));
         assert_eq!(floor.positions_m[2], Vec3::new(0.25, 0.75, -0.125));
         assert_eq!(floor.triangles, vec![[0, 1, 2], [0, 2, 3]]);
-        assert_eq!(surface.patches[1], SurfacePatch { block: IVec3::new(2, 0, 0), positions_m: vec![], triangles: vec![] });
-        assert_eq!(encode_surface_patches(&surface), golden);
+        assert_eq!(surface.blocks[1], MeshBlock { block: IVec3::new(2, 0, 0), positions_m: vec![], triangles: vec![] });
+        assert_eq!(encode_mesh_blocks(&surface), golden);
+    }
+
+    #[test]
+    fn the_mesh_blocks_snapshot_fixture_decodes_and_encodes_back_to_itself() {
+        let golden = fixture("mesh_blocks_snapshot");
+        let snapshot = decode_mesh_blocks(&golden).unwrap();
+        assert_eq!((snapshot.kind, snapshot.sequence, snapshot.map_version), (MeshBlocksKind::Snapshot, MeshSequence(18), MapVersion(413)));
+        assert_eq!(snapshot.blocks.iter().map(|p| p.block).collect::<Vec<_>>(), vec![IVec3::new(0, 1, -1)]);
+        assert_eq!(encode_mesh_blocks(&snapshot), golden);
+    }
+
+    #[test]
+    fn a_snapshot_with_a_block_without_surface_is_rejected() {
+        let mut snapshot = decode_mesh_blocks(&fixture("mesh_blocks_snapshot")).unwrap();
+        snapshot.blocks.push(MeshBlock { block: IVec3::new(2, 0, 0), positions_m: vec![], triangles: vec![] });
+        assert_eq!(
+            decode_mesh_blocks(&encode_mesh_blocks(&snapshot)),
+            Err(SpaceMapError::SnapshotBlockWithoutSurface { block: [2, 0, 0] })
+        );
+    }
+
+    #[test]
+    fn the_mesh_snapshot_request_fixture_decodes_and_encodes_back_to_itself() {
+        let golden = fixture("mesh_snapshot_request");
+        let request = decode_mesh_snapshot_request(&golden).unwrap();
+        assert_eq!(request, MeshSnapshotRequest { requested: UnixNanos(1_762_560_003_500_000_000) });
+        assert_eq!(encode_mesh_snapshot_request(&request), golden);
     }
 
     #[test]
     fn a_triangle_beyond_its_patch_vertices_is_rejected() {
-        let mut surface = decode_surface_patches(&fixture("surface_patches")).unwrap();
-        surface.patches[0].triangles.push([0, 1, 4]);
+        let mut surface = decode_mesh_blocks(&fixture("mesh_blocks")).unwrap();
+        surface.blocks[0].triangles.push([0, 1, 4]);
         assert_eq!(
-            decode_surface_patches(&encode_surface_patches(&surface)),
+            decode_mesh_blocks(&encode_mesh_blocks(&surface)),
             Err(SpaceMapError::CornerBeyondVertices { block: [0, 1, -1], vertices: 4 })
         );
     }

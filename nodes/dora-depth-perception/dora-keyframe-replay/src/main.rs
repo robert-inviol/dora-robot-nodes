@@ -121,7 +121,7 @@ mod tests {
             width: 1,
             height: 1,
             intrinsics: CameraIntrinsics { fx: 1.0, fy: 1.0, ppx: 0.0, ppy: 0.0 },
-            gravity_reaction: Vec3::NEG_Y,
+            specific_force: Vec3::NEG_Y,
             depth_mm: vec![0u16].into(),
             color_jpeg: Vec::new(),
         }

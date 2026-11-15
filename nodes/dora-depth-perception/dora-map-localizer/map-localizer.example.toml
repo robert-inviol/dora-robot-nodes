@@ -8,9 +8,15 @@ voxel_m = 0.05
 
 [submap]
 # Each keyframe registers against the map: the map keyframes within radius_m of its seed, however long ago
-# they were seen, at most max_keyframes of them, nearest first, each at its current optimised pose.
+# they were seen, at most max_keyframes of them, nearest first, each at its current optimized pose.
 radius_m = 4.0
 max_keyframes = 12
+
+[keyframe_selection]
+# A localized keyframe within both of these of a map keyframe it registered against is not added to the map: it
+# is sent with its pose and moves with that map keyframe. A camera at rest adds nothing to the map.
+min_translation_m = 0.1
+min_rotation_deg = 5.0
 
 [tracking]
 # Share of points within the inlier distance of the map at which a registration is accepted.
@@ -23,8 +29,8 @@ max_gyro_disagreement_deg = 5.0
 min_points = 500
 
 [loops]
-# Keyframes older than skip_latest_keyframes within radius_m of a tracked keyframe are matched against it.
-skip_latest_keyframes = 30
+# Map keyframes older than skip_latest_keyframes within radius_m of a newly selected keyframe are matched against it.
+skip_latest_keyframes = 10
 radius_m = 2.5
 attempt_every_keyframes = 3
 min_fitness = 0.4
@@ -32,26 +38,28 @@ max_rmse_m = 0.03
 max_correction_m = 1.0
 max_correction_deg = 20.0
 
-[relocalise]
+[relocalize]
 radius_m = 3.0
+# Above tracking's accept_fitness: relocalization keeps the best of many seeds over a wide search, which match a
+# wrong place more often than tracking's one seed from the previous pose.
 min_fitness = 0.35
 # After this many lost keyframes in a row, one with enough points restarts tracking where dead reckoning puts it.
 restart_after_lost = 3
 
 [graph]
-optimise_interval_s = 1.0
-# An optimisation moving any past keyframe further than either starts a new map version.
+optimize_interval_s = 1.0
+# An optimization moving any past keyframe further than either starts a new map version.
 version_move_m = 0.05
 version_turn_deg = 1.0
 
 [gyro]
 # IMU samples are kept this long; it bounds the gap between keyframes whose turn the gyro can give.
 buffer_s = 60.0
-# The gyro gives no turn until it has seen this much still time in all, to measure its bias.
-min_still_s = 1.0
+# The gyro gives no turn until it has seen this much stationary time in all, to measure its bias.
+min_stationary_s = 1.0
 # A keyframe whose turn the gyro cannot give (bias not measured yet, a gap in the samples):
 #   "refuse": the keyframe is reported lost, logged at error level; the heading stays unknown until a later
-#             keyframe relocalises against the map.
+#             keyframe relocalizes against the map.
 #   "search": every heading is searched for, logged at warn level for each such keyframe. For recordings
 #             without a usable IMU.
 heading_without_gyro = "refuse"

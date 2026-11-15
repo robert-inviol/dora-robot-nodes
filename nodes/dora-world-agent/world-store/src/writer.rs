@@ -17,8 +17,8 @@ use crate::inputs::{Arrivals, Clock};
 use crate::map::{parse_unnamed_room, MapState, UNMAPPED_ROOM};
 use crate::relations::{relation, Solid, NEXT_TO_M};
 use crate::types::{
-    Caption, FreeSpace, InputSource, IssuedGoal, JpegImage, ObjectChange, ObjectUpdate, PersonSighting, RobotPoseSample, RoomId,
-    Topology,
+    Caption, FloorVelocity, OccupancyGrid, InputSource, IssuedGoal, JpegImage, ObjectChange, ObjectUpdate, PersonObservation, RobotPoseSample,
+    RoomId, Topology,
 };
 
 /// How many crops of each object the store keeps, best first.
@@ -69,9 +69,9 @@ enum Command {
     Object(Box<ObjectUpdate>),
     Caption(ObjectId, Caption, UnixNanos),
     Topology(Box<Topology>),
-    FreeSpace(Box<FreeSpace>),
+    OccupancyGrid(Box<OccupancyGrid>),
     RobotPose(RobotPoseSample),
-    People(Vec<PersonSighting>),
+    People(Vec<PersonObservation>),
     Goal(Box<IssuedGoal>),
     GoalStatus(GoalStatus),
     NameRoom(RoomId, RoomName, Sender<Result<(), IngestError>>),
@@ -91,7 +91,7 @@ struct Shared {
     counters: Counters,
     arrivals: Arc<Arrivals>,
     clock: Clock,
-    /// A person is recorded at most once in this span; sightings in between are dropped.
+    /// A person is recorded at most once in this span; observations in between are dropped.
     record_people_every: Duration,
     thread: Mutex<Option<JoinHandle<()>>>,
 }
@@ -156,9 +156,9 @@ impl WorldWriter {
         self.send(Command::Topology(Box::new(topology)))
     }
 
-    pub fn set_free_space(&self, free_space: FreeSpace) -> Result<(), IngestError> {
-        self.arrived(InputSource::FreeSpace);
-        self.send(Command::FreeSpace(Box::new(free_space)))
+    pub fn set_occupancy_grid(&self, occupancy_grid: OccupancyGrid) -> Result<(), IngestError> {
+        self.arrived(InputSource::OccupancyGrid);
+        self.send(Command::OccupancyGrid(Box::new(occupancy_grid)))
     }
 
     pub fn record_robot_pose(&self, sample: RobotPoseSample) -> Result<(), IngestError> {
@@ -168,12 +168,12 @@ impl WorldWriter {
 
     /// Everyone the people tracker confirmed in one camera frame; an empty frame says tracking is running and
     /// nobody is in view.
-    pub fn record_people(&self, sightings: Vec<PersonSighting>) -> Result<(), IngestError> {
+    pub fn record_people(&self, observations: Vec<PersonObservation>) -> Result<(), IngestError> {
         self.arrived(InputSource::People);
-        if sightings.is_empty() {
+        if observations.is_empty() {
             return Ok(());
         }
-        self.send(Command::People(sightings))
+        self.send(Command::People(observations))
     }
 
     pub fn record_goal(&self, goal: IssuedGoal) -> Result<(), IngestError> {
@@ -320,9 +320,9 @@ fn apply(connection: &Connection, map: &RwLock<MapState>, command: Command, now:
         Command::Object(update) => apply_object(connection, map, &update, now),
         Command::Caption(object, caption, at) => set_caption(connection, object, &caption, at),
         Command::Topology(topology) => apply_topology(connection, map, *topology, now),
-        Command::FreeSpace(free_space) => apply_free_space(connection, map, *free_space, now),
+        Command::OccupancyGrid(occupancy_grid) => apply_occupancy_grid(connection, map, *occupancy_grid, now),
         Command::RobotPose(sample) => record_robot_pose(connection, map, sample, now),
-        Command::People(sightings) => record_people(connection, map, &sightings, now, record_people_every),
+        Command::People(observations) => record_people(connection, map, &observations, now, record_people_every),
         Command::Goal(goal) => record_goal(connection, &goal),
         Command::GoalStatus(status) => record_goal_status(connection, status),
         Command::NameRoom(..) | Command::Flush(_) | Command::Shutdown => unreachable!("write_batch handles these itself"),
@@ -598,25 +598,25 @@ fn apply_topology(connection: &Connection, map: &RwLock<MapState>, topology: Top
     Ok(Ok(()))
 }
 
-fn apply_free_space(connection: &Connection, map: &RwLock<MapState>, free_space: FreeSpace, now: UnixNanos) -> Applied {
-    note_version(connection, map, free_space.map_version(), now)?;
-    let cells: Vec<u8> = free_space.clearance().iter().flat_map(|c| c.0.to_le_bytes()).collect();
+fn apply_occupancy_grid(connection: &Connection, map: &RwLock<MapState>, occupancy_grid: OccupancyGrid, now: UnixNanos) -> Applied {
+    note_version(connection, map, occupancy_grid.map_version(), now)?;
+    let cells: Vec<u8> = occupancy_grid.clearance().iter().flat_map(|c| c.0.to_le_bytes()).collect();
     connection.execute(
         "INSERT OR REPLACE INTO free_space VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         params![
-            free_space.map_version().0 as i64,
-            free_space.built().0,
-            free_space.origin().x_m,
-            free_space.origin().y_m,
-            free_space.resolution_m(),
-            free_space.width(),
-            free_space.height(),
-            free_space.band().min_m,
-            free_space.band().max_m,
+            occupancy_grid.map_version().0 as i64,
+            occupancy_grid.built().0,
+            occupancy_grid.origin().x_m,
+            occupancy_grid.origin().y_m,
+            occupancy_grid.resolution_m(),
+            occupancy_grid.width(),
+            occupancy_grid.height(),
+            occupancy_grid.band().min_m,
+            occupancy_grid.band().max_m,
             cells,
         ],
     )?;
-    map.write().expect("the map lock is never poisoned").set_free_space(free_space);
+    map.write().expect("the map lock is never poisoned").set_occupancy_grid(occupancy_grid);
     Ok(Ok(()))
 }
 
@@ -632,41 +632,41 @@ fn record_robot_pose(connection: &Connection, map: &RwLock<MapState>, sample: Ro
 fn record_people(
     connection: &Connection,
     map: &RwLock<MapState>,
-    sightings: &[PersonSighting],
+    observations: &[PersonObservation],
     now: UnixNanos,
     every: Duration,
 ) -> Applied {
     let every_ns = i64::try_from(every.as_nanos()).expect("a recording interval shorter than 292 years");
-    for sighting in sightings {
-        let track = sighting.track.0 as i64;
+    for observation in observations {
+        let track = observation.track.0 as i64;
         let last: Option<i64> =
             connection.query_row("SELECT max(seen_unix_ns) FROM track_pose WHERE track_id = ?1", [track], |r| r.get(0))?;
-        if last.is_some_and(|last| sighting.seen.0 - last < every_ns) {
+        if last.is_some_and(|last| observation.seen.0 - last < every_ns) {
             continue;
         }
-        note_version(connection, map, sighting.map_version, now)?;
+        note_version(connection, map, observation.map_version, now)?;
         connection.execute(
             "INSERT INTO track VALUES (?1, ?2, ?2) ON CONFLICT (track_id) DO UPDATE SET last_seen_unix_ns = excluded.last_seen_unix_ns",
-            params![track, sighting.seen.0],
+            params![track, observation.seen.0],
         )?;
-        let torso = sighting.torso;
+        let torso = observation.torso;
         connection.execute(
             "INSERT INTO track_pose VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 track,
-                sighting.seen.0,
-                sighting.map_version.0 as i64,
+                observation.seen.0,
+                observation.map_version.0 as i64,
                 torso.x_m,
                 torso.y_m,
                 torso.z_m,
-                person_heading(sighting.velocity, &sighting.joints),
-                sighting.velocity.map_or(0.0, |v| v.speed_m_s()),
+                person_heading(observation.velocity, &observation.joints),
+                observation.velocity.map(FloorVelocity::speed_m_s),
             ],
         )?;
         let mut joint = connection.prepare_cached("INSERT INTO track_joint VALUES (?1, ?2, ?3, ?4, ?5, ?6)")?;
-        for placed in &sighting.joints {
-            let p = placed.position;
-            joint.execute(params![track, sighting.seen.0, placed.joint.name(), p.x_m, p.y_m, p.z_m])?;
+        for joint_in_map in &observation.joints {
+            let p = joint_in_map.position;
+            joint.execute(params![track, observation.seen.0, joint_in_map.joint.name(), p.x_m, p.y_m, p.z_m])?;
         }
     }
     Ok(Ok(()))

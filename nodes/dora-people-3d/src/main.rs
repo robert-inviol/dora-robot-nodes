@@ -1,6 +1,6 @@
 //! dora node: joins each frame's `person_poses` with that frame's raw `depth` and the camera's `calibration`, and
-//! publishes `people_tracks` for every pose frame, even an empty one. With `POSITION_FRAME=odom` it also places each
-//! frame with `odom_pose`, so a frame goes out once the odometry has reached its time.
+//! publishes `people_tracks` for every pose frame, even an empty one. With `POSITION_FRAME=odom` it also transforms each
+//! frame into the odom frame with `odom_pose`, so a frame goes out once the odometry has reached its time.
 
 use std::collections::{BTreeSet, VecDeque};
 use std::time::Instant;
@@ -10,11 +10,12 @@ use dora_node_api::arrow::buffer::ScalarBuffer;
 use dora_node_api::arrow::datatypes::UInt16Type;
 use dora_node_api::{DoraNode, Event, MetadataParameters, Parameter};
 use dora_people_3d::depth::DepthImage;
-use dora_people_3d::odom::{CameraPlacement, OdomHistory};
-use dora_people_3d::tracks::{DepthFrame, LiftedFrame, PeopleTracker, Placement, TrackSettings};
+use dora_people_3d::odom::{CameraPoseLookup, OdomHistory};
+use dora_people_3d::tracks::{DepthFrame, LiftedFrame, PeopleTracker, TrackFrame, TrackSettings};
 use eyre::{bail, eyre, Context, Result};
 use perception_wire::camera::decode_camera_calibration;
 use perception_wire::camera::CameraCalibration;
+use perception_wire::localization::CameraNanos;
 use perception_wire::odometry::decode_odom_pose;
 use perception_wire::people::{decode_person_poses, encode_people_tracks, PeopleTracks};
 
@@ -25,7 +26,7 @@ const ODOM_INPUT: &str = "odom_pose";
 const TRACKS_OUTPUT: &str = "people_tracks";
 /// Depth frames kept while their pose frames are still on the Hailo; the pose model runs a few frames behind.
 const DEPTH_FRAMES_KEPT: usize = 15;
-/// Odometry poses kept for placing pose frames that arrive late, in camera time.
+/// Odometry poses kept for synchronizer pose frames that arrive late, in camera time.
 const ODOM_KEPT_NS: i64 = 2_000_000_000;
 /// Pose frames held for the odometry to reach their time; past this many the oldest goes unsent.
 const FRAMES_AWAITING_ODOMETRY: usize = 60;
@@ -37,7 +38,7 @@ struct HeldDepth {
     width: usize,
     height: usize,
     depth_mm: ScalarBuffer<u16>,
-    gravity_reaction: Option<[f32; 3]>,
+    specific_force: Option<[f32; 3]>,
 }
 
 fn integer(metadata: &MetadataParameters, name: &str) -> Result<i64> {
@@ -53,12 +54,12 @@ fn hold_depth(metadata: &MetadataParameters, data: &dyn Array) -> Result<HeldDep
     if depth_mm.len() != width * height {
         bail!("depth has {} values for {width}x{height}", depth_mm.len());
     }
-    let gravity_reaction = match metadata.get("gravity_reaction") {
+    let specific_force = match metadata.get("specific_force") {
         Some(Parameter::ListFloat(values)) if values.len() == 3 => Some([values[0] as f32, values[1] as f32, values[2] as f32]),
         None => None,
-        other => bail!("depth metadata gravity_reaction is {other:?}, not three floats"),
+        other => bail!("depth metadata specific_force is {other:?}, not three floats"),
     };
-    Ok(HeldDepth { frame_id: integer(metadata, "frame_id")? as u64, width, height, depth_mm, gravity_reaction })
+    Ok(HeldDepth { frame_id: integer(metadata, "frame_id")? as u64, width, height, depth_mm, specific_force })
 }
 
 /// The frame `people_tracks` positions are in, from `POSITION_FRAME`.
@@ -81,9 +82,9 @@ fn position_frame_setting() -> Result<PositionFrameSetting> {
 struct Progress {
     frames: u32,
     with_depth: u32,
-    placed: u32,
+    positioned: u32,
     sent: u32,
-    never_placed: u32,
+    never_covered: u32,
     gave_up_waiting: u32,
     odometry_restarts: u32,
     track_ids: BTreeSet<u64>,
@@ -91,10 +92,10 @@ struct Progress {
 }
 
 /// Pose frames waiting for the odometry, and the odom frame the tracker's positions are in.
-struct OdomPlacing {
+struct OdomSynchronizer {
     history: OdomHistory,
     waiting: VecDeque<LiftedFrame>,
-    odom_started_camera_ns: Option<i64>,
+    odom_started: Option<CameraNanos>,
 }
 
 fn send(node: &mut DoraNode, tracks: &PeopleTracks, depth_found: bool, progress: &mut Progress) -> Result<()> {
@@ -102,36 +103,37 @@ fn send(node: &mut DoraNode, tracks: &PeopleTracks, depth_found: bool, progress:
     parameters.insert("depth_found".to_owned(), Parameter::Bool(depth_found));
     node.send_output(TRACKS_OUTPUT.to_owned().into(), parameters, encode_people_tracks(tracks))?;
     progress.sent += 1;
-    progress.placed += tracks.tracks.iter().filter(|t| t.position.is_some()).count() as u32;
+    progress.positioned += tracks.tracks.iter().filter(|t| t.position.is_some()).count() as u32;
     progress.track_ids.extend(tracks.tracks.iter().map(|t| t.track_id));
     progress.last = tracks.tracks.first().map(|t| format!(", track {} {:?} at {:?}", t.track_id, t.state, t.position));
     Ok(())
 }
 
 /// Tracks and sends every waiting frame the odometry has reached, in order.
-fn place_waiting(
+fn track_waiting_frames(
     node: &mut DoraNode,
     tracker: &mut PeopleTracker,
-    placing: &mut OdomPlacing,
+    synchronizer: &mut OdomSynchronizer,
     calibration: Option<&CameraCalibration>,
     progress: &mut Progress,
 ) -> Result<()> {
     let Some(calibration) = calibration else { return Ok(()) };
-    while let Some(frame) = placing.waiting.front() {
-        match placing.history.camera_at(frame.captured_camera_ns, calibration) {
-            CameraPlacement::NotYet => break,
-            CameraPlacement::Never => {
-                placing.waiting.pop_front();
-                progress.never_placed += 1;
+    while let Some(frame) = synchronizer.waiting.front() {
+        match synchronizer.history.camera_at(frame.captured_camera_ns, calibration) {
+            CameraPoseLookup::NotYet => break,
+            CameraPoseLookup::Never => {
+                synchronizer.waiting.pop_front();
+                progress.never_covered += 1;
             }
-            CameraPlacement::Placed { camera_to_odom, odom_started_camera_ns } => {
-                let frame = placing.waiting.pop_front().expect("a waiting frame");
-                if placing.odom_started_camera_ns.is_some_and(|started| started != odom_started_camera_ns) {
+            CameraPoseLookup::Interpolated { camera_to_odom, odom_started } => {
+                let frame = synchronizer.waiting.pop_front().expect("a waiting frame");
+                if synchronizer.odom_started.is_some_and(|started| started != odom_started) {
                     tracker.forget_everyone();
                 }
-                placing.odom_started_camera_ns = Some(odom_started_camera_ns);
+                synchronizer.odom_started = Some(odom_started);
                 let depth_found = frame.depth_found;
-                let tracks = tracker.track(frame, Placement::Odom(camera_to_odom));
+                // The tracks name the odom frame of the poses this frame was transformed with.
+                let tracks = tracker.track(frame, TrackFrame::Odom { camera_to_odom, odom_started });
                 send(node, &tracks, depth_found, progress)?;
             }
         }
@@ -145,7 +147,7 @@ fn main() -> Result<()> {
     let mut tracker = PeopleTracker::new(TrackSettings::default());
     let mut calibration = None;
     let mut depths: VecDeque<HeldDepth> = VecDeque::with_capacity(DEPTH_FRAMES_KEPT + 1);
-    let mut placing = OdomPlacing { history: OdomHistory::new(ODOM_KEPT_NS), waiting: VecDeque::new(), odom_started_camera_ns: None };
+    let mut synchronizer = OdomSynchronizer { history: OdomHistory::new(ODOM_KEPT_NS), waiting: VecDeque::new(), odom_started: None };
     let mut progress = Progress::default();
     let mut logged_at = Instant::now();
     while let Some(event) = events.recv() {
@@ -163,15 +165,15 @@ fn main() -> Result<()> {
                         bail!("odom_pose arrived but POSITION_FRAME is camera");
                     }
                     let pose = decode_odom_pose(data.as_ref()).wrap_err("reading an odom pose")?;
-                    progress.odometry_restarts += placing.history.push(pose) as u32;
-                    place_waiting(&mut node, &mut tracker, &mut placing, calibration.as_ref(), &mut progress)?;
+                    progress.odometry_restarts += synchronizer.history.push(pose) as u32;
+                    track_waiting_frames(&mut node, &mut tracker, &mut synchronizer, calibration.as_ref(), &mut progress)?;
                 }
                 POSES_INPUT => {
                     let poses = decode_person_poses(data.as_ref())?;
                     let held = depths.iter().find(|d| d.frame_id == poses.frame_id);
                     let depth = held.map(|d| DepthFrame {
                         image: DepthImage { width: d.width, height: d.height, depth_mm: &d.depth_mm },
-                        gravity_reaction: d.gravity_reaction,
+                        specific_force: d.specific_force,
                     });
                     let lifted = tracker.lift_frame(&poses, depth.as_ref(), calibration.as_ref());
                     progress.frames += 1;
@@ -179,16 +181,16 @@ fn main() -> Result<()> {
                     match position_frame {
                         PositionFrameSetting::Camera => {
                             let depth_found = lifted.depth_found;
-                            let tracks = tracker.track(lifted, Placement::Camera);
+                            let tracks = tracker.track(lifted, TrackFrame::Camera);
                             send(&mut node, &tracks, depth_found, &mut progress)?;
                         }
                         PositionFrameSetting::Odom => {
-                            placing.waiting.push_back(lifted);
-                            if placing.waiting.len() > FRAMES_AWAITING_ODOMETRY {
-                                placing.waiting.pop_front();
+                            synchronizer.waiting.push_back(lifted);
+                            if synchronizer.waiting.len() > FRAMES_AWAITING_ODOMETRY {
+                                synchronizer.waiting.pop_front();
                                 progress.gave_up_waiting += 1;
                             }
-                            place_waiting(&mut node, &mut tracker, &mut placing, calibration.as_ref(), &mut progress)?;
+                            track_waiting_frames(&mut node, &mut tracker, &mut synchronizer, calibration.as_ref(), &mut progress)?;
                         }
                     }
                     if progress.frames == LOG_EVERY_FRAMES {
@@ -196,15 +198,15 @@ fn main() -> Result<()> {
                         let (fitting, fits) = tracker.take_fitting_time();
                         eprintln!(
                             "[people-3d] {:.1} pose frames/s, {}/{} with depth, {} sent ({} before the odometry's poses, {} gave up \
-                             waiting, {} odometry restarts), {} people placed, {} skeleton fits at {:.2} ms each, track ids {:?}{}",
+                             waiting, {} odometry restarts), {} people positioned, {} skeleton fits at {:.2} ms each, track ids {:?}{}",
                             p.frames as f64 / logged_at.elapsed().as_secs_f64(),
                             p.with_depth,
                             p.frames,
                             p.sent,
-                            p.never_placed,
+                            p.never_covered,
                             p.gave_up_waiting,
                             p.odometry_restarts,
-                            p.placed,
+                            p.positioned,
                             fits,
                             fitting.as_secs_f64() * 1e3 / f64::from(fits.max(1)),
                             p.track_ids,

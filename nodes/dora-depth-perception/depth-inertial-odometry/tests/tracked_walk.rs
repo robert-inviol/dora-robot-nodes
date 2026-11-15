@@ -2,12 +2,12 @@ use std::num::NonZeroUsize;
 use std::time::Duration;
 
 use depth_inertial_odometry::simulation::{seeded, ImuErrors, ImuStreams, PinholeDepthCamera, Scene, Walk};
-use depth_inertial_odometry::thinning::SensorMount;
+use depth_inertial_odometry::downsampling::SensorExtrinsics;
 use depth_inertial_odometry::tracker::{DepthFrameId, DepthFrameOutcome, FramePose, TrackerPhase};
 use depth_inertial_odometry::{PlaneVoxelMap, PlaneVoxelSettings, PoseTracker, TrackerSettings};
 
 const FRAME_PERIOD: Duration = Duration::from_micros(32_500);
-const STILL: Duration = Duration::from_secs(2);
+const STATIONARY: Duration = Duration::from_secs(2);
 const WALK_FOR: Duration = Duration::from_secs(30);
 
 /// How far voxel planes may stray from the truth over the drive.
@@ -18,27 +18,27 @@ const ACCEL_BIAS_M_S2: f64 = 0.03;
 
 #[test]
 fn a_tracker_fed_raw_depth_images_and_separate_imu_streams_follows_a_drive_around_the_room() {
-    let (scene, walk, errors, streams) = (Scene::living_room(), Walk::on_a_robot(STILL), ImuErrors::consumer(), ImuStreams::d455());
+    let (scene, walk, errors, streams) = (Scene::living_room(), Walk::on_a_robot(STATIONARY), ImuErrors::consumer(), ImuStreams::d455());
     let camera = PinholeDepthCamera::d455(212, 120);
     // The depth sensor looks along the body's x from a few centimetres off the IMU.
-    let mount = SensorMount::from_depth_to_imu(PinholeDepthCamera::FACING_FORWARD, [0.03, 0.01, -0.02]).expect("a rotation");
+    let extrinsics = SensorExtrinsics::from_depth_to_imu(PinholeDepthCamera::FACING_FORWARD, [0.03, 0.01, -0.02]).expect("a rotation");
     // The start window ends while the body still rests.
-    let settings = TrackerSettings { rest_for: Duration::from_millis(1900), depth_stride: NonZeroUsize::MIN, ..TrackerSettings::d455() };
-    let mut tracker = PoseTracker::new(camera.intrinsics, mount, PlaneVoxelMap::new(PlaneVoxelSettings::indoors()), settings).expect("usable intrinsics");
+    let settings = TrackerSettings { stationary_for: Duration::from_millis(1900), depth_stride: NonZeroUsize::MIN, ..TrackerSettings::d455() };
+    let mut tracker = PoseTracker::new(camera.intrinsics, extrinsics, PlaneVoxelMap::new(PlaneVoxelSettings::indoors()), settings).expect("usable intrinsics");
     let mut rng = seeded(7);
 
     let mut poses: Vec<FramePose> = Vec::new();
     let (mut worst_position_m, mut worst_angle_deg) = (0.0f64, 0.0f64);
     let (mut depth_mm, mut imu_through) = (Vec::new(), None);
-    for frame in 0..((STILL + WALK_FOR).as_micros() / FRAME_PERIOD.as_micros()) as u32 {
+    for frame in 0..((STATIONARY + WALK_FOR).as_micros() / FRAME_PERIOD.as_micros()) as u32 {
         let time = FRAME_PERIOD * frame;
         let (accel, gyro) = streams.batch(&walk, &errors, imu_through, time, &mut rng);
         imu_through = Some(time);
         let phase = tracker.add_imu(&accel, &gyro).expect("the walk starts at rest and its samples are in order");
-        assert!(phase == TrackerPhase::Tracking || time < STILL, "odometry had not started when the body moved off at {time:?}");
+        assert!(phase == TrackerPhase::Tracking || time < STATIONARY, "odometry had not started when the body moved off at {time:?}");
 
         let seconds = time.as_secs_f64();
-        camera.image(&scene, walk.position(seconds), walk.rotation(seconds), &mount, &mut rng, &mut depth_mm);
+        camera.image(&scene, walk.position(seconds), walk.rotation(seconds), &extrinsics, &mut rng, &mut depth_mm);
         let DepthFrameOutcome::Posed(pose) = tracker.add_depth_frame(time, DepthFrameId(frame as u64), &depth_mm).expect("every frame is taken") else {
             assert!(phase != TrackerPhase::Tracking, "a frame after the start got no pose at {time:?}");
             continue;
@@ -62,10 +62,10 @@ fn a_tracker_fed_raw_depth_images_and_separate_imu_streams_follows_a_drive_aroun
     assert_eq!(corrected, poses.len() - 1, "every frame after the one that started the map is corrected");
     assert!(poses.windows(2).all(|pair| pair[0].time < pair[1].time), "pose times strictly increase");
     for pose in &poses[1..] {
-        let (sigma, weakest) = (pose.uncertainty, pose.weakest().expect("a corrected frame has a weakest direction"));
+        let (sigma, degenerate) = (pose.uncertainty, pose.degenerate().expect("a corrected frame has a degenerate direction"));
         assert!(sigma.position_sigma_m.min_element() > 0.0 && sigma.position_sigma_m.max_element() < 0.05, "{pose:?}");
         assert!(sigma.tilt_sigma_rad > 0.0 && sigma.tilt_sigma_rad < 0.02 && sigma.heading_sigma_rad > 0.0 && sigma.heading_sigma_rad < 0.02, "{pose:?}");
-        assert!((weakest.direction.length() - 1.0).abs() < 1e-9 && weakest.sigma_m > 0.0, "{pose:?}");
+        assert!((degenerate.direction.length() - 1.0).abs() < 1e-9 && degenerate.sigma_m > 0.0, "{pose:?}");
         assert!(pose.matched_points() >= 50, "{pose:?}");
     }
     // The drive ends with the body moving, and the velocity is the level frame's.

@@ -14,4 +14,4 @@ pub mod map_to_odom;
 pub mod pose_graph;
 pub mod synthetic;
 
-pub use localizer::{HeadingHint, HeadingWithoutGyro, KeyframeEstimate, Localizer, LocalizerInput, LocalizerSettings};
+pub use localizer::{RelativeYawPrior, HeadingWithoutGyro, KeyframeEstimate, KeyframeSelection, KeyframeSelectionSettings, Localizer, LocalizerInput, LocalizerSettings};

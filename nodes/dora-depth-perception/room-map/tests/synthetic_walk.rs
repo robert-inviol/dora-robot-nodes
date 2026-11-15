@@ -3,7 +3,7 @@ use depth_perception::{sample_point_cloud, DepthImage, FloorFrame, RangeLimits};
 use glam::Vec3;
 use room_map::grid::voxel_downsample;
 use room_map::trajectory::{close_loop, find_loop, track, LoopSettings, TrackingSettings};
-use room_map::keyframe_gaps::GapTurn;
+use room_map::timing_yaw_prior::TimingYawPrior;
 use room_map::Pose;
 
 const KEYFRAMES: usize = 24;
@@ -30,7 +30,7 @@ fn walk_clouds_in(scene: &SyntheticRoom, poses: &[Pose]) -> Vec<Vec<Vec3>> {
         .iter()
         .map(|pose| {
             let frame = scene.render_from(pose.translation, pose.yaw_rad);
-            let floor = FloorFrame::from_gravity_reaction(frame.accel_camera);
+            let floor = FloorFrame::from_specific_force(frame.accel_camera);
             let depth = DepthImage::new(scene.width, scene.height, &frame.depth_m);
             let cloud = sample_point_cloud(&depth, &scene.intrinsics, &floor, RangeLimits::D455, 4);
             voxel_downsample(&cloud.points, 0.05)
@@ -50,7 +50,7 @@ fn error(a: &Pose, b: &Pose) -> (f32, f32) {
 fn tracking_recovers_the_walk_within_a_couple_of_centimetres() {
     let truth = relative_to_first(&true_poses());
     let clouds = walk_clouds(&true_poses());
-    let tracked = track(&clouds, &vec![GapTurn::Unknown; clouds.len() - 1], &TrackingSettings::default());
+    let tracked = track(&clouds, &vec![TimingYawPrior::Unknown; clouds.len() - 1], &TrackingSettings::default());
     assert!(tracked.iter().all(|t| t.registered), "every synthetic keyframe registers");
     let worst = truth.iter().zip(&tracked).map(|(t, k)| error(t, &k.pose)).fold((0.0f32, 0.0f32), |a, e| (a.0.max(e.0), a.1.max(e.1)));
     println!("worst tracking error: {:.4} m, {:.3} deg", worst.0, worst.1);
@@ -85,12 +85,12 @@ fn closing_the_loop_removes_injected_drift() {
 mod with_gyro {
     use super::*;
     use depth_perception::synthetic::Cuboid;
-    use room_map::heading::{keyframe_turns, still_between, GyroBias, ImuStream, StillSettings};
-    use room_map::placement::{place_runs, PlacementHeading, PlacementSettings};
+    use room_map::heading::{keyframe_turns, stationary_between, GyroBias, ImuStream, StationaryDetectionSettings};
+    use room_map::run_alignment::{align_runs, AlignmentYawRange, RunAlignmentSettings};
     use room_map::trajectory::{check_turn_direction, track_with_gyro, HeadingSource};
 
     const KEYFRAME_GAP_NS: i64 = 600_000_000;
-    const STILL_START_NS: i64 = 2_000_000_000;
+    const STATIONARY_START_NS: i64 = 2_000_000_000;
     const GYRO_STEP_NS: i64 = 2_500_000;
     const ACCEL_STEP_NS: i64 = 5_000_000;
     /// Keyframes in the middle of the turn that depth cannot register, as when the camera faces glass.
@@ -139,7 +139,7 @@ mod with_gyro {
     }
 
     fn keyframe_times(count: usize) -> Vec<i64> {
-        (0..count as i64).map(|k| STILL_START_NS + k * KEYFRAME_GAP_NS).collect()
+        (0..count as i64).map(|k| STATIONARY_START_NS + k * KEYFRAME_GAP_NS).collect()
     }
 
     /// The walk's IMU: gyro at 400 Hz with a bias drifting tenfold over the walk and noise, following the
@@ -156,7 +156,7 @@ mod with_gyro {
             state ^= state << 17;
             ((state >> 11) as f32 / (1u64 << 53) as f32 - 0.5) * 0.007
         };
-        let segment = |t: i64| (t >= STILL_START_NS).then(|| ((t - STILL_START_NS) / KEYFRAME_GAP_NS) as usize).filter(|s| s + 1 < poses.len());
+        let segment = |t: i64| (t >= STATIONARY_START_NS).then(|| ((t - STATIONARY_START_NS) / KEYFRAME_GAP_NS) as usize).filter(|s| s + 1 < poses.len());
         let moving = |t: i64| segment(t).is_some_and(|s| poses[s + 1] != poses[s]);
         let gyro_ns: Vec<i64> = (0..=end / GYRO_STEP_NS).map(|k| k * GYRO_STEP_NS).collect();
         let gyro = gyro_ns
@@ -188,15 +188,15 @@ mod with_gyro {
     fn walk() -> Walk {
         let poses = true_poses();
         let stream = imu(&poses);
-        let spans = stream.still_spans(&StillSettings::default());
-        let bias = GyroBias::from_spans(&spans, &StillSettings::default()).unwrap();
+        let spans = stream.stationary_spans(&StationaryDetectionSettings::default());
+        let bias = GyroBias::from_spans(&spans, &StationaryDetectionSettings::default()).unwrap();
         let times = keyframe_times(poses.len());
         let turns = keyframe_turns(&stream, &bias, &times, &vec![UP_IN_CAMERA * 9.81; poses.len()]).unwrap();
         let mut clouds = walk_clouds_in(&furnished_room(), &poses);
         for k in BLANK {
             clouds[k].clear();
         }
-        Walk { truth: relative_to_first(&poses), turns, still: still_between(&spans, &times), clouds }
+        Walk { truth: relative_to_first(&poses), turns, still: stationary_between(&spans, &times), clouds }
     }
 
     fn worst(truth: &[Pose], poses: &[Option<Pose>], keyframes: &[usize]) -> (f32, f32) {
@@ -204,10 +204,10 @@ mod with_gyro {
     }
 
     #[test]
-    fn a_bias_measured_on_every_still_span_keeps_the_heading_through_a_drifting_bias() {
+    fn a_bias_measured_on_every_stationary_span_keeps_the_heading_through_a_drifting_bias() {
         let poses = true_poses();
         let stream = imu(&poses);
-        let spans = stream.still_spans(&StillSettings::default());
+        let spans = stream.stationary_spans(&StationaryDetectionSettings::default());
         let times = keyframe_times(poses.len());
         let up = vec![UP_IN_CAMERA * 9.81; poses.len()];
         let heading_error = |bias: &GyroBias| {
@@ -215,9 +215,9 @@ mod with_gyro {
             (turned - (poses[poses.len() - 1].yaw_rad - poses[0].yaw_rad)).abs().to_degrees()
         };
         let opening_only = GyroBias::constant(spans[0].gyro_bias_rad_s);
-        let every_span = GyroBias::from_spans(&spans, &StillSettings::default()).unwrap();
+        let every_span = GyroBias::from_spans(&spans, &StationaryDetectionSettings::default()).unwrap();
         let (constant, interpolated) = (heading_error(&opening_only), heading_error(&every_span));
-        println!("{} still spans; heading error at the end: {constant:.2} deg with the opening bias, {interpolated:.2} deg with every span", spans.len());
+        println!("{} stationary spans; heading error at the end: {constant:.2} deg with the opening bias, {interpolated:.2} deg with every span", spans.len());
         assert_eq!(spans.len(), 3, "the opening, the pause and the end");
         assert!(interpolated < 0.5 && interpolated < constant / 3.0, "{constant} then {interpolated}");
     }
@@ -242,28 +242,28 @@ mod with_gyro {
         assert_eq!(restarts, vec![BLANK.end], "tracking restarts once, on the first keyframe after the blank ones");
 
         let tracking = TrackingSettings::default();
-        let heading = PlacementHeading::NearTracked { extent_deg: 30.0, weight: tracking.gyro_yaw_weight, max_step_m: tracking.max_step_m };
-        let placement = PlacementSettings { heading, ..PlacementSettings::default() };
+        let heading = AlignmentYawRange::NearTracked { extent_deg: 30.0, weight: tracking.gyro_yaw_weight, max_step_m: tracking.max_step_m };
+        let alignment = RunAlignmentSettings { yaw_range: heading, ..RunAlignmentSettings::default() };
         let started = std::time::Instant::now();
-        let (placed, _) = place_runs(&clouds, &tracked, &placement, &tracking.registration);
-        let placing_s = started.elapsed().as_secs_f64();
-        let placed_worst = worst(&truth, &placed, &with_depth);
+        let (aligned, _) = align_runs(&clouds, &tracked, &alignment, &tracking.registration);
+        let aligning_s = started.elapsed().as_secs_f64();
+        let aligned_worst = worst(&truth, &aligned, &with_depth);
         let tracked_worst = worst(&truth, &tracked.iter().map(|t| Some(t.pose)).collect::<Vec<_>>(), &with_depth);
         let started = std::time::Instant::now();
-        let search = track(&clouds, &vec![GapTurn::Unknown; clouds.len() - 1], &tracking);
+        let search = track(&clouds, &vec![TimingYawPrior::Unknown; clouds.len() - 1], &tracking);
         let search_s = started.elapsed().as_secs_f64();
         let search_worst = worst(&truth, &search.iter().map(|t| Some(t.pose)).collect::<Vec<_>>(), &with_depth);
         println!(
-            "gyro tracking alone: worst {:.3} m {:.2} deg; after placing runs: {:.4} m {:.3} deg; depth-only search: {:.3} m {:.2} deg",
-            tracked_worst.0, tracked_worst.1, placed_worst.0, placed_worst.1, search_worst.0, search_worst.1
+            "gyro tracking alone: worst {:.3} m {:.2} deg; after aligning runs: {:.4} m {:.3} deg; depth-only search: {:.3} m {:.2} deg",
+            tracked_worst.0, tracked_worst.1, aligned_worst.0, aligned_worst.1, search_worst.0, search_worst.1
         );
         let per = |seconds: f64| seconds * 1e3 / (truth.len() - 1) as f64;
         println!(
-            "time for {} keyframes: gyro tracking {:.0} ms ({:.1} ms each), placing runs {:.0} ms, depth-only search {:.0} ms ({:.1} ms each)",
-            truth.len(), gyro_tracking_s * 1e3, per(gyro_tracking_s), placing_s * 1e3, search_s * 1e3, per(search_s)
+            "time for {} keyframes: gyro tracking {:.0} ms ({:.1} ms each), aligning runs {:.0} ms, depth-only search {:.0} ms ({:.1} ms each)",
+            truth.len(), gyro_tracking_s * 1e3, per(gyro_tracking_s), aligning_s * 1e3, search_s * 1e3, per(search_s)
         );
         assert!(tracked_worst.1 < 1.0, "the gyro keeps every heading right: {tracked_worst:?}");
-        assert!(placed_worst.0 < 0.03 && placed_worst.1 < 1.0, "every keyframe with depth placed: {placed_worst:?}");
+        assert!(aligned_worst.0 < 0.03 && aligned_worst.1 < 1.0, "every keyframe with depth aligned: {aligned_worst:?}");
     }
 
     #[test]

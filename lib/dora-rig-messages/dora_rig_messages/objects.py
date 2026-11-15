@@ -15,7 +15,7 @@ from .wire import one_row, only_row
 
 
 class ObjectUpdateKind(Enum):
-    # Confirmed after enough sightings; first report of this id.
+    # Confirmed after enough observations; first report of this id.
     APPEARED = "appeared"
     # Seen again; position, size, label or crop may have changed.
     UPDATED = "updated"
@@ -44,7 +44,7 @@ OBJECT_UPDATE_TYPE = pa.struct(
         ("label", pa.string()),
         # The best segmentation score among the object's detections.
         ("score", pa.float32()),
-        # Sightings over sightings plus misses: how sure the map is that the object is there.
+        # Observations over observations plus misses: how sure the map is that the object is there.
         ("confidence", pa.float32()),
         ("seen_count", pa.uint32()),
         # The keyframe whose evidence caused this update.

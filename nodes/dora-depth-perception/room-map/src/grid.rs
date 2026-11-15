@@ -1,18 +1,21 @@
 //! Voxel downsampling, nearest-neighbour search on a hashed grid, and surface normals.
-
-use std::collections::HashMap;
+//!
+//! The grids hash cells with a fixed hasher, so the same points in the same order give the same output order in
+//! every run.
 
 use glam::{IVec3, Vec3};
 use rayon::prelude::*;
+use rustc_hash::FxHashMap;
 
 #[inline]
 fn cell_of(point: Vec3, cell_m: f32) -> IVec3 {
     (point / cell_m).floor().as_ivec3()
 }
 
-/// The centroid of the points in each occupied voxel.
+/// The centroid of the points in each occupied voxel, in the same order for the same input.
 pub fn voxel_downsample(points: &[Vec3], cell_m: f32) -> Vec<Vec3> {
-    let mut cells: HashMap<IVec3, (Vec3, u32)> = HashMap::with_capacity(points.len() / 4);
+    let mut cells: FxHashMap<IVec3, (Vec3, u32)> = FxHashMap::default();
+    cells.reserve(points.len() / 4);
     for &point in points {
         let entry = cells.entry(cell_of(point, cell_m)).or_insert((Vec3::ZERO, 0));
         entry.0 += point;
@@ -24,13 +27,14 @@ pub fn voxel_downsample(points: &[Vec3], cell_m: f32) -> Vec<Vec3> {
 /// Points bucketed by cell, for finding neighbours within one cell's distance.
 pub struct NeighbourGrid {
     cell_m: f32,
-    cells: HashMap<IVec3, Vec<u32>>,
+    cells: FxHashMap<IVec3, Vec<u32>>,
     pub points: Vec<Vec3>,
 }
 
 impl NeighbourGrid {
     pub fn new(points: Vec<Vec3>, cell_m: f32) -> NeighbourGrid {
-        let mut cells: HashMap<IVec3, Vec<u32>> = HashMap::with_capacity(points.len() / 2);
+        let mut cells: FxHashMap<IVec3, Vec<u32>> = FxHashMap::default();
+        cells.reserve(points.len() / 2);
         for (index, &point) in points.iter().enumerate() {
             cells.entry(cell_of(point, cell_m)).or_default().push(index as u32);
         }
@@ -82,10 +86,10 @@ fn smallest_eigenvector(mut a: [[f32; 3]; 3]) -> ([f32; 3], Vec3) {
         let t = theta.signum() / (theta.abs() + (theta * theta + 1.0).sqrt());
         let t = if theta == 0.0 { 1.0 } else { t };
         let (c, s) = (1.0 / (t * t + 1.0).sqrt(), t / (t * t + 1.0).sqrt());
-        for k in 0..3 {
-            let (akp, akq) = (a[k][p], a[k][q]);
-            a[k][p] = c * akp - s * akq;
-            a[k][q] = s * akp + c * akq;
+        for row in &mut a {
+            let (akp, akq) = (row[p], row[q]);
+            row[p] = c * akp - s * akq;
+            row[q] = s * akp + c * akq;
         }
         for k in 0..3 {
             let (apk, aqk) = (a[p][k], a[q][k]);
@@ -153,5 +157,13 @@ mod tests {
         let grid = NeighbourGrid::new(vec![Vec3::ZERO, Vec3::new(0.05, 0.0, 0.0), Vec3::new(0.5, 0.0, 0.0)], 0.1);
         assert_eq!(grid.nearest(Vec3::new(0.04, 0.0, 0.0), 0.1).map(|n| n.0), Some(1));
         assert_eq!(grid.nearest(Vec3::new(0.3, 0.0, 0.0), 0.1), None);
+    }
+
+    #[test]
+    fn downsampling_gives_the_same_order_every_time() {
+        let points: Vec<Vec3> = (0..2000).map(|k| Vec3::new((k % 37) as f32 * 0.07, (k % 11) as f32 * 0.13, (k / 50) as f32 * 0.05)).collect();
+        let first = voxel_downsample(&points, 0.1);
+        // A fixed hasher gives the same order in another process too; within one, every call agrees.
+        assert!((0..5).all(|_| voxel_downsample(&points, 0.1) == first));
     }
 }

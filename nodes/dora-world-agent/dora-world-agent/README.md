@@ -1,23 +1,23 @@
 # dora-world-agent
 
 The spatial agent of `world-agent` as a dora node, answering from the SQLite world store of `world-store`, which the
-node feeds from its inputs. It answers each `space_question` with several models and sends their answers as
-`space_answer` messages, revision by revision, and moves the robot with `nav_goal`.
+node feeds from its inputs. It answers each `spatial_query` with several models and sends their answers as
+`spatial_answer` messages, revision by revision, and moves the robot with `nav_goal`.
 
 | Input | What happens to it |
 |---|---|
-| `space_question` | Answered by every configured model (`SpatialService::ask`) |
+| `spatial_query` | Answered by every configured model (`SpatialService::ask`) |
 | `goal_status` | Recorded in the goal book for the digest, and in the world store (`record_goal_status`) |
 | `topology` | `set_topology`; then the rooms, with their names and objects, go to the room namer (`rooms_changed`) |
-| `free_space` | `set_free_space` |
+| `occupancy_grid` | `set_occupancy_grid` |
 | `object_update` | `apply_object_update` |
-| `keyframe_pose` | `record_robot_pose` with the map pose (x, y, yaw), unless the localizer is lost |
+| `keyframe_pose` | `record_robot_pose` with the map pose (x, y, yaw) of a `tracking` or `relocalized` keyframe. A `lost` or `restarted` pose is dead reckoning that the store would never revise when pose graph updates move it, so it is not recorded |
 | `map_to_odom` | Kept: the latest correction places odometry-frame people tracks |
-| `people_tracks` | `record_people` with the frame's confirmed tracks that have a torso position, each with every joint depth placed, carried from odometry into the map by the latest `map_to_odom` (`people::place_people`). A frame in the camera frame, or in odometry before any correction, records nothing and is logged at warn when that reason first appears |
+| `people_tracks` | `record_people` with the frame's confirmed tracks that have a torso position, each with every fitted joint, carried from odometry into the map by the latest `map_to_odom` (`people::transform_people_to_map`) when it was made in the odom frame the tracks name (`odom_started_camera_ns`). A frame in the camera frame, in odometry before any correction, or in an odom frame the latest correction is not for (odometry started again; `NotTransformed::CorrectionFromAnotherOdomFrame`) records nothing; the reason is logged at warn when it first appears, and placing again at info |
 
 | Output | What it carries |
 |---|---|
-| `space_answer` | Revision 0 from the fast model at once, then each revision; the last has `is_final` |
+| `spatial_answer` | Revision 0 from the fast model at once, then each revision; the last has `is_final` |
 | `nav_goal` | Every goal the agent sends; each is recorded in the world store (`record_goal`) with the agent that sent it (`answerer <n>` or `reconciler`) and its model |
 
 A message that does not decode, or a world store whose writer has stopped, stops the node with the error. Room names
@@ -38,7 +38,7 @@ the database path and, optionally, where and how often it is backed up.
 cargo test -p dora-world-agent
 ```
 
-The test feeds encoded topology, free space, object updates and a keyframe pose into a real store in a temporary
+The test feeds encoded topology, the occupancy grid, object updates and a keyframe pose into a real store in a temporary
 directory, asks a question through `node-fake-claude` (the `fake-claude` of `world-agent`, built in this crate so
 the test can find it), and checks the answer's references, the goal recorded with its status, and the room the
 namer named.

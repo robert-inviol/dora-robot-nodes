@@ -2,7 +2,7 @@
 
 use depth_perception::{object_footprint, DepthImage, FloorFrame, ObjectFootprint, ObjectMask, RangeLimits};
 use glam::{Vec2, Vec3};
-use perception_wire::NO_SEGMENT;
+use perception_wire::NO_INSTANCE;
 use rayon::prelude::*;
 use tracing::debug;
 
@@ -12,11 +12,11 @@ use crate::settings::DetectionSettings;
 use crate::voxels::{VoxelGrid, VoxelSet};
 use crate::ObservedFrame;
 
-/// One mask of one keyframe, placed in the map.
+/// One mask of one keyframe, in the map frame.
 #[derive(Clone, Debug)]
 pub struct Detection {
-    /// Index into the labels of the segments message.
-    pub segment_index: u16,
+    /// Index into the labels of the instance masks message.
+    pub instance_index: u16,
     pub label: Label,
     pub score: f32,
     pub voxels: VoxelSet,
@@ -41,18 +41,18 @@ impl FrameGeometry {
     pub fn of(frame: &ObservedFrame) -> FrameGeometry {
         FrameGeometry {
             depth_m: frame.keyframe.depth_m(),
-            floor: FloorFrame::from_gravity_reaction(frame.keyframe.gravity_reaction),
+            floor: FloorFrame::from_specific_force(frame.keyframe.specific_force),
         }
     }
 }
 
 /// Every mask with enough depth to place, best score first.
 pub fn detect(frame: &ObservedFrame, geometry: &FrameGeometry, grid: VoxelGrid, settings: &DetectionSettings) -> Vec<Detection> {
-    let mut detections: Vec<Detection> = (0..frame.segments.labels.len())
+    let mut detections: Vec<Detection> = (0..frame.instance_masks.labels.len())
         .into_par_iter()
         .filter_map(|index| place_mask(frame, geometry, grid, settings, index as u16))
         .collect();
-    detections.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.segment_index.cmp(&b.segment_index)));
+    detections.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.instance_index.cmp(&b.instance_index)));
     detections
 }
 
@@ -61,17 +61,17 @@ fn place_mask(
     geometry: &FrameGeometry,
     grid: VoxelGrid,
     settings: &DetectionSettings,
-    segment_index: u16,
+    instance_index: u16,
 ) -> Option<Detection> {
-    let (keyframe, segments) = (&frame.keyframe, &frame.segments);
-    let label = Label::new(&segments.labels[segment_index as usize]);
-    let score = segments.scores[segment_index as usize];
+    let (keyframe, instance_masks) = (&frame.keyframe, &frame.instance_masks);
+    let label = Label::new(&instance_masks.labels[instance_index as usize]);
+    let score = instance_masks.scores[instance_index as usize];
     let frame_id = keyframe.frame_id;
     if score < settings.min_score {
         debug!(frame_id, %label, score, "mask ignored: score below the minimum");
         return None;
     }
-    let pixels: Vec<bool> = segments.segment_ids.iter().map(|&id| id != NO_SEGMENT && id as u16 == segment_index).collect();
+    let pixels: Vec<bool> = instance_masks.instance_ids.iter().map(|&id| id != NO_INSTANCE && id as u16 == instance_index).collect();
     let mask_pixels = pixels.iter().filter(|&&p| p).count();
     let mask_box = PixelBox::around(keyframe.width, pixels.iter().enumerate().filter(|(_, &p)| p).map(|(i, _)| i))?;
     let mask = ObjectMask { width: keyframe.width, height: keyframe.height, pixels: &pixels };
@@ -87,7 +87,7 @@ fn place_mask(
         debug!(frame_id, %label, voxels = voxels.len(), "mask ignored: too few voxels");
         return None;
     }
-    Some(Detection { segment_index, label, score, voxels, mask_box, mask_pixels })
+    Some(Detection { instance_index, label, score, voxels, mask_box, mask_pixels })
 }
 
 /// The map cells of the mask's points that lie within the object's footprint rectangle and height band, which

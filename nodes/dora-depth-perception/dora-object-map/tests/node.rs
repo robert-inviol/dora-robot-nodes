@@ -1,4 +1,4 @@
-//! The node's message handling, fed encoded keyframes, poses and segments of a rendered room.
+//! The node's message handling, fed encoded keyframes, poses and instance masks of a rendered room.
 
 use std::path::PathBuf;
 
@@ -7,10 +7,10 @@ use glam::{Vec2, Vec3};
 use object_map::synthetic::{LabelledBox, SyntheticScene};
 use object_map::ObservedFrame;
 use object_map::ObjectMapSettings;
-use perception_wire::localization::{encode_keyframe_pose, FrameId, KeyframePose, Pose4, Tracking};
+use perception_wire::localization::{encode_keyframe_pose, FrameId, KeyframePose, Pose4Dof, Tracking};
 use perception_wire::navigation::{MapVersion, UnixNanos};
 use perception_wire::objects::{decode_object_update, ObjectUpdate, ObjectUpdateKind};
-use perception_wire::{encode_keyframe, encode_segments};
+use perception_wire::{encode_keyframe, encode_instance_masks};
 
 /// Mask erosion and point count for the synthetic camera's resolution, as an operator would set them.
 const SETTINGS_TOML: &str = "
@@ -38,16 +38,16 @@ fn keyframe_pose(frame: &ObservedFrame, tracking: Tracking) -> KeyframePose {
         frame_id: FrameId(frame.keyframe.frame_id),
         captured: UnixNanos(frame.keyframe.captured_unix_ns),
         map_version: frame.map_version,
-        pose: Pose4 { x_m: t.x, y_m: t.y, z_m: t.z, yaw_rad: frame.pose.yaw_rad },
+        pose: Pose4Dof { x_m: t.x, y_m: t.y, z_m: t.z, yaw_rad: frame.pose.yaw_rad },
         tracking,
         residual_m: 0.01,
         inlier_fraction: 0.9,
     }
 }
 
-/// Sends the frame's three messages, segments first, then the pose, then the keyframe.
+/// Sends the frame's three messages, instance masks first, then the pose, then the keyframe.
 fn send(node: &mut ObjectMapNode, frame: &ObservedFrame, tracking: Tracking) -> Vec<ObjectUpdate> {
-    let mut outputs = node.on_input(Input::Segments, &encode_segments(&frame.segments)).unwrap();
+    let mut outputs = node.on_input(Input::InstanceMasks, &encode_instance_masks(&frame.instance_masks)).unwrap();
     outputs.extend(node.on_input(Input::KeyframePose, &encode_keyframe_pose(&keyframe_pose(frame, tracking))).unwrap());
     outputs.extend(node.on_input(Input::Keyframe, &encode_keyframe(&frame.keyframe)).unwrap());
     outputs.iter().map(|o| decode_object_update(o).unwrap()).collect()
@@ -78,9 +78,9 @@ fn frames_the_localizer_lost_do_not_count() {
     let scene = scene();
     let mut node = ObjectMapNode::new(settings());
     let mut updates = send(&mut node, &observe(&scene, 1, POSES[0]), Tracking::Lost);
-    updates.extend(send(&mut node, &observe(&scene, 2, POSES[1]), Tracking::Relocalised));
+    updates.extend(send(&mut node, &observe(&scene, 2, POSES[1]), Tracking::Relocalized));
     updates.extend(send(&mut node, &observe(&scene, 3, POSES[2]), Tracking::Tracking));
-    assert!(updates.is_empty(), "only two frames were placed: {updates:#?}");
+    assert!(updates.is_empty(), "only two frames were registered: {updates:#?}");
 }
 
 #[test]

@@ -46,7 +46,7 @@ impl<'a> CameraView<'a> {
 
 /// How an object's voxels compare with the measured depth where they should be.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct VoxelTally {
+pub struct VoxelVotes {
     /// Projected inside the image, within the trusted depth range.
     pub in_view: usize,
     /// The measured depth is at the voxel: the camera sees the object's surface.
@@ -57,7 +57,7 @@ pub struct VoxelTally {
     pub hidden: usize,
 }
 
-impl VoxelTally {
+impl VoxelVotes {
     pub fn judged(&self) -> usize {
         self.surface + self.seen_past
     }
@@ -75,33 +75,33 @@ pub enum Verdict {
     Inconclusive,
 }
 
-pub fn judge(voxels: &VoxelSet, grid: VoxelGrid, view: &CameraView, settings: &AbsenceSettings) -> (Verdict, VoxelTally) {
+pub fn judge(voxels: &VoxelSet, grid: VoxelGrid, view: &CameraView, settings: &AbsenceSettings) -> (Verdict, VoxelVotes) {
     let range = RangeLimits { min_m: RangeLimits::D455.min_m, max_m: settings.max_depth_m };
-    let mut tally = VoxelTally::default();
+    let mut votes = VoxelVotes::default();
     for cell in voxels.cells() {
         let Some((pixel, expected_m)) = view.project(grid.centre(cell)) else { continue };
         if !range.contains(expected_m) {
             continue;
         }
-        tally.in_view += 1;
+        votes.in_view += 1;
         let measured_m = view.depth_m[pixel];
         if !RangeLimits::D455.contains(measured_m) || measured_m < expected_m - settings.surface_margin_m {
-            tally.hidden += 1;
+            votes.hidden += 1;
         } else if measured_m > expected_m + settings.surface_margin_m {
-            tally.seen_past += 1;
+            votes.seen_past += 1;
         } else {
-            tally.surface += 1;
+            votes.surface += 1;
         }
     }
-    let judged = tally.judged();
+    let judged = votes.judged();
     let verdict = if judged < settings.min_judged_voxels {
         Verdict::NoEvidence
-    } else if tally.surface as f32 >= settings.surface_fraction * judged as f32 {
+    } else if votes.surface as f32 >= settings.surface_fraction * judged as f32 {
         Verdict::Present
-    } else if tally.seen_past as f32 >= settings.seen_past_fraction * judged as f32 {
+    } else if votes.seen_past as f32 >= settings.seen_past_fraction * judged as f32 {
         Verdict::Missing
     } else {
         Verdict::Inconclusive
     };
-    (verdict, tally)
+    (verdict, votes)
 }

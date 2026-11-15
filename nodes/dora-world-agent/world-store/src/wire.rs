@@ -6,7 +6,7 @@ use perception_wire::navigation::ObjectId;
 use world_model::{Point, Size};
 
 use crate::types::{
-    ClearanceMm, DoorwaySpan, Footprint, FreeSpace, HeightBand, InvalidFreeSpace, JpegImage, ObjectChange, ObjectUpdate,
+    ClearanceMm, DoorwaySpan, Footprint, OccupancyGrid, HeightBand, InvalidOccupancyGrid, JpegImage, ObjectChange, ObjectUpdate,
     PlaceEdge, PlaceNode, Position3, RoomShape, Topology,
 };
 
@@ -55,11 +55,11 @@ impl TryFrom<objects::ObjectUpdate> for ObjectUpdate {
     }
 }
 
-impl TryFrom<space_map::FreeSpace> for FreeSpace {
-    type Error = InvalidFreeSpace;
+impl TryFrom<space_map::OccupancyGrid> for OccupancyGrid {
+    type Error = InvalidOccupancyGrid;
 
-    fn try_from(wire: space_map::FreeSpace) -> Result<Self, InvalidFreeSpace> {
-        FreeSpace::new(
+    fn try_from(wire: space_map::OccupancyGrid) -> Result<Self, InvalidOccupancyGrid> {
+        OccupancyGrid::new(
             wire.map_version,
             wire.built,
             point(wire.origin),
@@ -153,8 +153,8 @@ mod tests {
     }
 
     #[test]
-    fn a_free_space_grid_with_the_wrong_cell_count_is_refused() {
-        let wire = space_map::FreeSpace {
+    fn a_occupancy_grid_grid_with_the_wrong_cell_count_is_refused() {
+        let wire = space_map::OccupancyGrid {
             map_version: MapVersion(1),
             built: UnixNanos(0),
             origin: Vec2::ZERO,
@@ -164,6 +164,6 @@ mod tests {
             band: space_map::HeightBand { min_m: 0.05, max_m: 1.2 },
             clearance_mm: vec![0; 5],
         };
-        assert!(matches!(FreeSpace::try_from(wire), Err(InvalidFreeSpace::WrongCellCount { expected: 6, received: 5, .. })));
+        assert!(matches!(OccupancyGrid::try_from(wire), Err(InvalidOccupancyGrid::WrongCellCount { expected: 6, received: 5, .. })));
     }
 }

@@ -1,7 +1,7 @@
 [package]
 name = "dora-depth-perception"
 version = "0.1.0"
-description = "dora node that turns keyframes and segments into scenes: planes, room and object footprints"
+description = "dora node that turns keyframes and instance masks into scenes: planes, room and object footprints"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

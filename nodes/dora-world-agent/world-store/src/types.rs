@@ -1,4 +1,4 @@
-//! What the store is told, in domain types: object updates, the map's topology and free space, robot poses, people,
+//! What the store is told, in domain types: object updates, the map's topology and occupancy grid, robot poses, people,
 //! goals and room names. All positions are in the map frame, metres.
 
 use std::fmt;
@@ -55,7 +55,7 @@ pub struct Topology {
     pub edges: Vec<PlaceEdge>,
 }
 
-/// One cell of the free-space grid: millimetres to the nearest occupied cell, with two reserved values.
+/// One cell of the occupancy grid: millimetres to the nearest occupied cell, with two reserved values.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ClearanceMm(pub u16);
 
@@ -79,7 +79,7 @@ impl ClearanceMm {
     }
 }
 
-/// The height band above the floor that the free-space grid considers.
+/// The height band above the floor that the occupancy grid considers.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct HeightBand {
     pub min_m: f32,
@@ -87,7 +87,7 @@ pub struct HeightBand {
 }
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
-pub enum InvalidFreeSpace {
+pub enum InvalidOccupancyGrid {
     #[error("a {width} by {height} grid needs {expected} cells, received {received}")]
     WrongCellCount { width: u32, height: u32, expected: usize, received: usize },
     #[error("the resolution must be a positive number of metres, received {0}")]
@@ -96,7 +96,7 @@ pub enum InvalidFreeSpace {
 
 /// The 2D clearance grid of one map version, row-major from `origin` (the corner of cell 0), rows along y.
 #[derive(Clone, Debug, PartialEq)]
-pub struct FreeSpace {
+pub struct OccupancyGrid {
     map_version: MapVersion,
     built: UnixNanos,
     origin: Point,
@@ -108,7 +108,7 @@ pub struct FreeSpace {
 }
 
 #[allow(clippy::too_many_arguments)]
-impl FreeSpace {
+impl OccupancyGrid {
     pub fn new(
         map_version: MapVersion,
         built: UnixNanos,
@@ -118,13 +118,13 @@ impl FreeSpace {
         height: u32,
         band: HeightBand,
         clearance: Vec<ClearanceMm>,
-    ) -> Result<Self, InvalidFreeSpace> {
+    ) -> Result<Self, InvalidOccupancyGrid> {
         if !(resolution_m.is_finite() && resolution_m > 0.0) {
-            return Err(InvalidFreeSpace::BadResolution(resolution_m));
+            return Err(InvalidOccupancyGrid::BadResolution(resolution_m));
         }
         let expected = width as usize * height as usize;
         if clearance.len() != expected {
-            return Err(InvalidFreeSpace::WrongCellCount { width, height, expected, received: clearance.len() });
+            return Err(InvalidOccupancyGrid::WrongCellCount { width, height, expected, received: clearance.len() });
         }
         Ok(Self { map_version, built, origin, resolution_m, width, height, band, clearance })
     }
@@ -271,14 +271,14 @@ impl FloorVelocity {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct JointPlacement {
+pub struct JointInMap {
     pub joint: Joint,
     pub position: Position3,
 }
 
-/// A person the people tracker has confirmed, as seen in one camera frame and placed in the map.
+/// A person the people tracker has confirmed, as seen in one camera frame and transformed into the map frame.
 #[derive(Clone, Debug, PartialEq)]
-pub struct PersonSighting {
+pub struct PersonObservation {
     pub track: TrackId,
     /// When the store received the frame: people tracks are timed on the camera's clock, which the server does not
     /// share.
@@ -288,8 +288,8 @@ pub struct PersonSighting {
     pub torso: Position3,
     /// Absent until the tracker has measured it.
     pub velocity: Option<FloorVelocity>,
-    /// Each joint depth placed, at most once each.
-    pub joints: Vec<JointPlacement>,
+    /// Each joint the skeleton fit found, at most once each.
+    pub joints: Vec<JointInMap>,
 }
 
 /// The agent slot that sent a goal.
@@ -323,20 +323,20 @@ pub enum InputSource {
     RobotPose,
     Objects,
     Topology,
-    FreeSpace,
+    OccupancyGrid,
     People,
 }
 
 impl InputSource {
     pub const ALL: [InputSource; 5] =
-        [InputSource::RobotPose, InputSource::Objects, InputSource::Topology, InputSource::FreeSpace, InputSource::People];
+        [InputSource::RobotPose, InputSource::Objects, InputSource::Topology, InputSource::OccupancyGrid, InputSource::People];
 
     pub fn name(self) -> &'static str {
         match self {
             InputSource::RobotPose => "robot pose",
             InputSource::Objects => "object map",
             InputSource::Topology => "topology",
-            InputSource::FreeSpace => "free space",
+            InputSource::OccupancyGrid => "occupancy grid",
             InputSource::People => "people tracking",
         }
     }

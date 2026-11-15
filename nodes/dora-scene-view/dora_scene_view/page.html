@@ -130,7 +130,7 @@ function recolour() {
     const seg = pointSegments[p], plane = pointPlanes[p];
     for (let c = 0; c < 3; c++) {
       const photo = photoColors[3 * p + c];
-      if (overlays.segments && seg !== SCENE.no_segment) {
+      if (overlays.segments && seg !== SCENE.no_instance) {
         out[3 * p + c] = 255 * [palette[seg].r, palette[seg].g, palette[seg].b][c];
       } else if (overlays.planes && plane !== SCENE.no_plane) {
         const tint = SCENE.planes[plane].color;
@@ -150,7 +150,7 @@ scene.add(cloud);
 const segmentOnlyGeometry = new THREE.BufferGeometry();
 segmentOnlyGeometry.setAttribute("position", positionAttribute);
 segmentOnlyGeometry.setAttribute("color", colorAttribute);
-segmentOnlyGeometry.setIndex(pointSegments.reduce((kept, id, p) => (id !== SCENE.no_segment && kept.push(p), kept), []));
+segmentOnlyGeometry.setIndex(pointSegments.reduce((kept, id, p) => (id !== SCENE.no_instance && kept.push(p), kept), []));
 const segmentCloud = new THREE.Points(segmentOnlyGeometry, pointMaterial);
 scene.add(segmentCloud);
 function updateCloudVisibility() {

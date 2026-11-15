@@ -17,7 +17,7 @@ use crate::navigation::{MapVersion, UnixNanos};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ObjectUpdateKind {
-    /// Confirmed after enough sightings; first report of this id.
+    /// Confirmed after enough observations; first report of this id.
     Appeared,
     /// Seen again; position, size, label or crop may have changed.
     Updated,
@@ -75,7 +75,7 @@ pub struct ObjectUpdate {
     pub label: String,
     /// The best segmentation score among the object's detections.
     pub score: f32,
-    /// Sightings over sightings plus misses.
+    /// Observations over observations plus misses.
     pub confidence: f32,
     pub seen_count: u32,
     /// The keyframe whose evidence caused this update.

@@ -71,6 +71,10 @@ pub struct Registration {
     pub weakest_constraint: f64,
 }
 
+/// The normal equations are summed over fixed chunks of the source, in parallel, and the chunk sums are added in
+/// source order: the same inputs give the same pose and fitness whatever the thread count.
+const SUM_CHUNK_POINTS: usize = 1024;
+
 #[derive(Default, Clone, Copy)]
 struct Normal4 {
     h: [[f64; 4]; 4],
@@ -157,9 +161,9 @@ fn register_with(source: &[Vec3], target: &Target, seed: Pose, settings: &Regist
     let mut last = Normal4::default();
     for &max_distance in &settings.correspondence_schedule_m {
         for _ in 0..settings.iterations_per_stage {
-            last = source
-                .par_iter()
-                .fold(Normal4::default, |mut acc, &p| {
+            let chunk_sums: Vec<Normal4> = source
+                .par_chunks(SUM_CHUNK_POINTS)
+                .map(|chunk| chunk.iter().fold(Normal4::default(), |mut acc, &p| {
                     let moved = pose.apply(p);
                     let Some((index, _)) = target.grid.nearest(moved, max_distance) else { return acc };
                     let Some(normal) = target.normals[index as usize] else { return acc };
@@ -178,8 +182,9 @@ fn register_with(source: &[Vec3], target: &Target, seed: Pose, settings: &Regist
                         acc.squared += r * r;
                     }
                     acc
-                })
-                .reduce(Normal4::default, Normal4::add);
+                }))
+                .collect();
+            last = chunk_sums.into_iter().fold(Normal4::default(), Normal4::add);
             let mut damped = last.h;
             for (k, row) in damped.iter_mut().enumerate() {
                 row[k] += settings.damping;

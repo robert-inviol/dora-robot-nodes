@@ -1,0 +1,48 @@
+# On the camera's machine: records what the odometry node takes (depth frames, imu messages, the calibration and the
+# pose model's person poses, wired as pose-dataflow.yml wires them) for `replay-odometry-inputs` to run the odometry
+# over offline (see nodes/dora-depth-perception/depth-inertial-odometry/README.md). Nothing is published. Set
+# RECORDINGS_DIRECTORY to where recordings go (each is a new directory in it, named by the Unix time it started); raw depth is about 24 MB a second, so 120 s is about
+# 3 GB. Paths are relative to this file; the binaries are those of pose-dataflow.yml and dora-odometry-input-recorder.
+nodes:
+  - id: camera
+    path: ../target/release/dora-realsense
+    env:
+      IMU_CALIBRATION_PATH: imu-calibration.json
+    inputs:
+      # Carries nothing; it keeps the node's events open so the dataflow can stop it.
+      tick: dora/timer/millis/500
+    outputs:
+      - model_input
+      - depth
+      - imu
+      - calibration
+
+  - id: pose
+    path: ../../dora-hailo-perception/dora_hailo_pose_node.py
+    env:
+      PYTHONPATH: ../../../lib/dora-rig-messages
+    inputs:
+      model_input:
+        source: camera/model_input
+        queue_size: 1
+    outputs:
+      - person_poses
+
+  - id: recorder
+    path: ../../dora-depth-perception/target/release/dora-odometry-input-recorder
+    env:
+      RECORDINGS_DIRECTORY: /home/bob/odometry-recordings
+      RECORD_SECONDS: "120"
+    inputs:
+      imu:
+        source: camera/imu
+        queue_size: 1000
+      depth:
+        source: camera/depth
+        queue_size: 4
+      calibration:
+        source: camera/calibration
+        queue_size: 1
+      person_poses:
+        source: pose/person_poses
+        queue_size: 1

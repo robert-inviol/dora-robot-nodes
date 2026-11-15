@@ -214,7 +214,7 @@ QuestionId = NewType("QuestionId", int)
 Revision = NewType("Revision", int)
 RoomId = NewType("RoomId", int)
 
-SPACE_QUESTION_TYPE = pa.struct(
+SPATIAL_QUERY_TYPE = pa.struct(
     [
         ("question_id", pa.uint64()),
         ("asked_unix_ns", pa.int64()),
@@ -226,8 +226,8 @@ SPACE_QUESTION_TYPE = pa.struct(
 
 
 @dataclass(frozen=True)
-class SpaceQuestion:
-    """A question about the space for the spatial agent; its answers come back as space_answer messages."""
+class SpatialQuery:
+    """A question about the space for the spatial agent; its answers come back as spatial_answer messages."""
 
     question_id: QuestionId
     asked_unix_ns: int
@@ -237,12 +237,12 @@ class SpaceQuestion:
     def to_arrow(self) -> pa.Array:
         return one_row(
             {"question_id": self.question_id, "asked_unix_ns": self.asked_unix_ns, "asker": self.asker, "text": self.text},
-            SPACE_QUESTION_TYPE,
+            SPATIAL_QUERY_TYPE,
         )
 
     @classmethod
-    def from_arrow(cls, array: pa.Array) -> "SpaceQuestion":
-        row = only_row(array, SPACE_QUESTION_TYPE)
+    def from_arrow(cls, array: pa.Array) -> "SpatialQuery":
+        row = only_row(array, SPATIAL_QUERY_TYPE)
         return cls(QuestionId(row["question_id"]), row["asked_unix_ns"], row["asker"], row["text"])
 
 
@@ -265,7 +265,7 @@ REFERENCE_TYPE = pa.struct(
     ]
 )
 
-SPACE_ANSWER_TYPE = pa.struct(
+SPATIAL_ANSWER_TYPE = pa.struct(
     [
         ("question_id", pa.uint64()),
         # 0 for the first answer; each later message for the same question counts up.
@@ -299,7 +299,7 @@ class Reference:
 
 
 @dataclass(frozen=True)
-class SpaceAnswer:
+class SpatialAnswer:
     question_id: QuestionId
     revision: Revision
     is_final: bool
@@ -321,12 +321,12 @@ class SpaceAnswer:
                 ],
                 "goal_id": self.goal_id,
             },
-            SPACE_ANSWER_TYPE,
+            SPATIAL_ANSWER_TYPE,
         )
 
     @classmethod
-    def from_arrow(cls, array: pa.Array) -> "SpaceAnswer":
-        row = only_row(array, SPACE_ANSWER_TYPE)
+    def from_arrow(cls, array: pa.Array) -> "SpatialAnswer":
+        row = only_row(array, SPATIAL_ANSWER_TYPE)
         goal = row["goal_id"]
         return cls(
             question_id=QuestionId(row["question_id"]),
@@ -343,13 +343,13 @@ class SpaceAnswer:
 
 # Golden examples of this module's messages, merged into fixtures.EXAMPLES. Every float is exact in float32.
 FIXTURE_EXAMPLES: dict[str, object] = {
-    "space_question": SpaceQuestion(
+    "spatial_query": SpatialQuery(
         question_id=QuestionId(31),
         asked_unix_ns=1_762_560_000_250_000_000,
         asker="planner",
         text="Where is my blue mug?",
     ),
-    "space_answer_first": SpaceAnswer(
+    "spatial_answer_first": SpatialAnswer(
         question_id=QuestionId(31),
         revision=Revision(0),
         is_final=False,
@@ -361,7 +361,7 @@ FIXTURE_EXAMPLES: dict[str, object] = {
         ),
         goal_id=GoalId(17),
     ),
-    "space_answer_final": SpaceAnswer(
+    "spatial_answer_final": SpatialAnswer(
         question_id=QuestionId(31),
         revision=Revision(2),
         is_final=True,

@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "dora-sam3-segmenter"
 version = "0.1.0"
-description = "A dora node that segments each keyframe into the object types it is told about, with SAM 3 on a CUDA GPU"
+description = "A dora node that segments each keyframe into instance masks of the object types it is told about, with SAM 3 on a CUDA GPU"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.11"

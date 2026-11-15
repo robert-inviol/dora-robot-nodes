@@ -14,9 +14,9 @@ use world_model::{
     ViewRequest, WorldError, WorldModel,
 };
 use world_store::{
-    AgentName, Caption, ClearanceMm, Clock, DoorwayId, DoorwaySpan, FrameId, FreeSpace, HeightBand, IngestError, IssuedGoal,
+    AgentName, Caption, ClearanceMm, Clock, DoorwayId, DoorwaySpan, FrameId, OccupancyGrid, HeightBand, IngestError, IssuedGoal,
     JpegImage, ManualClock, ModelName, ObjectChange, ObjectUpdate, OpenError, PlaceEdge, PlaceNode, Position3, Footprint,
-    FloorVelocity, JointPlacement, PersonSighting, Rejection, RobotPoseSample, RoomId, RoomShape, StoreConfig, Topology,
+    FloorVelocity, JointInMap, PersonObservation, Rejection, RobotPoseSample, RoomId, RoomShape, StoreConfig, Topology,
     WorldStore, WorldWriter,
 };
 
@@ -148,9 +148,9 @@ fn last_seen_ago(id: u64) -> i64 {
     }
 }
 
-/// The free-space grid of the house: walls along every room outline except the doorways, the furniture, and
+/// The occupancy grid of the house: walls along every room outline except the doorways, the furniture, and
 /// unknown ground outside the rooms. Clearances are exact distances to the nearest occupied cell, capped at 1.5 m.
-fn free_space() -> FreeSpace {
+fn occupancy_grid() -> OccupancyGrid {
     let (width, height) = (120_u32, 100_u32);
     let centre = |column: u32, row: u32| p((column as f32 + 0.5) * RESOLUTION_M, (row as f32 + 0.5) * RESOLUTION_M);
     let inside_rooms = |q: Point| ROOMS.iter().any(|(_, _, [x0, y0, x1, y1])| (*x0..=*x1).contains(&q.x_m) && (*y0..=*y1).contains(&q.y_m));
@@ -204,7 +204,7 @@ fn free_space() -> FreeSpace {
             });
         }
     }
-    FreeSpace::new(VERSION, ago(17), p(0.0, 0.0), RESOLUTION_M, width, height, HeightBand { min_m: 0.05, max_m: 1.2 }, cells).unwrap()
+    OccupancyGrid::new(VERSION, ago(17), p(0.0, 0.0), RESOLUTION_M, width, height, HeightBand { min_m: 0.05, max_m: 1.2 }, cells).unwrap()
 }
 
 fn config(dir: &Path) -> (StoreConfig, ManualClock) {
@@ -220,7 +220,7 @@ fn seed(writer: &WorldWriter) {
     for &(id, name, _) in &ROOMS {
         writer.name_room(RoomId(id), room(name)).unwrap();
     }
-    writer.set_free_space(free_space()).unwrap();
+    writer.set_occupancy_grid(occupancy_grid()).unwrap();
     for f in &FURNITURE {
         let appeared = if f.id == 51 { ago(300) } else { ago(86_400) };
         writer.apply_object_update(update(f, ObjectChange::Appeared, f.at, appeared)).unwrap();
@@ -304,7 +304,7 @@ async fn the_gap_between_the_sofa_and_the_armchair_is_measured_between_footprint
 }
 
 #[tokio::test]
-async fn clearance_along_a_line_comes_from_the_free_space_grid() {
+async fn clearance_along_a_line_comes_from_the_occupancy_grid_grid() {
     let House { store, _dir, .. } = house();
     let open = store.clearance_between(Landmark::Place(PlaceId(2)), Landmark::Place(PlaceId(4))).await.unwrap();
     assert!(open.passable, "{open:?}");
@@ -335,11 +335,11 @@ async fn a_route_from_the_robot_to_the_sofa_runs_through_the_hallway() {
 #[tokio::test]
 async fn the_robot_heading_north_has_the_living_room_and_bedroom_doors_ahead() {
     let House { store, _dir, .. } = house();
-    let sighting = store.last_seen(EntityRef::Robot).await.unwrap();
-    assert_eq!(sighting.room, room("kitchen"));
-    assert!((sighting.heading_deg.unwrap() - 90.0).abs() < 1e-3);
+    let observation = store.last_seen(EntityRef::Robot).await.unwrap();
+    assert_eq!(observation.room, room("kitchen"));
+    assert!((observation.heading_deg.unwrap() - 90.0).abs() < 1e-3);
     assert_eq!(
-        sighting.exits_ahead,
+        observation.exits_ahead,
         vec!["p4 (doorway between hallway and living_room)", "p6 (doorway between hallway and bedroom)"]
     );
 }
@@ -374,12 +374,12 @@ async fn changes_since_a_time_leave_out_older_ones() {
 #[tokio::test]
 async fn a_move_keeps_where_the_object_stood_before() {
     let House { store, _dir, .. } = house();
-    let before = store.placement_at(ObjectId(21), ago(2000)).await.unwrap().unwrap();
+    let before = store.location_at(ObjectId(21), ago(2000)).await.unwrap().unwrap();
     assert_eq!((before.room, before.position, before.until), (room("bedroom"), p(7.0, 7.0), Some(ago(1500))));
-    let after = store.placement_at(ObjectId(21), ago(1000)).await.unwrap().unwrap();
+    let after = store.location_at(ObjectId(21), ago(1000)).await.unwrap().unwrap();
     assert_eq!((after.room, after.until), (room("hallway"), None));
-    assert_eq!(store.placement_at(ObjectId(21), ago(100_000)).await.unwrap(), None);
-    assert_eq!(store.placement_at(ObjectId(999), NOW).await.unwrap_err(), WorldError::UnknownObject(ObjectId(999)));
+    assert_eq!(store.location_at(ObjectId(21), ago(100_000)).await.unwrap(), None);
+    assert_eq!(store.location_at(ObjectId(999), NOW).await.unwrap_err(), WorldError::UnknownObject(ObjectId(999)));
     let described = store.describe_object(ObjectId(21)).await.unwrap();
     assert_eq!(described.history.iter().map(|h| h.room.0.as_str()).collect::<Vec<_>>(), vec!["bedroom", "hallway"]);
 }
@@ -475,8 +475,8 @@ async fn the_snapshot_holds_rooms_objects_changes_and_stale_sources() {
     assert_eq!(later.stale_sources[0].silent_s, 10.0);
 }
 
-/// Track 7 standing in the living room facing +y (north), every joint placed, at `seen`.
-fn standing(seen: UnixNanos, velocity: Option<FloorVelocity>) -> PersonSighting {
+/// Track 7 standing in the living room facing +y (north), every fitted joint, at `seen`.
+fn standing(seen: UnixNanos, velocity: Option<FloorVelocity>) -> PersonObservation {
     let height = |joint: Joint| match joint {
         Joint::Nose | Joint::LeftEye | Joint::RightEye | Joint::LeftEar | Joint::RightEar => 1.62,
         Joint::LeftShoulder | Joint::RightShoulder => 1.42,
@@ -488,7 +488,7 @@ fn standing(seen: UnixNanos, velocity: Option<FloorVelocity>) -> PersonSighting 
     };
     // Facing +y, a person's left is -x.
     let side = |joint: Joint| if joint.name().starts_with("left") { -0.2 } else if joint.name().starts_with("right") { 0.2 } else { 0.0 };
-    PersonSighting {
+    PersonObservation {
         track: TrackId(7),
         seen,
         map_version: VERSION,
@@ -496,13 +496,13 @@ fn standing(seen: UnixNanos, velocity: Option<FloorVelocity>) -> PersonSighting 
         velocity,
         joints: Joint::ALL
             .into_iter()
-            .map(|joint| JointPlacement { joint, position: Position3 { x_m: 8.0 + side(joint), y_m: 2.0, z_m: height(joint) } })
+            .map(|joint| JointInMap { joint, position: Position3 { x_m: 8.0 + side(joint), y_m: 2.0, z_m: height(joint) } })
             .collect(),
     }
 }
 
 #[tokio::test]
-async fn a_person_is_placed_in_their_room_with_every_joint_above_the_floor() {
+async fn a_person_is_in_their_room_with_every_joint_above_the_floor() {
     let House { store, writer, clock, _dir } = house();
     writer.record_people(vec![standing(NOW, Some(FloorVelocity { vx_m_s: 0.05, vy_m_s: 0.0 }))]).unwrap();
     writer.flush().unwrap();
@@ -511,9 +511,9 @@ async fn a_person_is_placed_in_their_room_with_every_joint_above_the_floor() {
     let person = &snapshot.people[0];
     assert_eq!((person.id, &person.room, person.liveness), (TrackId(7), &room("living_room"), TrackLiveness::Live));
     assert!((person.heading_deg.unwrap() - 90.0).abs() < 1e-3, "standing still, they head where their shoulders face: {:?}", person.heading_deg);
-    let sighting = store.last_seen(EntityRef::Track(TrackId(7))).await.unwrap();
-    assert_eq!(sighting.joints.iter().map(|j| j.joint).collect::<Vec<_>>(), Joint::ALL);
-    let nose = sighting.joints.iter().find(|j| j.joint == Joint::Nose).unwrap();
+    let observation = store.last_seen(EntityRef::Track(TrackId(7))).await.unwrap();
+    assert_eq!(observation.joints.iter().map(|j| j.joint).collect::<Vec<_>>(), Joint::ALL);
+    let nose = observation.joints.iter().find(|j| j.joint == Joint::Nose).unwrap();
     assert_eq!((nose.position, nose.height_above_floor_m), (p(8.0, 2.0), Some(1.62)));
     clock.advance(Duration::from_secs(3));
     let later = store.snapshot().await.unwrap();
@@ -531,12 +531,25 @@ async fn a_person_is_recorded_at_most_once_per_interval_and_heads_where_they_wal
     writer.record_people(Vec::new()).unwrap();
     writer.flush().unwrap();
     let rows = store.query_text("SELECT seen_unix_ns, heading_rad FROM track_pose ORDER BY seen_unix_ns".to_owned(), NonZeroUsize::new(10).unwrap()).await.unwrap();
-    assert_eq!(rows.rows.len(), 2, "the sighting 100 ms after the first is dropped: {rows:?}");
+    assert_eq!(rows.rows.len(), 2, "the observation 100 ms after the first is dropped: {rows:?}");
     let joints = store.query_text("SELECT count(*) FROM track_joint".to_owned(), NonZeroUsize::new(1).unwrap()).await.unwrap();
     assert_eq!(joints.rows[0][0], SqlValue::Integer(2 * Joint::ALL.len() as i64));
     let person = &store.snapshot().await.unwrap().people[0];
     assert!((person.heading_deg.unwrap().abs() - 180.0).abs() < 1e-3, "walking west, not where they face: {:?}", person.heading_deg);
-    assert!((person.speed_m_s - 0.8).abs() < 1e-6);
+    assert!((person.speed_m_s.unwrap() - 0.8).abs() < 1e-6);
+}
+
+#[tokio::test]
+async fn a_person_whose_speed_was_not_measured_is_stored_and_read_with_an_unknown_speed() {
+    let House { store, writer, _dir, .. } = house();
+    writer.record_people(vec![standing(NOW, None)]).unwrap();
+    writer.flush().unwrap();
+    let rows = store.query_text("SELECT speed_m_s FROM track_pose".to_owned(), NonZeroUsize::new(10).unwrap()).await.unwrap();
+    assert_eq!(rows.rows, [vec![SqlValue::Null]], "not measured is not standing still");
+    assert_eq!(store.snapshot().await.unwrap().people[0].speed_m_s, None);
+    let observation = store.last_seen(EntityRef::Track(TrackId(7))).await.unwrap();
+    assert_eq!(observation.speed, Some(world_model::PersonSpeed::Unknown));
+    assert_eq!(serde_json::to_value(&observation).unwrap()["speed"], "unknown");
 }
 
 #[tokio::test]

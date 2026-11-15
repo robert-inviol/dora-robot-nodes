@@ -11,8 +11,8 @@ use crate::clock;
 use crate::room_names::{RoomNameSink, RoomNameSinkError};
 use crate::world::{
     Change, ChangeKind, Clearance, Doorway, EntityRef, FindQuery, FoundObject, Joint, JointPosition, Landmark,
-    ObjectDescription, ObjectSummary, PersonTrack, Placement, PlaceSummary, Point, PngImage, ReadOnlySql, Relation, RobotState,
-    RoomName, RoomSummary, Route, Sighting, Size, SqlRows, Stamp, TrackLiveness, ViewKind, ViewRequest, WorldError,
+    ObjectDescription, ObjectSummary, PersonTrack, LocationInterval, PlaceSummary, Point, PngImage, ReadOnlySql, Relation, RobotState,
+    RoomName, RoomSummary, Route, Observation, Size, SqlRows, Timestamp, TrackLiveness, ViewKind, ViewRequest, WorldError,
     WorldModel, WorldSnapshot,
 };
 
@@ -86,7 +86,7 @@ struct FakeObject {
     summary: ObjectSummary,
     caption: &'static str,
     relations: Vec<Relation>,
-    history: Vec<Placement>,
+    history: Vec<LocationInterval>,
 }
 
 /// A fixed house whose clock is the moment it was built, so ages in its answers stay put across calls.
@@ -152,7 +152,7 @@ impl FakeWorld {
             },
             caption,
             relations: Vec::new(),
-            history: vec![Placement { room: room(room_name), position: point(x, y), from: ago(86_400), until: None }],
+            history: vec![LocationInterval { room: room(room_name), position: point(x, y), from: ago(86_400), until: None }],
         };
         let mut objects = vec![
             object(42, "table", "kitchen", 2.0, 1.5, (1.6, 0.9, 0.74), 40, "a wooden kitchen table"),
@@ -166,11 +166,11 @@ impl FakeWorld {
         ];
         let mug = objects.iter_mut().find(|o| o.summary.id == ObjectId(51)).expect("the mug is in the house");
         mug.relations.push(Relation { relation: "on".to_owned(), other: ObjectId(42) });
-        mug.history = vec![Placement { room: room("kitchen"), position: point(2.2, 1.6), from: ago(420), until: None }];
+        mug.history = vec![LocationInterval { room: room("kitchen"), position: point(2.2, 1.6), from: ago(420), until: None }];
         let basket = objects.iter_mut().find(|o| o.summary.id == ObjectId(21)).expect("the basket is in the house");
         basket.history = vec![
-            Placement { room: room("bedroom"), position: point(7.0, 7.0), from: ago(86_400), until: Some(ago(2400)) },
-            Placement { room: room("hallway"), position: point(4.6, 5.0), from: ago(1500), until: None },
+            LocationInterval { room: room("bedroom"), position: point(7.0, 7.0), from: ago(86_400), until: Some(ago(2400)) },
+            LocationInterval { room: room("hallway"), position: point(4.6, 5.0), from: ago(1500), until: None },
         ];
         let people = vec![
             PersonTrack {
@@ -178,7 +178,7 @@ impl FakeWorld {
                 room: room("living_room"),
                 position: point(8.1, 2.0),
                 heading_deg: Some(180.0),
-                speed_m_s: 0.6,
+                speed_m_s: Some(0.6),
                 last_seen: ago(0),
                 liveness: TrackLiveness::Live,
             },
@@ -187,7 +187,7 @@ impl FakeWorld {
                 room: room("hallway"),
                 position: point(5.0, 4.2),
                 heading_deg: Some(90.0),
-                speed_m_s: 0.8,
+                speed_m_s: None,
                 last_seen: ago(120),
                 liveness: TrackLiveness::Lost,
             },
@@ -223,8 +223,8 @@ impl FakeWorld {
         }
     }
 
-    fn stamp_now(&self) -> Stamp {
-        Stamp { as_of: self.now, map_version: self.map_version }
+    fn stamp_now(&self) -> Timestamp {
+        Timestamp { as_of: self.now, map_version: self.map_version }
     }
 
     fn robot_point(&self) -> Point {
@@ -461,7 +461,7 @@ impl WorldModel for FakeWorld {
         })
     }
 
-    async fn stamp(&self) -> Result<Stamp, WorldError> {
+    async fn stamp(&self) -> Result<Timestamp, WorldError> {
         Ok(self.stamp_now())
     }
 
@@ -549,7 +549,7 @@ impl WorldModel for FakeWorld {
         })
     }
 
-    async fn last_seen(&self, subject: EntityRef) -> Result<Sighting, WorldError> {
+    async fn last_seen(&self, subject: EntityRef) -> Result<Observation, WorldError> {
         match subject {
             EntityRef::Track(id) => {
                 let track = self.track(id)?;
@@ -562,7 +562,7 @@ impl WorldModel for FakeWorld {
                     .filter(|p| (p.position.x_m - track.position.x_m) * hx + (p.position.y_m - track.position.y_m) * hy > 0.0)
                     .collect();
                 ahead.sort_by(|a, b| a.position.distance_to(track.position).total_cmp(&b.position.distance_to(track.position)));
-                Ok(Sighting {
+                Ok(Observation {
                     subject: subject.to_string(),
                     room: track.room.clone(),
                     position: track.position,
@@ -571,11 +571,12 @@ impl WorldModel for FakeWorld {
                     heading_deg: track.heading_deg,
                     exits_ahead: ahead.iter().map(|p| format!("{} ({})", p.id, p.name)).collect(),
                     joints: if id == TrackId(7) { standing_skeleton(track.position) } else { Vec::new() },
+                    speed: Some(track.speed_m_s.into()),
                 })
             }
             EntityRef::Object(id) => {
                 let summary = &self.object(id)?.summary;
-                Ok(Sighting {
+                Ok(Observation {
                     subject: subject.to_string(),
                     room: summary.room.clone(),
                     position: summary.position,
@@ -584,6 +585,7 @@ impl WorldModel for FakeWorld {
                     heading_deg: None,
                     exits_ahead: Vec::new(),
                     joints: Vec::new(),
+                    speed: None,
                 })
             }
             EntityRef::Robot | EntityRef::Place(_) => Err(WorldError::Unsupported("say when the robot or a place was last seen")),
@@ -708,9 +710,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_lost_person_heading_north_has_the_bedroom_door_ahead() {
-        let sighting = house().last_seen(EntityRef::Track(TrackId(3))).await.unwrap();
-        assert_eq!(sighting.exits_ahead, vec!["p6 (bedroom door)"]);
-        assert_eq!(sighting.seconds_ago, 120.0);
+        let observation = house().last_seen(EntityRef::Track(TrackId(3))).await.unwrap();
+        assert_eq!(observation.exits_ahead, vec!["p6 (bedroom door)"]);
+        assert_eq!(observation.seconds_ago, 120.0);
     }
 
     #[tokio::test]

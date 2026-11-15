@@ -1,6 +1,6 @@
 """Where odometry says the robot is: one pose per depth frame.
 
-The odom frame is fixed where the IMU rested when odometry started, with z up; it drifts against the real room as
+The odom frame is fixed where the IMU was during static initialization, with z up; it drifts against the real room as
 the robot travels. The body frame is the IMU's own axes (on the D455: x right, y down, z forward).
 
 `camera_ns` strictly increases from one pose to the next. A consumer that wants the pose at another camera time
@@ -49,8 +49,8 @@ ODOM_POSE_TYPE = pa.struct(
         ("matched_points", pa.uint32()),
         # The odom-frame direction of travel the cloud pinned down least, either way round, and the one sigma the
         # cloud alone leaves along it. Both null when the cloud did not correct the pose.
-        ("weakest_direction", _items(pa.float32())),
-        ("weakest_sigma_m", pa.float32()),
+        ("degenerate_direction", _items(pa.float32())),
+        ("degenerate_sigma_m", pa.float32()),
     ]
 )
 
@@ -62,14 +62,14 @@ def _vector(values: tuple[float, ...], length: int, name: str) -> tuple[float, .
 
 
 @dataclass(frozen=True)
-class WeakestDirection:
+class DegenerateDirection:
     """The direction of travel a cloud pinned down least, and the one sigma the cloud alone leaves along it."""
 
     direction: tuple[float, float, float]
     sigma_m: float
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "direction", _vector(self.direction, 3, "weakest_direction"))
+        object.__setattr__(self, "direction", _vector(self.direction, 3, "degenerate_direction"))
 
 
 @dataclass(frozen=True)
@@ -87,7 +87,7 @@ class OdomPose:
     heading_sigma_rad: float
     corrected: bool
     matched_points: int
-    weakest: WeakestDirection | None
+    degenerate: DegenerateDirection | None
 
     def __post_init__(self) -> None:
         for name, length in (("position_m", 3), ("orientation_xyzw", 4), ("velocity_m_s", 3), ("position_sigma_m", 3)):
@@ -107,8 +107,8 @@ class OdomPose:
                 "heading_sigma_rad": self.heading_sigma_rad,
                 "corrected": self.corrected,
                 "matched_points": self.matched_points,
-                "weakest_direction": None if self.weakest is None else list(self.weakest.direction),
-                "weakest_sigma_m": None if self.weakest is None else self.weakest.sigma_m,
+                "degenerate_direction": None if self.degenerate is None else list(self.degenerate.direction),
+                "degenerate_sigma_m": None if self.degenerate is None else self.degenerate.sigma_m,
             },
             ODOM_POSE_TYPE,
         )
@@ -116,10 +116,10 @@ class OdomPose:
     @classmethod
     def from_arrow(cls, array: pa.Array) -> "OdomPose":
         row = only_row(array, ODOM_POSE_TYPE)
-        direction, sigma_m = row.pop("weakest_direction"), row.pop("weakest_sigma_m")
+        direction, sigma_m = row.pop("degenerate_direction"), row.pop("degenerate_sigma_m")
         if (direction is None) != (sigma_m is None):
-            raise ValueError("odom pose has one of weakest_direction and weakest_sigma_m without the other")
+            raise ValueError("odom pose has one of degenerate_direction and degenerate_sigma_m without the other")
         missing = sorted(name for name, value in row.items() if value is None)
         if missing:
             raise ValueError(f"odom pose is missing {', '.join(missing)}")
-        return cls(**row, weakest=None if direction is None else WeakestDirection(tuple(direction), sigma_m))
+        return cls(**row, degenerate=None if direction is None else DegenerateDirection(tuple(direction), sigma_m))

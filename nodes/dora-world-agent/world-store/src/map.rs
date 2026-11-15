@@ -1,4 +1,4 @@
-//! The map held in memory for the geometry tools: the latest topology, the latest free-space grid and room names.
+//! The map held in memory for the geometry tools: the latest topology, the latest occupancy grid and room names.
 //! The writer replaces it as updates arrive; readers take a shared lock.
 
 use std::cmp::Reverse;
@@ -8,7 +8,7 @@ use perception_wire::navigation::{MapVersion, PlaceId, UnixNanos};
 use world_model::{Point, RoomName};
 
 use crate::geometry::{distance_to_polygon, polygon_contains};
-use crate::types::{FreeSpace, PlaceEdge, PlaceNode, RoomId, Topology};
+use crate::types::{OccupancyGrid, PlaceEdge, PlaceNode, RoomId, Topology};
 
 /// What objects stand in when no room polygon is known.
 pub const UNMAPPED_ROOM: &str = "unmapped";
@@ -46,7 +46,7 @@ pub enum RoomFilter {
 pub struct MapState {
     pub topology: Option<Topology>,
     pub doorway_places: Vec<DoorwayPlace>,
-    pub free_space: Option<FreeSpace>,
+    pub occupancy_grid: Option<OccupancyGrid>,
     pub room_names: BTreeMap<RoomId, RoomName>,
     pub latest_version: Option<MapVersion>,
 }
@@ -73,16 +73,16 @@ impl MapState {
         self.topology = Some(topology);
     }
 
-    pub fn set_free_space(&mut self, free_space: FreeSpace) {
-        self.note_version(free_space.map_version());
-        self.free_space = Some(free_space);
+    pub fn set_occupancy_grid(&mut self, occupancy_grid: OccupancyGrid) {
+        self.note_version(occupancy_grid.map_version());
+        self.occupancy_grid = Some(occupancy_grid);
     }
 
     /// When the map was last fused: the newer of the topology and free-space builds.
     pub fn fused(&self) -> Option<UnixNanos> {
         let topology = self.topology.as_ref().map(|t| t.built);
-        let free_space = self.free_space.as_ref().map(FreeSpace::built);
-        topology.max(free_space)
+        let occupancy_grid = self.occupancy_grid.as_ref().map(OccupancyGrid::built);
+        topology.max(occupancy_grid)
     }
 
     pub fn room_name(&self, room: Option<RoomId>) -> RoomName {

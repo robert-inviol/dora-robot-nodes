@@ -6,7 +6,7 @@ holding the world digest and one question; nothing carries over between calls. T
 
 ## How a question is answered
 
-1. A `space_question` arrives. The desk takes one `WorldModel::snapshot`, renders the digest from it, and puts the
+1. A `spatial_query` arrives. The desk takes one `WorldModel::snapshot`, renders the digest from it, and puts the
    digest at the top of the user message, then the question. The system prompt never holds the digest.
 2. Every configured answerer gets that message at once, each on its own warm `claude -p` process with the ten world
    tools over MCP.
@@ -86,7 +86,7 @@ their part of the digest with their id, such as `r3`, which answers may name.
 | `describe_object` | Geometry, caption, relations, where it stood over time, and its best views as images |
 | `clearance_between` | The narrowest gap between two objects, places or the robot, and whether the robot fits |
 | `route` | Length, places and rooms passed, narrowest clearance, estimated time |
-| `last_seen` | Where and when a person or object was last seen; for a person, the heading, the doorways ahead and every joint placed, with its height above the floor |
+| `last_seen` | Where and when a person or object was last seen; for a person, the heading, the doorways ahead and every fitted joint, with its height above the floor |
 | `changes_since` | What appeared, moved or disappeared since a UTC time |
 | `render_view` | A PNG of the map with objects highlighted |
 | `query_sql` | One read-only SELECT on the world store |

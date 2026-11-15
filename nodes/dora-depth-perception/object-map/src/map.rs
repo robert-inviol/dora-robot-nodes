@@ -1,8 +1,8 @@
 //! The objects of the map and every decision about their identity.
 //!
 //! Each keyframe goes through four steps, in order:
-//! 1. sightings: each detection is matched to an object or starts a candidate;
-//! 2. absences: confirmed objects not sighted are checked against the measured depth and may disappear;
+//! 1. observations: each detection is matched to an object or starts a candidate;
+//! 2. absences: confirmed objects not observed are checked against the measured depth and may disappear;
 //! 3. confirmation: candidates seen often enough become objects, or turn out to be a disappeared object, moved;
 //! 4. merging, every so often: confirmed objects with agreeing labels that overlap become one.
 
@@ -44,11 +44,11 @@ struct MapObject {
     score: f32,
     voxels: VoxelSet,
     /// Keyframes the object was detected in.
-    sightings: u32,
+    observations: u32,
     /// Keyframes that saw past where the object should be.
     misses: u32,
     misses_in_a_row: u32,
-    last_sighting_frame: u64,
+    last_observation_frame: u64,
     best_view: Option<BestView>,
     /// The best view changed since the last report.
     crop_unsent: bool,
@@ -59,16 +59,16 @@ impl MapObject {
         self.standing == Standing::Confirmed
     }
 
-    /// Sightings over sightings plus misses.
+    /// Observations over observations plus misses.
     fn confidence(&self) -> f32 {
-        self.sightings as f32 / (self.sightings + self.misses) as f32
+        self.observations as f32 / (self.observations + self.misses) as f32
     }
 
     fn absorb(&mut self, detection: &Detection, frame_id: u64) {
         self.voxels.absorb(&detection.voxels);
-        if self.last_sighting_frame != frame_id {
-            self.sightings += 1;
-            self.last_sighting_frame = frame_id;
+        if self.last_observation_frame != frame_id {
+            self.observations += 1;
+            self.last_observation_frame = frame_id;
         }
         self.misses_in_a_row = 0;
         if detection.score > self.score {
@@ -79,10 +79,10 @@ impl MapObject {
 
     fn absorb_object(&mut self, other: MapObject) {
         self.voxels.absorb(&other.voxels);
-        self.sightings += other.sightings;
+        self.observations += other.observations;
         self.misses += other.misses;
         self.misses_in_a_row = self.misses_in_a_row.min(other.misses_in_a_row);
-        self.last_sighting_frame = self.last_sighting_frame.max(other.last_sighting_frame);
+        self.last_observation_frame = self.last_observation_frame.max(other.last_observation_frame);
         if other.score > self.score {
             self.score = other.score;
             self.label = other.label;
@@ -114,7 +114,7 @@ impl MapObject {
             label: self.label.text().to_owned(),
             score: self.score,
             confidence: self.confidence(),
-            seen_count: self.sightings,
+            seen_count: self.observations,
             frame_id: FrameId(stamp.frame_id),
             captured: stamp.captured,
             map_version: stamp.map_version,
@@ -189,7 +189,7 @@ impl ObjectMap {
         let stamp = FrameStamp { frame_id: frame.keyframe.frame_id, captured: frame.captured(), map_version: frame.map_version };
         let geometry = FrameGeometry::of(frame);
         let detections = detect(frame, &geometry, self.grid, &self.settings.detection);
-        debug!(frame_id = stamp.frame_id, masks = frame.segments.labels.len(), detections = detections.len(), "keyframe observed");
+        debug!(frame_id = stamp.frame_id, masks = frame.instance_masks.labels.len(), detections = detections.len(), "keyframe observed");
 
         let mut colour = LazyColour { keyframe: &frame.keyframe, image: None };
         for detection in &detections {
@@ -211,7 +211,7 @@ impl ObjectMap {
         let survivors = self.merge_if_due(stamp, &mut updates);
         let grid = self.grid;
         for object in self.objects.iter_mut().filter(|o| o.is_confirmed() && !announced.contains(&o.id)) {
-            if object.last_sighting_frame == stamp.frame_id || survivors.contains(&object.id) {
+            if object.last_observation_frame == stamp.frame_id || survivors.contains(&object.id) {
                 updates.push(object.report(ObjectUpdateKind::Updated, stamp, grid));
             }
         }
@@ -256,10 +256,10 @@ impl ObjectMap {
             label: detection.label.clone(),
             score: detection.score,
             voxels: detection.voxels.clone(),
-            sightings: 1,
+            observations: 1,
             misses: 0,
             misses_in_a_row: 0,
-            last_sighting_frame: stamp.frame_id,
+            last_observation_frame: stamp.frame_id,
             best_view: None,
             crop_unsent: false,
         });
@@ -282,7 +282,7 @@ impl ObjectMap {
         Ok(())
     }
 
-    /// Counts a miss for each confirmed object, not sighted in this keyframe, that the camera sees clearly past; an
+    /// Counts a miss for each confirmed object, not observed in this keyframe, that the camera sees clearly past; an
     /// object that keeps being missed disappears.
     fn look_for_absences(&mut self, frame: &ObservedFrame, geometry: &FrameGeometry, stamp: FrameStamp, updates: &mut Vec<ObjectUpdate>) {
         let k = &frame.keyframe;
@@ -290,14 +290,14 @@ impl ObjectMap {
         let settings = &self.settings.absence;
         let mut gone = Vec::new();
         for (at, object) in self.objects.iter_mut().enumerate() {
-            if !object.is_confirmed() || object.last_sighting_frame == stamp.frame_id {
+            if !object.is_confirmed() || object.last_observation_frame == stamp.frame_id {
                 continue;
             }
-            let (verdict, tally) = judge(&object.voxels, self.grid, &view, settings);
+            let (verdict, votes) = judge(&object.voxels, self.grid, &view, settings);
             match verdict {
                 Verdict::Present => {
                     if object.misses_in_a_row > 0 {
-                        debug!(frame_id = stamp.frame_id, object = %object.id, ?tally, "surface seen: misses reset");
+                        debug!(frame_id = stamp.frame_id, object = %object.id, ?votes, "surface seen: misses reset");
                     }
                     object.misses_in_a_row = 0;
                 }
@@ -309,7 +309,7 @@ impl ObjectMap {
                         object = %object.id,
                         label = %object.label,
                         misses_in_a_row = object.misses_in_a_row,
-                        ?tally,
+                        ?votes,
                         "camera sees past where the object should be"
                     );
                     if object.misses_in_a_row >= settings.misses_to_disappear {
@@ -317,7 +317,7 @@ impl ObjectMap {
                     }
                 }
                 Verdict::NoEvidence | Verdict::Inconclusive => {
-                    debug!(frame_id = stamp.frame_id, object = %object.id, ?verdict, ?tally, "no decision about the object");
+                    debug!(frame_id = stamp.frame_id, object = %object.id, ?verdict, ?votes, "no decision about the object");
                 }
             }
         }
@@ -338,39 +338,49 @@ impl ObjectMap {
         let window = self.settings.confirmation.window();
         self.objects.retain(|object| match object.standing {
             Standing::Candidate { first_seen } if elapsed(first_seen, now) > window => {
-                debug!(candidate = %object.id, label = %object.label, sightings = object.sightings, "candidate dropped: not confirmed in time");
+                debug!(candidate = %object.id, label = %object.label, observations = object.observations, "candidate dropped: not confirmed in time");
                 false
             }
             _ => true,
         });
     }
 
-    /// Confirms the candidates sighted often enough. A candidate whose label agrees with a recently disappeared
+    /// Confirms the candidates observed often enough. A candidate whose label agrees with a recently disappeared
     /// object is that object, moved, and takes its id. Returns the ids announced.
     fn confirm_candidates(&mut self, stamp: FrameStamp, updates: &mut Vec<ObjectUpdate>) -> BTreeSet<ObjectId> {
         let mut announced = BTreeSet::new();
         for at in 0..self.objects.len() {
             let object = &self.objects[at];
-            if object.is_confirmed() || object.sightings < self.settings.confirmation.sightings {
+            if object.is_confirmed() || object.observations < self.settings.confirmation.observations {
                 continue;
             }
             let returning = self.departed.iter().enumerate().filter(|(_, d)| d.label.agrees_with(&object.label)).max_by_key(|(_, d)| d.at);
+            let candidate = object.id;
             let kind = match returning.map(|(index, _)| index) {
                 Some(index) => {
                     let departed = self.departed.remove(index);
-                    info!(frame_id = stamp.frame_id, object = %departed.id, candidate = %object.id, label = %object.label, "object moved");
                     self.objects[at].id = departed.id;
                     ObjectUpdateKind::Moved
                 }
-                None => {
-                    info!(frame_id = stamp.frame_id, object = %object.id, label = %object.label, sightings = object.sightings, "object appeared");
-                    ObjectUpdateKind::Appeared
-                }
+                None => ObjectUpdateKind::Appeared,
             };
             let object = &mut self.objects[at];
             object.standing = Standing::Confirmed;
             announced.insert(object.id);
-            updates.push(object.report(kind, stamp, self.grid));
+            let update = object.report(kind, stamp, self.grid);
+            let extent = &update.extent;
+            let centre_m = extent.centre_m.to_array().map(|v| (v * 100.0).round() / 100.0);
+            let size_m = [extent.long_m, extent.short_m, extent.height_m].map(|v| (v * 100.0).round() / 100.0);
+            let voxels = update.voxels.len();
+            match kind {
+                ObjectUpdateKind::Moved => {
+                    info!(frame_id = stamp.frame_id, object = %update.object_id, %candidate, label = %update.label, ?centre_m, ?size_m, voxels, "object moved");
+                }
+                _ => {
+                    info!(frame_id = stamp.frame_id, object = %update.object_id, label = %update.label, observations = object.observations, ?centre_m, ?size_m, voxels, "object appeared");
+                }
+            }
+            updates.push(update);
         }
         announced
     }
@@ -430,17 +440,17 @@ mod tests {
         (0..10).flat_map(|x| (0..6).flat_map(move |y| (0..4).map(move |z| IVec3::new(x, y, z) + offset))).collect()
     }
 
-    fn confirmed(id: u64, label: &str, voxels: VoxelSet, sightings: u32) -> MapObject {
+    fn confirmed(id: u64, label: &str, voxels: VoxelSet, observations: u32) -> MapObject {
         MapObject {
             id: ObjectId(id),
             standing: Standing::Confirmed,
             label: Label::new(label),
             score: 0.5 + id as f32 / 100.0,
             voxels,
-            sightings,
+            observations,
             misses: 0,
             misses_in_a_row: 0,
-            last_sighting_frame: 0,
+            last_observation_frame: 0,
             best_view: None,
             crop_unsent: false,
         }
@@ -468,7 +478,7 @@ mod tests {
         assert_eq!(survivors, BTreeSet::from([ObjectId(2)]));
         assert_eq!(map.confirmed_ids(), vec![ObjectId(2)]);
         let survivor = &map.objects[0];
-        assert_eq!(survivor.sightings, 6);
+        assert_eq!(survivor.observations, 6);
         assert_eq!(survivor.voxels.len(), block(IVec3::ZERO).len() + 6 * 4, "the union of both");
         assert_eq!(survivor.label.text(), "Sofa", "the label of the better score");
     }

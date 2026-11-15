@@ -28,19 +28,23 @@ pub struct CameraNanos(pub i64);
 pub enum Tracking {
     /// Registered against the map around the previous keyframe.
     Tracking,
-    /// Placed again by matching stored keyframes after tracking was lost.
-    Relocalised,
-    /// Not registered: dead reckoning from the gyro and the last known position.
+    /// Registered again by matching stored keyframes after tracking was lost.
+    Relocalized,
+    /// Starts a new run after tracking was lost: in the map, joined to it only by a dead-reckoning edge, not
+    /// registered against it. Its pose is dead reckoning, which later pose graph updates move.
+    Restarted,
+    /// Not registered and not in the map: dead reckoning from the gyro and the last known position.
     Lost,
 }
 
 impl Tracking {
-    pub const ALL: [Tracking; 3] = [Tracking::Tracking, Tracking::Relocalised, Tracking::Lost];
+    pub const ALL: [Tracking; 4] = [Tracking::Tracking, Tracking::Relocalized, Tracking::Restarted, Tracking::Lost];
 
     pub fn wire_name(self) -> &'static str {
         match self {
             Tracking::Tracking => "tracking",
-            Tracking::Relocalised => "relocalised",
+            Tracking::Relocalized => "relocalized",
+            Tracking::Restarted => "restarted",
             Tracking::Lost => "lost",
         }
     }
@@ -59,7 +63,7 @@ impl FromStr for Tracking {
 
 /// A turn about the vertical then a translation, in metres and radians.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Pose4 {
+pub struct Pose4Dof {
     pub x_m: f32,
     pub y_m: f32,
     pub z_m: f32,
@@ -70,10 +74,10 @@ pub struct Pose4 {
 pub struct KeyframePose {
     pub frame_id: FrameId,
     pub captured: UnixNanos,
-    /// The pose graph the pose comes from; it rises whenever optimisation moves past keyframes.
+    /// The pose graph the pose comes from; it rises whenever optimization moves past keyframes.
     pub map_version: MapVersion,
     /// The keyframe's floor frame in the map.
-    pub pose: Pose4,
+    pub pose: Pose4Dof,
     pub tracking: Tracking,
     /// Registration RMS of the inliers; meaningful only when `inlier_fraction` is above zero.
     pub residual_m: f32,
@@ -86,8 +90,11 @@ pub struct MapToOdom {
     pub map_version: MapVersion,
     /// Odometry poses from this time on are corrected with this transform.
     pub valid_from: CameraNanos,
+    /// The odom frame the correction takes points out of, named as odom poses name it: the camera time at which
+    /// odometry started. Odom poses of another odom frame cannot be corrected with it.
+    pub odom_started: CameraNanos,
     /// p_map = R_z(yaw) p_odom + (x, y, z).
-    pub correction: Pose4,
+    pub correction: Pose4Dof,
     pub sigma_xy_m: f32,
     pub sigma_z_m: f32,
     pub sigma_yaw_rad: f32,
@@ -115,7 +122,11 @@ pub fn keyframe_pose_fields() -> Fields {
 }
 
 pub fn map_to_odom_fields() -> Fields {
-    let mut fields = vec![field("map_version", DataType::UInt64), field("valid_from_camera_ns", DataType::Int64)];
+    let mut fields = vec![
+        field("map_version", DataType::UInt64),
+        field("valid_from_camera_ns", DataType::Int64),
+        field("odom_started_camera_ns", DataType::Int64),
+    ];
     fields.extend(POSE_FIELDS.map(|name| field(name, DataType::Float32)));
     fields.extend(["sigma_xy_m", "sigma_z_m", "sigma_yaw_rad"].map(|name| field(name, DataType::Float32)));
     Fields::from(fields)
@@ -156,15 +167,15 @@ fn str_field<'a>(row: &'a StructArray, name: &'static str) -> Result<&'a str, Wi
     values.is_valid(0).then(|| values.value(0)).ok_or(WireError::Null { field: name })
 }
 
-fn pose4(row: &StructArray) -> Result<Pose4, WireError> {
-    Ok(Pose4 { x_m: f32_field(row, "x_m")?, y_m: f32_field(row, "y_m")?, z_m: f32_field(row, "z_m")?, yaw_rad: f32_field(row, "yaw_rad")? })
+fn pose_4dof(row: &StructArray) -> Result<Pose4Dof, WireError> {
+    Ok(Pose4Dof { x_m: f32_field(row, "x_m")?, y_m: f32_field(row, "y_m")?, z_m: f32_field(row, "z_m")?, yaw_rad: f32_field(row, "yaw_rad")? })
 }
 
 fn floats(value: f32) -> ArrayRef {
     Arc::new(Float32Array::from(vec![value]))
 }
 
-fn pose_columns(pose: &Pose4) -> [ArrayRef; 4] {
+fn pose_columns(pose: &Pose4Dof) -> [ArrayRef; 4] {
     [floats(pose.x_m), floats(pose.y_m), floats(pose.z_m), floats(pose.yaw_rad)]
 }
 
@@ -174,7 +185,7 @@ pub fn decode_keyframe_pose(array: &dyn Array) -> Result<KeyframePose, WireError
         frame_id: FrameId(u64_field(row, "frame_id")?),
         captured: UnixNanos(i64_field(row, "captured_unix_ns")?),
         map_version: MapVersion(u64_field(row, "map_version")?),
-        pose: pose4(row)?,
+        pose: pose_4dof(row)?,
         tracking: str_field(row, "tracking")?.parse()?,
         residual_m: f32_field(row, "residual_m")?,
         inlier_fraction: f32_field(row, "inlier_fraction")?,
@@ -201,7 +212,8 @@ pub fn decode_map_to_odom(array: &dyn Array) -> Result<MapToOdom, WireError> {
     Ok(MapToOdom {
         map_version: MapVersion(u64_field(row, "map_version")?),
         valid_from: CameraNanos(i64_field(row, "valid_from_camera_ns")?),
-        correction: pose4(row)?,
+        odom_started: CameraNanos(i64_field(row, "odom_started_camera_ns")?),
+        correction: pose_4dof(row)?,
         sigma_xy_m: f32_field(row, "sigma_xy_m")?,
         sigma_z_m: f32_field(row, "sigma_z_m")?,
         sigma_yaw_rad: f32_field(row, "sigma_yaw_rad")?,
@@ -209,31 +221,34 @@ pub fn decode_map_to_odom(array: &dyn Array) -> Result<MapToOdom, WireError> {
 }
 
 pub fn encode_map_to_odom(message: &MapToOdom) -> StructArray {
-    let mut columns: Vec<ArrayRef> =
-        vec![Arc::new(UInt64Array::from(vec![message.map_version.0])), Arc::new(Int64Array::from(vec![message.valid_from.0]))];
+    let mut columns: Vec<ArrayRef> = vec![
+        Arc::new(UInt64Array::from(vec![message.map_version.0])),
+        Arc::new(Int64Array::from(vec![message.valid_from.0])),
+        Arc::new(Int64Array::from(vec![message.odom_started.0])),
+    ];
     columns.extend(pose_columns(&message.correction));
     columns.extend([floats(message.sigma_xy_m), floats(message.sigma_z_m), floats(message.sigma_yaw_rad)]);
     StructArray::new(map_to_odom_fields(), columns, None)
 }
 
-/// A keyframe already sent that an optimisation moved, at its new pose.
+/// A keyframe already sent that an optimization moved, at its new pose.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct MovedKeyframe {
+pub struct UpdatedKeyframePose {
     pub frame_id: FrameId,
-    pub pose: Pose4,
+    pub pose: Pose4Dof,
 }
 
-/// Every keyframe already sent that one optimisation of the pose graph moved, with its new pose. A keyframe's own
+/// Every keyframe already sent that one optimization of the pose graph moved, with its new pose. A keyframe's own
 /// keyframe_pose is never sent again; this is how its later poses arrive.
 #[derive(Clone, Debug, PartialEq)]
-pub struct KeyframePosesMoved {
-    /// The pose graph the poses come from: the optimisation's.
+pub struct PoseGraphUpdate {
+    /// The pose graph the poses come from: the optimization's.
     pub map_version: MapVersion,
-    pub keyframes: Vec<MovedKeyframe>,
+    pub keyframes: Vec<UpdatedKeyframePose>,
 }
 
 #[derive(Serialize, Deserialize)]
-struct MovedKeyframeRow {
+struct UpdatedKeyframePoseRow {
     frame_id: u64,
     x_m: f32,
     y_m: f32,
@@ -242,12 +257,12 @@ struct MovedKeyframeRow {
 }
 
 #[derive(Serialize, Deserialize)]
-struct KeyframePosesMovedRow {
+struct PoseGraphUpdateRow {
     map_version: u64,
-    keyframes: Vec<MovedKeyframeRow>,
+    keyframes: Vec<UpdatedKeyframePoseRow>,
 }
 
-pub fn keyframe_poses_moved_fields() -> Fields {
+pub fn pose_graph_update_fields() -> Fields {
     let keyframe = DataType::Struct(Fields::from(vec![
         required("frame_id", DataType::UInt64),
         required("x_m", DataType::Float32),
@@ -258,28 +273,28 @@ pub fn keyframe_poses_moved_fields() -> Fields {
     Fields::from(vec![required("map_version", DataType::UInt64), required("keyframes", list_of(keyframe, false))])
 }
 
-pub fn decode_keyframe_poses_moved(array: &dyn Array) -> eyre::Result<KeyframePosesMoved> {
-    let row: KeyframePosesMovedRow = decode_row(array, &keyframe_poses_moved_fields(), "keyframe poses moved")?;
-    Ok(KeyframePosesMoved {
+pub fn decode_pose_graph_update(array: &dyn Array) -> eyre::Result<PoseGraphUpdate> {
+    let row: PoseGraphUpdateRow = decode_row(array, &pose_graph_update_fields(), "keyframe poses moved")?;
+    Ok(PoseGraphUpdate {
         map_version: MapVersion(row.map_version),
         keyframes: row
             .keyframes
             .into_iter()
-            .map(|k| MovedKeyframe { frame_id: FrameId(k.frame_id), pose: Pose4 { x_m: k.x_m, y_m: k.y_m, z_m: k.z_m, yaw_rad: k.yaw_rad } })
+            .map(|k| UpdatedKeyframePose { frame_id: FrameId(k.frame_id), pose: Pose4Dof { x_m: k.x_m, y_m: k.y_m, z_m: k.z_m, yaw_rad: k.yaw_rad } })
             .collect(),
     })
 }
 
-pub fn encode_keyframe_poses_moved(message: &KeyframePosesMoved) -> StructArray {
-    let row = KeyframePosesMovedRow {
+pub fn encode_pose_graph_update(message: &PoseGraphUpdate) -> StructArray {
+    let row = PoseGraphUpdateRow {
         map_version: message.map_version.0,
         keyframes: message
             .keyframes
             .iter()
-            .map(|k| MovedKeyframeRow { frame_id: k.frame_id.0, x_m: k.pose.x_m, y_m: k.pose.y_m, z_m: k.pose.z_m, yaw_rad: k.pose.yaw_rad })
+            .map(|k| UpdatedKeyframePoseRow { frame_id: k.frame_id.0, x_m: k.pose.x_m, y_m: k.pose.y_m, z_m: k.pose.z_m, yaw_rad: k.pose.yaw_rad })
             .collect(),
     };
-    encode_row(&row, keyframe_poses_moved_fields())
+    encode_row(&row, pose_graph_update_fields())
 }
 
 #[cfg(test)]
@@ -306,7 +321,7 @@ mod tests {
                 frame_id: FrameId(42),
                 captured: UnixNanos(1_762_560_000_123_456_789),
                 map_version: MapVersion(7),
-                pose: Pose4 { x_m: 1.25, y_m: -0.5, z_m: 0.0625, yaw_rad: 0.75 },
+                pose: Pose4Dof { x_m: 1.25, y_m: -0.5, z_m: 0.0625, yaw_rad: 0.75 },
                 tracking: Tracking::Tracking,
                 residual_m: 0.015625,
                 inlier_fraction: 0.875,
@@ -324,6 +339,14 @@ mod tests {
     }
 
     #[test]
+    fn the_restarted_keyframe_pose_fixture_decodes_and_encodes_back_to_itself() {
+        let golden = fixture("keyframe_pose_restarted");
+        let message = decode_keyframe_pose(&golden).unwrap();
+        assert_eq!((message.frame_id, message.tracking, message.map_version), (FrameId(47), Tracking::Restarted, MapVersion(8)));
+        assert_eq!(encode_keyframe_pose(&message), golden);
+    }
+
+    #[test]
     fn the_map_to_odom_fixture_decodes_and_encodes_back_to_itself() {
         let golden = fixture("map_to_odom");
         let message = decode_map_to_odom(&golden).unwrap();
@@ -332,7 +355,8 @@ mod tests {
             MapToOdom {
                 map_version: MapVersion(7),
                 valid_from: CameraNanos(1_762_560_000_100_000_000),
-                correction: Pose4 { x_m: 0.5, y_m: -0.25, z_m: 0.0, yaw_rad: -0.125 },
+                odom_started: CameraNanos(1_762_559_990_000_000_000),
+                correction: Pose4Dof { x_m: 0.5, y_m: -0.25, z_m: 0.0, yaw_rad: -0.125 },
                 sigma_xy_m: 0.03125,
                 sigma_z_m: 0.015625,
                 sigma_yaw_rad: 0.0078125,
@@ -362,19 +386,19 @@ mod tests {
     }
 
     #[test]
-    fn the_keyframe_poses_moved_fixture_decodes_and_encodes_back_to_itself() {
-        let golden = fixture("keyframe_poses_moved");
-        let message = decode_keyframe_poses_moved(&golden).unwrap();
+    fn the_pose_graph_update_fixture_decodes_and_encodes_back_to_itself() {
+        let golden = fixture("pose_graph_update");
+        let message = decode_pose_graph_update(&golden).unwrap();
         assert_eq!(
             message,
-            KeyframePosesMoved {
+            PoseGraphUpdate {
                 map_version: MapVersion(8),
                 keyframes: vec![
-                    MovedKeyframe { frame_id: FrameId(40), pose: Pose4 { x_m: 1.0, y_m: -0.5, z_m: 0.0625, yaw_rad: 0.5 } },
-                    MovedKeyframe { frame_id: FrameId(42), pose: Pose4 { x_m: 1.3125, y_m: -0.4375, z_m: 0.0625, yaw_rad: 0.8125 } },
+                    UpdatedKeyframePose { frame_id: FrameId(40), pose: Pose4Dof { x_m: 1.0, y_m: -0.5, z_m: 0.0625, yaw_rad: 0.5 } },
+                    UpdatedKeyframePose { frame_id: FrameId(42), pose: Pose4Dof { x_m: 1.3125, y_m: -0.4375, z_m: 0.0625, yaw_rad: 0.8125 } },
                 ],
             }
         );
-        assert_eq!(encode_keyframe_poses_moved(&message), golden);
+        assert_eq!(encode_pose_graph_update(&message), golden);
     }
 }

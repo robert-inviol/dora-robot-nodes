@@ -26,8 +26,8 @@ export RUSTFLAGS="-C link-arg=-Wl,--allow-shlib-undefined"
 
 # workspace directory, then the packages built there
 builds=(
-  "nodes/dora-realsense dora-realsense dora-keyframe-picker"
-  "nodes/dora-depth-perception dora-depth-inertial-odometry"
+  "nodes/dora-realsense dora-realsense dora-keyframe-selector dora-posed-depth"
+  "nodes/dora-depth-perception dora-depth-inertial-odometry dora-odometry-input-recorder"
   "nodes/dora-people-3d dora-people-3d"
   "nodes/dora-zenoh-bridge dora-zenoh-bridge"
 )

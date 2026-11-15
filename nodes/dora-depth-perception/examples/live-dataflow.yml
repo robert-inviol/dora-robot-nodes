@@ -2,47 +2,46 @@
 # ZENOH_CONNECT is the camera machine's address.
 # Paths are relative to this file. Build the Rust nodes with `cargo build --release` in the node
 # directory, and run `uv sync` in each Python node's directory, before `dora start`.
-# With CONCEPTS_BACKEND: api, the concepts node needs ANTHROPIC_API_KEY in the environment dora runs in.
+# With LABELS_BACKEND: api, the labels node needs ANTHROPIC_API_KEY in the environment dora runs in.
 nodes:
   # Keyframes from the camera's machine, and scenes back to it.
-  - id: link
+  - id: bridge
     path: ../../dora-zenoh-bridge/target/release/dora-zenoh-bridge
     env:
       ZENOH_CONNECT: tcp/192.0.2.10:7447
-      # Listening lets the spatial server connect here directly: the camera machine does not pass rig/segments
+      # Listening lets the spatial server connect here directly: the camera machine does not pass rig/instance_masks
       # between two machines that each only connect to it.
       ZENOH_LISTEN: tcp/0.0.0.0:7447
-      ZENOH_SUBSCRIBE: rig/keyframe=keyframe,rig/imu=imu
-      ZENOH_PUBLISH: structure=rig/structure,scene=rig/scene,segments=rig/segments
+      ZENOH_SUBSCRIBE: rig/keyframe=keyframe
+      ZENOH_PUBLISH: room_layout=rig/room_layout,scene=rig/scene,instance_masks=rig/instance_masks
     inputs:
       tick: dora/timer/millis/5
-      structure:
-        source: geometry/structure
+      room_layout:
+        source: plane_segmentation/room_layout
         queue_size: 1
       scene:
-        source: geometry/scene
+        source: plane_segmentation/scene
         queue_size: 1
       # For the spatial server's object map (spatial-server-dataflow.yml).
-      segments:
-        source: sam3/segments
+      instance_masks:
+        source: sam3/instance_masks
         queue_size: 4
     outputs:
       - keyframe
-      - imu
 
-  # Names the object types once at the start, then every CONCEPTS_REFRESH_S.
-  - id: concepts
+  # Names the object types once at the start, then every LABELS_REFRESH_S.
+  - id: labels
     path: ../../dora-scene-concepts/.venv/bin/dora-scene-concepts
     env:
-      CONCEPTS_MODEL: claude-opus-5-5
-      CONCEPTS_BACKEND: claude-cli
-      CONCEPTS_REFRESH_S: "600"
+      LABELS_MODEL: claude-opus-5-5
+      LABELS_BACKEND: claude-cli
+      LABELS_REFRESH_S: "600"
     inputs:
       keyframe:
-        source: link/keyframe
+        source: bridge/keyframe
         queue_size: 1
     outputs:
-      - concepts
+      - labels
 
   # Holds only the newest keyframe, so it never works through a backlog.
   - id: sam3
@@ -50,22 +49,22 @@ nodes:
     env:
       # Four object types per pass fit a 6 GB GPU.
       SAM3_BATCH_SIZE: "4"
-      SAM3_IDLE_CONCEPTS_PER_KEYFRAME: "8"
+      SAM3_IDLE_LABELS_PER_KEYFRAME: "8"
     inputs:
       keyframe:
-        source: link/keyframe
+        source: bridge/keyframe
         queue_size: 1
-      concepts: concepts/concepts
+      labels: labels/labels
     outputs:
-      - segments
+      - instance_masks
 
-  - id: geometry
+  - id: plane_segmentation
     path: ../target/release/dora-depth-perception
     inputs:
-      keyframe: link/keyframe
-      segments: sam3/segments
+      keyframe: bridge/keyframe
+      instance_masks: sam3/instance_masks
     outputs:
-      - structure
+      - room_layout
       - scene
 
   - id: view
@@ -74,19 +73,19 @@ nodes:
       SCENE_VIEW_PORT: "8090"
       SCENE_VIEW_TIMINGS_CSV: /tmp/perception-timings.csv
     inputs:
-      # Kept, not just the newest, so the keyframe that segments arrive for is still at hand.
+      # Kept, not just the newest, so the keyframe that instance masks arrive for is still at hand.
       keyframe:
-        source: link/keyframe
+        source: bridge/keyframe
         queue_size: 10
-      segments:
-        source: sam3/segments
+      instance_masks:
+        source: sam3/instance_masks
         queue_size: 1
-      structure:
-        source: geometry/structure
+      room_layout:
+        source: plane_segmentation/room_layout
         queue_size: 1
       scene:
-        source: geometry/scene
+        source: plane_segmentation/scene
         queue_size: 1
-      concepts:
-        source: concepts/concepts
+      labels:
+        source: labels/labels
         queue_size: 1

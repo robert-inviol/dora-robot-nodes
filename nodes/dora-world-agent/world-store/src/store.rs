@@ -15,8 +15,8 @@ use world_model::clock::seconds_between;
 use world_model::{
     Change, ChangeKind, Clearance, Doorway, EntityRef, FindQuery, FoundObject, Joint, JointPosition, Landmark, ObjectDescription,
     ObjectSummary,
-    PersonTrack, PlaceSummary, Placement, PngImage, Point, ReadOnlySql, Relation, RobotState, RoomName, RoomSummary, Route,
-    Sighting, Size, SqlRows, StaleSource, Stamp, TrackLiveness, ViewKind, ViewRequest, WorldError, WorldModel, WorldSnapshot,
+    PersonSpeed, PersonTrack, PlaceSummary, LocationInterval, PngImage, Point, ReadOnlySql, Relation, RobotState, RoomName, RoomSummary, Route,
+    Observation, Size, SqlRows, StaleSource, Timestamp, TrackLiveness, ViewKind, ViewRequest, WorldError, WorldModel, WorldSnapshot,
 };
 
 use crate::geometry::{area_centroid, bounds, gap_between, polygon_contains, square_around};
@@ -26,7 +26,7 @@ use crate::render::{self, Canvas};
 use crate::schema::{migrate, MigrationError};
 use crate::sql::{open_guarded, run_read_only};
 use crate::types::{
-    Cell, ClearanceMm, DoorwayId, DoorwaySpan, FreeSpace, HeightBand, InputSource, PlaceEdge, PlaceNode, RoomId, RoomLabels,
+    Cell, ClearanceMm, DoorwayId, DoorwaySpan, OccupancyGrid, HeightBand, InputSource, PlaceEdge, PlaceNode, RoomId, RoomLabels,
     RoomShape, Topology,
 };
 use crate::writer::WorldWriter;
@@ -45,7 +45,7 @@ pub struct StalenessBounds {
     pub robot_pose: Duration,
     pub objects: Duration,
     pub topology: Duration,
-    pub free_space: Duration,
+    pub occupancy_grid: Duration,
     pub people: Duration,
 }
 
@@ -55,14 +55,14 @@ impl StalenessBounds {
             InputSource::RobotPose => self.robot_pose,
             InputSource::Objects => self.objects,
             InputSource::Topology => self.topology,
-            InputSource::FreeSpace => self.free_space,
+            InputSource::OccupancyGrid => self.occupancy_grid,
             InputSource::People => self.people,
         }
     }
 }
 
 /// How long a people track counts as live, how long a lost one stays in the snapshot, and how often a person's
-/// sighting is recorded.
+/// observation is recorded.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TrackBounds {
     pub live: Duration,
@@ -108,7 +108,7 @@ impl StoreConfig {
                 robot_pose: Duration::from_secs(2),
                 objects: Duration::from_secs(60),
                 topology: Duration::from_secs(300),
-                free_space: Duration::from_secs(300),
+                occupancy_grid: Duration::from_secs(300),
                 people: Duration::from_secs(2),
             },
             tracks: TrackBounds {
@@ -129,8 +129,8 @@ pub enum OpenError {
     Integrity { path: PathBuf, problems: Vec<String> },
     #[error("the world database at {path} did not switch to WAL mode; it is in {mode} mode")]
     NotWal { path: PathBuf, mode: String },
-    #[error("the stored free-space map of {version} is malformed: {reason}")]
-    BadFreeSpace { version: MapVersion, reason: String },
+    #[error("the stored occupancy grid of {version} is malformed: {reason}")]
+    BadOccupancyGrid { version: MapVersion, reason: String },
     #[error(transparent)]
     Migration(#[from] MigrationError),
     #[error(transparent)]
@@ -260,7 +260,7 @@ fn load_map(connection: &Connection) -> Result<MapState, OpenError> {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         map.set_topology(Topology { map_version: MapVersion(version as u64), built: UnixNanos(built), rooms, doorways, places, edges });
     }
-    let free_space = connection
+    let occupancy_grid = connection
         .query_row(
             "SELECT map_version, built_unix_ns, origin_x_m, origin_y_m, resolution_m, width, height, band_min_m, band_max_m,
                  clearance_mm FROM free_space ORDER BY map_version DESC LIMIT 1",
@@ -279,14 +279,14 @@ fn load_map(connection: &Connection) -> Result<MapState, OpenError> {
             },
         )
         .optional()?;
-    if let Some((version, built, origin, resolution_m, width, height, band, bytes)) = free_space {
-        let bad = |reason: String| OpenError::BadFreeSpace { version, reason };
+    if let Some((version, built, origin, resolution_m, width, height, band, bytes)) = occupancy_grid {
+        let bad = |reason: String| OpenError::BadOccupancyGrid { version, reason };
         if bytes.len() % 2 != 0 {
             return Err(bad(format!("{} bytes is not a whole number of cells", bytes.len())));
         }
         let cells = bytes.chunks_exact(2).map(|pair| ClearanceMm(u16::from_le_bytes([pair[0], pair[1]]))).collect();
-        let grid = FreeSpace::new(version, built, origin, resolution_m, width, height, band, cells).map_err(|e| bad(e.to_string()))?;
-        map.set_free_space(grid);
+        let grid = OccupancyGrid::new(version, built, origin, resolution_m, width, height, band, cells).map_err(|e| bad(e.to_string()))?;
+        map.set_occupancy_grid(grid);
     }
     let mut names = connection.prepare("SELECT room_id, name FROM room_name")?;
     for row in names.query_map([], |r| Ok((RoomId(r.get::<_, i64>(0)? as u64), RoomName(r.get(1)?))))? {
@@ -355,7 +355,7 @@ impl WorldStore {
     }
 
     /// Where an object stood at a time: the history row whose interval holds it, or None if it was not in the map.
-    pub async fn placement_at(&self, id: ObjectId, at: UnixNanos) -> Result<Option<Placement>, WorldError> {
+    pub async fn location_at(&self, id: ObjectId, at: UnixNanos) -> Result<Option<LocationInterval>, WorldError> {
         self.read(move |_, connection, map| {
             latest_row(connection, id)?.ok_or(WorldError::UnknownObject(id))?;
             connection
@@ -369,7 +369,7 @@ impl WorldStore {
                 )
                 .optional()
                 .map_err(store)
-                .map(|row| row.map(|row| row.placement(map)))
+                .map(|row| row.map(|row| row.location(map)))
         })
         .await
     }
@@ -390,9 +390,9 @@ impl Inner {
         self.config.clock.now()
     }
 
-    fn stamp(&self, map: &MapState) -> Result<Stamp, WorldError> {
+    fn stamp(&self, map: &MapState) -> Result<Timestamp, WorldError> {
         let map_version = map.latest_version.ok_or(WorldError::NotMapped("map"))?;
-        Ok(Stamp { as_of: self.now(), map_version })
+        Ok(Timestamp { as_of: self.now(), map_version })
     }
 
     fn robot_needs_m(&self) -> f32 {
@@ -454,8 +454,8 @@ impl ObjectRow {
         }
     }
 
-    fn placement(&self, map: &MapState) -> Placement {
-        Placement { room: map.room_name(self.room), position: self.position, from: self.valid_from, until: self.valid_to }
+    fn location(&self, map: &MapState) -> LocationInterval {
+        LocationInterval { room: map.room_name(self.room), position: self.position, from: self.valid_from, until: self.valid_to }
     }
 }
 
@@ -507,7 +507,8 @@ struct TrackRow {
     id: TrackId,
     position: Point,
     heading_rad: Option<f32>,
-    speed_m_s: f32,
+    /// None when the people tracker had not measured it.
+    speed_m_s: Option<f32>,
     last_seen: UnixNanos,
 }
 
@@ -524,7 +525,7 @@ fn read_track(row: &Row<'_>) -> rusqlite::Result<TrackRow> {
 const TRACK_QUERY: &str = "SELECT t.track_id, p.seen_unix_ns, p.x_m, p.y_m, p.heading_rad, p.speed_m_s
     FROM track t JOIN track_pose p ON p.track_id = t.track_id AND p.seen_unix_ns = t.last_seen_unix_ns";
 
-/// The joints placed when a person was seen, in joint order, with their heights above the floor of the room each
+/// The fitted joints of a person when they were seen, in joint order, with their heights above the floor of the room each
 /// is in.
 fn joints_at(connection: &Connection, map: &MapState, id: TrackId, seen: UnixNanos) -> Result<Vec<JointPosition>, WorldError> {
     let mut statement = connection
@@ -689,9 +690,9 @@ fn landmark_ref(landmark: Landmark) -> EntityRef {
 
 /// The narrowest corridor along the straight line from `a` to `b`, outside both outlines: twice the smallest
 /// clearance of the cells the line crosses, and where that is.
-fn corridor_along(free_space: &FreeSpace, a: &Located, b: &Located) -> Result<(f32, Point), WorldError> {
+fn corridor_along(occupancy_grid: &OccupancyGrid, a: &Located, b: &Located) -> Result<(f32, Point), WorldError> {
     let length = a.position.distance_to(b.position);
-    let steps = ((length / (free_space.resolution_m() / 2.0)).ceil() as usize).max(1);
+    let steps = ((length / (occupancy_grid.resolution_m() / 2.0)).ceil() as usize).max(1);
     let mut narrowest: Option<(f32, Point)> = None;
     for i in 0..=steps {
         let t = i as f32 / steps as f32;
@@ -702,7 +703,7 @@ fn corridor_along(free_space: &FreeSpace, a: &Located, b: &Located) -> Result<(f
         if polygon_contains(&a.outline, p) || polygon_contains(&b.outline, p) {
             continue;
         }
-        let clearance_m = match free_space.at(p) {
+        let clearance_m = match occupancy_grid.at(p) {
             None | Some(Cell::Unknown) => return Err(WorldError::Unmapped(p)),
             Some(Cell::Occupied) => 0.0,
             Some(Cell::Free { clearance_m }) => clearance_m,
@@ -881,7 +882,7 @@ fn describe_object(connection: &Connection, map: &MapState, id: ObjectId) -> Res
         .map_err(store)?
         .query_map([id.0 as i64], ObjectRow::read)
         .map_err(store)?
-        .map(|row| row.map(|row| row.placement(map)))
+        .map(|row| row.map(|row| row.location(map)))
         .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(store)?;
     let crops = connection
@@ -902,7 +903,7 @@ fn clearance_between(inner: &Inner, connection: &Connection, map: &MapState, a: 
     let (a, b) = (locate(inner, connection, map, a)?, locate(inner, connection, map, b)?);
     let (min_gap_m, pinch_point) = match a.outline.len() > 1 && b.outline.len() > 1 {
         true => gap_between(&a.outline, &b.outline),
-        false => corridor_along(map.free_space.as_ref().ok_or(WorldError::NotMapped("free-space map"))?, &a, &b)?,
+        false => corridor_along(map.occupancy_grid.as_ref().ok_or(WorldError::NotMapped("occupancy grid"))?, &a, &b)?,
     };
     let robot_needs_m = inner.robot_needs_m();
     Ok(Clearance { min_gap_m, pinch_point, robot_needs_m, passable: min_gap_m >= robot_needs_m })
@@ -951,9 +952,9 @@ fn route(inner: &Inner, connection: &Connection, map: &MapState, from: Landmark,
     })
 }
 
-fn last_seen(inner: &Inner, connection: &Connection, map: &MapState, subject: EntityRef) -> Result<Sighting, WorldError> {
+fn last_seen(inner: &Inner, connection: &Connection, map: &MapState, subject: EntityRef) -> Result<Observation, WorldError> {
     let now = inner.now();
-    let sighting = |room, position: Point, at: UnixNanos, heading_rad: Option<f32>| Sighting {
+    let observation = |room, position: Point, at: UnixNanos, heading_rad: Option<f32>| Observation {
         subject: subject.to_string(),
         room,
         position,
@@ -962,21 +963,23 @@ fn last_seen(inner: &Inner, connection: &Connection, map: &MapState, subject: En
         heading_deg: heading_rad.map(f32::to_degrees),
         exits_ahead: heading_rad.map_or_else(Vec::new, |h| exits_ahead(map, position, h)),
         joints: Vec::new(),
+        speed: None,
     };
     match subject {
         EntityRef::Object(id) => {
             let row = latest_row(connection, id)?.ok_or(WorldError::UnknownObject(id))?;
-            Ok(sighting(map.room_name(row.room), row.position, row.last_seen, None))
+            Ok(observation(map.room_name(row.room), row.position, row.last_seen, None))
         }
         EntityRef::Robot => {
             let (at, pose) = latest_robot(connection)?;
             let position = on_floor(pose);
-            Ok(sighting(map.room_name(map.room_at(position)), position, at, Some(pose.yaw_rad)))
+            Ok(observation(map.room_name(map.room_at(position)), position, at, Some(pose.yaw_rad)))
         }
         EntityRef::Track(id) => {
             let track = track(connection, id)?;
             let joints = joints_at(connection, map, id, track.last_seen)?;
-            Ok(Sighting { joints, ..sighting(map.room_name(map.room_at(track.position)), track.position, track.last_seen, track.heading_rad) })
+            let speed = Some(PersonSpeed::from(track.speed_m_s));
+            Ok(Observation { joints, speed, ..observation(map.room_name(map.room_at(track.position)), track.position, track.last_seen, track.heading_rad) })
         }
         EntityRef::Place(_) => Err(WorldError::Unsupported("say when a place was last seen: places do not move")),
     }
@@ -995,7 +998,7 @@ fn render_view(inner: &Inner, connection: &Connection, map: &MapState, request: 
             RoomFilter::Unmapped => return Err(WorldError::Unsupported("draw the unmapped area: it has no outline")),
         },
         None => {
-            let grid = map.free_space.as_ref().map(|g| [g.origin(), g.extent()]).into_iter().flatten();
+            let grid = map.occupancy_grid.as_ref().map(|g| [g.origin(), g.extent()]).into_iter().flatten();
             bounds(rooms.iter().flat_map(|r| r.polygon.iter().copied()).chain(grid))
         }
     };
@@ -1008,8 +1011,8 @@ fn render_view(inner: &Inner, connection: &Connection, map: &MapState, request: 
         }
     }
     let mut canvas = Canvas::new(margin(lo, -VIEW_MARGIN_M), margin(hi, VIEW_MARGIN_M));
-    if let Some(free_space) = &map.free_space {
-        canvas.paint_free_space(free_space);
+    if let Some(occupancy_grid) = &map.occupancy_grid {
+        canvas.paint_occupancy_grid(occupancy_grid);
     }
     for room in rooms {
         canvas.outline_polygon(&room.polygon, render::WALL);
@@ -1067,7 +1070,7 @@ impl WorldModel for WorldStore {
         self.read(snapshot).await
     }
 
-    async fn stamp(&self) -> Result<Stamp, WorldError> {
+    async fn stamp(&self) -> Result<Timestamp, WorldError> {
         self.read(|inner, _, map| inner.stamp(map)).await
     }
 
@@ -1087,7 +1090,7 @@ impl WorldModel for WorldStore {
         self.read(move |inner, connection, map| route(inner, connection, map, from, to)).await
     }
 
-    async fn last_seen(&self, subject: EntityRef) -> Result<Sighting, WorldError> {
+    async fn last_seen(&self, subject: EntityRef) -> Result<Observation, WorldError> {
         self.read(move |inner, connection, map| last_seen(inner, connection, map, subject)).await
     }
 

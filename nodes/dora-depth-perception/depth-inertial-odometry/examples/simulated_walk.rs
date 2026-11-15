@@ -4,25 +4,25 @@
 
 use std::time::{Duration, Instant};
 
-use depth_inertial_odometry::odometry::{CloudOutcome, StillStart};
+use depth_inertial_odometry::odometry::{CloudOutcome, StaticInitialization};
 use depth_inertial_odometry::simulation::{seeded, DepthCamera, ImuErrors, Scene, Walk};
 use depth_inertial_odometry::{DepthInertialOdometry, KdTreeMap, NeighbourPlaneSettings, NeighbourPlanes, OdometrySettings, PlaneVoxelMap, PlaneVoxelSettings, SurfaceMap, VoxelHashMap};
 
 const IMU_PERIOD: Duration = Duration::from_micros(2500);
 const IMU_PER_CLOUD: u32 = 13;
-const STILL: Duration = Duration::from_secs(2);
+const STATIONARY: Duration = Duration::from_secs(2);
 
 fn run<M: SurfaceMap>(name: &str, walk: Walk, map: M, walk_for: Duration) {
     let (scene, camera, errors) = (Scene::living_room(), DepthCamera::d455_quarter(), ImuErrors::consumer());
     let mut rng = seeded(7);
-    let still_samples = (STILL.as_micros() / IMU_PERIOD.as_micros()) as u32;
-    let resting: Vec<_> = (0..still_samples).map(|i| walk.imu_sample(IMU_PERIOD * i, &errors, &mut rng)).collect();
-    let mut odometry = DepthInertialOdometry::new(StillStart::from_samples(&resting).expect("the walk starts at rest"), map, OdometrySettings::d455());
+    let stationary_samples = (STATIONARY.as_micros() / IMU_PERIOD.as_micros()) as u32;
+    let stationary: Vec<_> = (0..stationary_samples).map(|i| walk.imu_sample(IMU_PERIOD * i, &errors, &mut rng)).collect();
+    let mut odometry = DepthInertialOdometry::new(StaticInitialization::from_samples(&stationary, OdometrySettings::d455().gravity_m_s2).expect("the walk starts at rest"), map, OdometrySettings::d455());
 
     let (mut worst_level_m, mut worst_height_m) = (0.0f64, 0.0f64);
     let (mut cloud_times, mut worst_m, mut sum_m, mut matched_sum, mut offered_sum, mut iteration_sum) = (Vec::new(), 0.0f64, 0.0f64, 0usize, 0usize, 0usize);
-    let last = ((STILL + walk_for).as_micros() / IMU_PERIOD.as_micros()) as u32;
-    for i in still_samples..last {
+    let last = ((STATIONARY + walk_for).as_micros() / IMU_PERIOD.as_micros()) as u32;
+    for i in stationary_samples..last {
         let time = IMU_PERIOD * i;
         odometry.add_imu(walk.imu_sample(time, &errors, &mut rng)).expect("samples are in order");
         if i % IMU_PER_CLOUD != 0 {
@@ -67,7 +67,7 @@ fn run<M: SurfaceMap>(name: &str, walk: Walk, map: M, walk_for: Duration) {
 fn main() {
     let seconds = std::env::args().nth(1).map(|text| text.parse::<u64>().expect("the argument is a whole number of seconds")).unwrap_or(60);
     println!("simulated walk, {seconds} s, {} threads", rayon::current_num_threads());
-    for (mount, walk) in [("on a robot", Walk::on_a_robot(STILL)), ("carried", Walk::carried(STILL))] {
+    for (mount, walk) in [("on a robot", Walk::on_a_robot(STATIONARY)), ("carried", Walk::carried(STATIONARY))] {
         println!("camera {mount}, {:.2} m above the floor", walk.height_m);
         let neighbours = NeighbourPlaneSettings::indoors();
         run("grid neighbours", walk, NeighbourPlanes::new(VoxelHashMap::new(0.3, 20, 0.1), neighbours), Duration::from_secs(seconds));

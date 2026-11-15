@@ -1,7 +1,7 @@
 """Which object types to search for in each keyframe."""
 
 
-class ConceptRota:
+class LabelRota:
     """Types found in the last keyframe are searched for every time; the others take turns."""
 
     def __init__(self, idle_per_keyframe: int) -> None:
@@ -10,9 +10,9 @@ class ConceptRota:
         self._recently_found: set[str] = set()
         self._next_idle = 0
 
-    def add(self, concepts: tuple[str, ...] | list[str]) -> list[str]:
+    def add(self, labels: tuple[str, ...] | list[str]) -> list[str]:
         """Adds newly named types and returns them, so they can be searched for straight away."""
-        named = [c for c in dict.fromkeys(concepts) if c not in self._known]
+        named = [c for c in dict.fromkeys(labels) if c not in self._known]
         self._known.extend(named)
         self._recently_found.update(named)
         return named

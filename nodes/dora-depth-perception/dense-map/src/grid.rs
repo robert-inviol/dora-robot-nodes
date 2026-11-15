@@ -4,7 +4,7 @@
 use glam::{IVec2, Vec2};
 use rayon::prelude::*;
 
-use crate::tsdf::{DistanceField, Sample};
+use crate::tsdf::{Tsdf, Sample};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Cell {
@@ -61,7 +61,7 @@ impl GridGeometry {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct CellGrid {
+pub struct OccupancyCells {
     pub geometry: GridGeometry,
     pub cells: Vec<Cell>,
 }
@@ -78,7 +78,7 @@ pub struct Slice {
 /// The field sliced into floor cells, one per voxel column: occupied where any voxel of the band is near or behind
 /// a surface, free where every voxel of the band was seen and is clear, unknown otherwise. The grid covers every
 /// voxel the field holds with a ring of unknown cells around it, or is None while the field is empty.
-pub fn slice_field(field: &dyn DistanceField, slice: Slice) -> Option<CellGrid> {
+pub fn slice_field(field: &dyn Tsdf, slice: Slice) -> Option<OccupancyCells> {
     let voxel_m = field.voxel_m();
     let bounds = field.bounds()?;
     let low = (bounds.min.truncate() / voxel_m).round().as_ivec2() - 1;
@@ -112,7 +112,7 @@ pub fn slice_field(field: &dyn DistanceField, slice: Slice) -> Option<CellGrid> 
             }
         }
     });
-    Some(CellGrid { geometry, cells })
+    Some(OccupancyCells { geometry, cells })
 }
 
 /// Squared distance in cells from each cell to the nearest source cell, by Felzenszwalb and Huttenlocher's lower
@@ -220,14 +220,14 @@ mod tests {
     /// A field that is free everywhere inside a box except one occupied column, and unseen above a height.
     struct Fake;
 
-    impl DistanceField for Fake {
+    impl Tsdf for Fake {
         fn voxel_m(&self) -> f32 {
             0.5
         }
         fn cleared(&self) -> Self {
             Fake
         }
-        fn integrate(&mut self, _: &crate::keyframe::PosedDepth) {}
+        fn fuse(&mut self, _: &crate::keyframe::PosedDepth) {}
         fn voxel(&self, index: IVec3) -> Sample {
             match (index.x, index.y, index.z) {
                 (_, _, z) if z > 1 => Sample::Unobserved,

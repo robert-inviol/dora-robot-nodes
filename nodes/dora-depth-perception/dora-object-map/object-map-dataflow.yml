@@ -1,13 +1,13 @@
-# The object map on its own, fed over Zenoh: keyframes from the camera machine, segments from the machine that runs
+# The object map on its own, fed over Zenoh: keyframes from the camera machine, instance masks from the machine that runs
 # SAM 3, and keyframe poses from the localizer. Object updates go back out on rig/object_update.
 # Paths are relative to this file. Build with `cargo build --release` in nodes/dora-depth-perception first.
 # ZENOH_CONNECT is the address of the machine whose Zenoh router the others publish to.
 nodes:
-  - id: link
+  - id: bridge
     path: ../../dora-zenoh-bridge/target/release/dora-zenoh-bridge
     env:
       ZENOH_CONNECT: tcp/192.0.2.10:7447
-      ZENOH_SUBSCRIBE: rig/keyframe=keyframe,rig/keyframe_pose=keyframe_pose,rig/segments=segments
+      ZENOH_SUBSCRIBE: rig/keyframe=keyframe,rig/keyframe_pose=keyframe_pose,rig/instance_masks=instance_masks
       ZENOH_PUBLISH: object_update=rig/object_update
     inputs:
       tick: dora/timer/millis/5
@@ -15,7 +15,7 @@ nodes:
     outputs:
       - keyframe
       - keyframe_pose
-      - segments
+      - instance_masks
 
   - id: objects
     path: ../target/release/dora-object-map
@@ -25,16 +25,16 @@ nodes:
       # Every identity decision is logged at info; debug adds each match, candidate and absence check.
       RUST_LOG: info
     inputs:
-      # Segments arrive seconds after their keyframe, at no fixed rate, and only for some keyframes; the node holds
-      # the last few keyframes and poses until their segments come, so these queues must not drop them first.
+      # Instance masks arrive seconds after their keyframe, at no fixed rate, and only for some keyframes; the node holds
+      # the last few keyframes and poses until their instance masks come, so these queues must not drop them first.
       keyframe:
-        source: link/keyframe
+        source: bridge/keyframe
         queue_size: 32
       keyframe_pose:
-        source: link/keyframe_pose
+        source: bridge/keyframe_pose
         queue_size: 32
-      segments:
-        source: link/segments
+      instance_masks:
+        source: bridge/instance_masks
         queue_size: 8
     outputs:
       - object_update

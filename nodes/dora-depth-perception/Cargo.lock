@@ -539,6 +539,7 @@ name = "dense-map"
 version = "0.1.0"
 dependencies = [
  "depth-perception",
+ "dora-node-api",
  "glam",
  "perception-wire",
  "rayon",
@@ -756,6 +757,15 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "dora-odometry-input-recorder"
+version = "0.1.0"
+dependencies = [
+ "dora-depth-inertial-odometry",
+ "dora-node-api",
+ "eyre",
 ]
 
 [[package]]
@@ -1273,6 +1283,7 @@ dependencies = [
 name = "map-localizer"
 version = "0.1.0"
 dependencies = [
+ "depth-inertial-odometry",
  "depth-perception",
  "eyre",
  "glam",
@@ -1725,6 +1736,7 @@ dependencies = [
  "perception-wire",
  "rayon",
  "rgbd-keyframes",
+ "rustc-hash",
  "serde_json",
 ]
 

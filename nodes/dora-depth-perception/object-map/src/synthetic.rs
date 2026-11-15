@@ -6,7 +6,7 @@ use depth_perception::CameraIntrinsics;
 use dora_node_api::arrow::buffer::ScalarBuffer;
 use glam::Vec3;
 use perception_wire::navigation::MapVersion;
-use perception_wire::{Keyframe, Segments, NO_SEGMENT};
+use perception_wire::{Keyframe, InstanceMasks, NO_INSTANCE};
 use room_map::Pose;
 
 use crate::crop::encode_rgb_jpeg;
@@ -53,7 +53,7 @@ impl SyntheticScene {
         };
         let rendered = room.render_from(position, heading_rad);
         let depth_mm: Vec<u16> = rendered.depth_m.iter().map(|&d| (d * 1000.0).round().clamp(0.0, 65535.0) as u16).collect();
-        let segment_ids: Vec<i16> = rendered.object_ids.iter().map(|id| id.map_or(NO_SEGMENT, |i| i as i16)).collect();
+        let instance_ids: Vec<i16> = rendered.object_ids.iter().map(|id| id.map_or(NO_INSTANCE, |i| i as i16)).collect();
         let colour: Vec<u8> = rendered.object_ids.iter().flat_map(|id| colour_of(*id)).collect();
         let keyframe = Keyframe {
             frame_id,
@@ -61,19 +61,19 @@ impl SyntheticScene {
             width: WIDTH,
             height: HEIGHT,
             intrinsics: INTRINSICS,
-            gravity_reaction: rendered.accel_camera,
+            specific_force: rendered.accel_camera,
             depth_mm: ScalarBuffer::from(depth_mm),
             color_jpeg: encode_rgb_jpeg(WIDTH, HEIGHT, &colour, 90).expect("a synthetic image encodes"),
         };
-        let segments = Segments {
+        let instance_masks = InstanceMasks {
             frame_id,
             width: WIDTH,
             height: HEIGHT,
             labels: self.objects.iter().map(|o| o.label.clone()).collect(),
             scores: self.objects.iter().map(|o| o.score).collect(),
-            segment_ids: ScalarBuffer::from(segment_ids),
+            instance_ids: ScalarBuffer::from(instance_ids),
         };
-        ObservedFrame { keyframe, segments, pose: Pose { yaw_rad: heading_rad, translation: position }, map_version: MapVersion(1) }
+        ObservedFrame { keyframe, instance_masks, pose: Pose { yaw_rad: heading_rad, translation: position }, map_version: MapVersion(1) }
     }
 }
 

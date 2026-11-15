@@ -5,7 +5,8 @@ use std::sync::Arc;
 use depth_perception::{CameraIntrinsics, FloorFrame};
 use glam::{Mat3, Vec3};
 pub use perception_wire::localization::{FrameId, Tracking};
-use perception_wire::localization::KeyframePose as WireKeyframePose;
+use perception_wire::localization::{KeyframePose as WireKeyframePose, MapToOdom};
+use perception_wire::posed_depth::PosedDepthFrame;
 use perception_wire::navigation::{MapVersion, UnixNanos};
 use perception_wire::Keyframe as WireKeyframe;
 
@@ -18,7 +19,7 @@ pub struct DepthKeyframe {
     pub height: usize,
     pub intrinsics: CameraIntrinsics,
     /// The accelerometer at rest, in camera coordinates: the reaction to gravity.
-    pub gravity_reaction: Vec3,
+    pub specific_force: Vec3,
     /// Row major, 0 where the sensor has no reading.
     pub depth_mm: Arc<[u16]>,
 }
@@ -32,14 +33,14 @@ impl DepthKeyframe {
             width: keyframe.width,
             height: keyframe.height,
             intrinsics: keyframe.intrinsics,
-            gravity_reaction: keyframe.gravity_reaction,
+            specific_force: keyframe.specific_force,
             depth_mm: Arc::from(&keyframe.depth_mm[..]),
         }
     }
 }
 
 /// Where the localizer put a keyframe: a turn about the vertical, then a translation, applied to the keyframe's
-/// gravity-aligned floor frame (origin at the camera). A lost pose is a guess, and its keyframe is not integrated.
+/// gravity-aligned floor frame (origin at the camera). A lost pose is a guess, and its keyframe is not fused.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct KeyframePose {
     pub frame_id: FrameId,
@@ -72,10 +73,21 @@ pub struct CameraPose {
 }
 
 impl CameraPose {
-    pub fn new(gravity_reaction: Vec3, pose: &KeyframePose) -> CameraPose {
-        let floor = FloorFrame::from_gravity_reaction(gravity_reaction);
+    pub fn new(specific_force: Vec3, pose: &KeyframePose) -> CameraPose {
+        let floor = FloorFrame::from_specific_force(specific_force);
         let camera_to_floor = Mat3::from_cols(floor.to_floor(Vec3::X), floor.to_floor(Vec3::Y), floor.to_floor(Vec3::Z));
         CameraPose { camera_to_map: Mat3::from_rotation_z(pose.yaw_rad) * camera_to_floor, position: pose.translation }
+    }
+
+    /// The camera of a posed depth frame in the map: its odometry pose, carried out of the odom frame by the
+    /// correction from the odom frame to the map.
+    pub fn corrected(frame: &PosedDepthFrame, correction: &MapToOdom) -> CameraPose {
+        let c = correction.correction;
+        let odom_to_map = Mat3::from_rotation_z(c.yaw_rad);
+        CameraPose {
+            camera_to_map: odom_to_map * Mat3::from_quat(frame.camera_orientation),
+            position: odom_to_map * frame.camera_position_m + Vec3::new(c.x_m, c.y_m, c.z_m),
+        }
     }
 
     #[inline]
@@ -101,7 +113,21 @@ impl<'a> PosedDepth<'a> {
             height: keyframe.height,
             intrinsics: keyframe.intrinsics,
             depth_mm: &keyframe.depth_mm,
-            pose: CameraPose::new(keyframe.gravity_reaction, pose),
+            pose: CameraPose::new(keyframe.specific_force, pose),
+        }
+    }
+}
+
+impl<'a> PosedDepth<'a> {
+    /// A posed depth frame placed in the map with the correction of its odom frame.
+    pub fn corrected(frame: &'a PosedDepthFrame, correction: &MapToOdom) -> PosedDepth<'a> {
+        let k = frame.intrinsics;
+        PosedDepth {
+            width: k.width as usize,
+            height: k.height as usize,
+            intrinsics: CameraIntrinsics { fx: k.fx, fy: k.fy, ppx: k.ppx, ppy: k.ppy },
+            depth_mm: &frame.depth_mm,
+            pose: CameraPose::corrected(frame, correction),
         }
     }
 }

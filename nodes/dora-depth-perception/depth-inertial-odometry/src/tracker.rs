@@ -12,11 +12,11 @@ use std::time::Duration;
 use glam::{DQuat, DVec3, Vec3};
 
 use crate::depth_image::{DepthImageError, DepthProjector, PinholeIntrinsics};
-use crate::filter::{CorrectionError, LevelledUncertainty};
+use crate::filter::{MeasurementUpdateError, LevelledUncertainty};
 use crate::imu_pairing::{AccelReading, GyroReading, ImuOutOfOrder, ImuPairer, ImuStream};
-use crate::odometry::{CloudOutcome, DepthInertialOdometry, ImuSample, OdometryError, OdometrySettings, StillStart, StillStartError};
+use crate::odometry::{CloudCounts, CloudOutcome, DepthInertialOdometry, ImuSample, OdometryError, OdometrySettings, StaticInitialization, StaticInitializationError};
 use crate::surfaces::SurfaceMap;
-use crate::thinning::SensorMount;
+use crate::downsampling::SensorExtrinsics;
 
 /// The camera's own number for a depth frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -24,10 +24,10 @@ pub struct DepthFrameId(pub u64);
 
 #[derive(Clone, Copy, Debug)]
 pub struct TrackerSettings {
-    /// Its `sensor_mount` is replaced by the mount the tracker is given.
+    /// Its `sensor_extrinsics` is replaced by the extrinsics the tracker is given.
     pub odometry: OdometrySettings,
-    /// How long the body must rest before odometry starts.
-    pub rest_for: Duration,
+    /// How long the body must be stationary before odometry starts (static initialization).
+    pub stationary_for: Duration,
     /// Every this many pixels of every this many rows of a depth image become cloud points.
     pub depth_stride: NonZeroUsize,
     /// How far a depth frame's time may be ahead of the newest sample of either IMU stream. Over that
@@ -43,7 +43,7 @@ impl TrackerSettings {
     pub fn d455() -> TrackerSettings {
         TrackerSettings {
             odometry: OdometrySettings::d455(),
-            rest_for: Duration::from_secs(2),
+            stationary_for: Duration::from_secs(2),
             depth_stride: NonZeroUsize::new(4).expect("four is not zero"),
             max_imu_lag: Duration::from_millis(10),
             max_backlog: Duration::from_secs(1),
@@ -54,15 +54,15 @@ impl TrackerSettings {
 /// What the tracker is doing.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum TrackerPhase {
-    /// Waiting for the body to have rested long enough; it has rested this long so far.
-    Resting { rested: Duration },
+    /// Static initialization: waiting for the body to be stationary long enough; it has been stationary this long so far.
+    StaticInitialization { stationary_so_far: Duration },
     Tracking,
 }
 
 /// The direction of travel a cloud pinned down least, in the level frame, and the one-sigma
 /// uncertainty the cloud alone leaves along it.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct WeakestDirection {
+pub struct DegenerateDirection {
     pub direction: DVec3,
     pub sigma_m: f64,
 }
@@ -75,14 +75,14 @@ pub enum CloudUse {
     Corrected {
         /// Points that found a surface in the map.
         matched_points: usize,
-        weakest: WeakestDirection,
+        degenerate: DegenerateDirection,
     },
     /// The cloud could not correct the estimate, which is the IMU's prediction; the cloud stayed out
     /// of the map.
-    NotCorrected(CorrectionError),
+    NotCorrected(MeasurementUpdateError),
 }
 
-/// The estimate at one depth frame, in the level frame: fixed where the body rested at the start,
+/// The estimate at one depth frame, in the level frame: fixed where the body was during static initialization,
 /// with z up. From one pose to the next `time` strictly increases.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FramePose {
@@ -98,7 +98,15 @@ pub struct FramePose {
     pub velocity_m_s: DVec3,
     /// How well the pose is known against the odometry's own map; the map's drift is not in it.
     pub uncertainty: LevelledUncertainty,
+    /// One-sigma position uncertainty against the map along the direction where it is largest. It grows while the
+    /// IMU alone carries the pose.
+    pub largest_position_sigma_m: f64,
     pub cloud: CloudUse,
+    /// How the frame's points fared, whatever became of the cloud.
+    pub counts: CloudCounts,
+    /// How long the IMU alone has carried the pose (dead reckoning): the time since a cloud last
+    /// corrected it, or since odometry started when none has. Zero when this frame's cloud did.
+    pub dead_reckoning_for: Duration,
 }
 
 impl FramePose {
@@ -114,9 +122,9 @@ impl FramePose {
         }
     }
 
-    pub fn weakest(&self) -> Option<WeakestDirection> {
+    pub fn degenerate(&self) -> Option<DegenerateDirection> {
         match self.cloud {
-            CloudUse::Corrected { weakest, .. } => Some(weakest),
+            CloudUse::Corrected { degenerate, .. } => Some(degenerate),
             CloudUse::StartedMap | CloudUse::NotCorrected(_) => None,
         }
     }
@@ -154,7 +162,7 @@ pub enum TrackerError {
     Imu(ImuOutOfOrder),
     /// The body did not rest through the window just collected. Collection has begun again with the
     /// samples after that window, so feeding on tries the next one.
-    NotAtRest(StillStartError),
+    NotStationary(StaticInitializationError),
     DepthImage(DepthImageError),
     /// A depth frame that is not newer than the last frame that got a pose.
     FrameOutOfOrder { at: Duration, previous: Duration },
@@ -171,7 +179,7 @@ impl std::fmt::Display for TrackerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             TrackerError::Imu(cause) => write!(f, "{cause}"),
-            TrackerError::NotAtRest(cause) => write!(f, "odometry did not start: {cause}"),
+            TrackerError::NotStationary(cause) => write!(f, "odometry did not start: {cause}"),
             TrackerError::DepthImage(cause) => write!(f, "{cause}"),
             TrackerError::FrameOutOfOrder { at, previous } => write!(f, "depth frame at {at:?} is not newer than the last posed frame at {previous:?}"),
             TrackerError::ImuBehind { frame_at, stream, latest: Some(latest) } => write!(f, "depth frame at {frame_at:?} is too far ahead of the newest {stream} sample at {latest:?}"),
@@ -185,7 +193,7 @@ impl std::fmt::Display for TrackerError {
 impl std::error::Error for TrackerError {}
 
 enum Phase<M> {
-    Resting {
+    StaticInitialization {
         /// Held for the odometry, which takes it at the start.
         map: Option<M>,
         window: Vec<ImuSample>,
@@ -209,13 +217,13 @@ pub struct PoseTracker<M> {
 }
 
 impl<M: SurfaceMap> PoseTracker<M> {
-    /// A tracker for a camera whose depth stream has these intrinsics and sits on the IMU at `mount`.
-    pub fn new(intrinsics: PinholeIntrinsics, mount: SensorMount, map: M, settings: TrackerSettings) -> Result<PoseTracker<M>, DepthImageError> {
+    /// A tracker for a camera whose depth stream has these intrinsics and sits on the IMU at `extrinsics`.
+    pub fn new(intrinsics: PinholeIntrinsics, extrinsics: SensorExtrinsics, map: M, settings: TrackerSettings) -> Result<PoseTracker<M>, DepthImageError> {
         Ok(PoseTracker {
-            settings: TrackerSettings { odometry: OdometrySettings { sensor_mount: mount, ..settings.odometry }, ..settings },
+            settings: TrackerSettings { odometry: OdometrySettings { sensor_extrinsics: extrinsics, ..settings.odometry }, ..settings },
             projector: DepthProjector::new(intrinsics, settings.depth_stride)?,
             pairer: ImuPairer::default(),
-            phase: Phase::Resting { map: Some(map), window: Vec::new() },
+            phase: Phase::StaticInitialization { map: Some(map), window: Vec::new() },
             last_posed: None,
             paired: Vec::new(),
             sensor_points: Vec::new(),
@@ -224,7 +232,7 @@ impl<M: SurfaceMap> PoseTracker<M> {
 
     pub fn phase(&self) -> TrackerPhase {
         match &self.phase {
-            Phase::Resting { window, .. } => TrackerPhase::Resting { rested: window.first().zip(window.last()).map_or(Duration::ZERO, |(first, last)| last.time - first.time) },
+            Phase::StaticInitialization { window, .. } => TrackerPhase::StaticInitialization { stationary_so_far: window.first().zip(window.last()).map_or(Duration::ZERO, |(first, last)| last.time - first.time) },
             Phase::Tracking { .. } => TrackerPhase::Tracking,
         }
     }
@@ -232,15 +240,15 @@ impl<M: SurfaceMap> PoseTracker<M> {
     /// The odometry, once it has started. Its estimate stands at the last depth frame's time.
     pub fn odometry(&self) -> Option<&DepthInertialOdometry<M>> {
         match &self.phase {
-            Phase::Resting { .. } => None,
+            Phase::StaticInitialization { .. } => None,
             Phase::Tracking { odometry, .. } => Some(odometry),
         }
     }
 
     /// Takes every accelerometer and gyro sample since the previous batch, each stream oldest first.
     ///
-    /// While resting, the samples fill a window of the configured length; when it is full, odometry
-    /// starts if the body rested through it, and [`TrackerError::NotAtRest`] is returned if it did not.
+    /// During static initialization the samples fill a window of the configured length; when it is full, odometry
+    /// starts if the body was stationary through it, and [`TrackerError::NotStationary`] is returned if it did not.
     /// Samples wait for the other stream to pair with and, once odometry has started, for a depth
     /// frame; [`TrackerError::Backlog`] is returned when those held span more than the settings allow.
     pub fn add_imu(&mut self, accel: &[AccelReading], gyro: &[GyroReading]) -> Result<TrackerPhase, TrackerError> {
@@ -253,12 +261,12 @@ impl<M: SurfaceMap> PoseTracker<M> {
         for &sample in &self.paired {
             match &mut self.phase {
                 Phase::Tracking { pending, .. } => pending.push_back(sample),
-                Phase::Resting { map, window } => {
+                Phase::StaticInitialization { map, window } => {
                     window.push(sample);
-                    if sample.time - window[0].time < self.settings.rest_for {
+                    if sample.time - window[0].time < self.settings.stationary_for {
                         continue;
                     }
-                    match StillStart::from_samples(window) {
+                    match StaticInitialization::from_samples(window, self.settings.odometry.gravity_m_s2) {
                         Ok(start) => {
                             let map = map.take().expect("the map is held until odometry starts");
                             let mut odometry = Box::new(DepthInertialOdometry::new(start, map, self.settings.odometry));
@@ -278,7 +286,7 @@ impl<M: SurfaceMap> PoseTracker<M> {
             let span = pending.front().zip(pending.back()).map_or(Duration::ZERO, |(oldest, newest)| newest.time - oldest.time);
             self.within_backlog(span, Awaited::DepthFrame)?;
         }
-        refused.map_or(Ok(self.phase()), |moving| Err(TrackerError::NotAtRest(moving)))
+        refused.map_or(Ok(self.phase()), |moving| Err(TrackerError::NotStationary(moving)))
     }
 
     fn within_backlog(&self, span: Duration, waiting_for: Awaited) -> Result<(), TrackerError> {
@@ -321,8 +329,8 @@ impl<M: SurfaceMap> PoseTracker<M> {
 
         let cloud = match odometry.add_cloud(time, &self.sensor_points) {
             Ok(CloudOutcome::StartedMap) => CloudUse::StartedMap,
-            Ok(CloudOutcome::Corrected { matched, weakest, .. }) => {
-                CloudUse::Corrected { matched_points: matched, weakest: WeakestDirection { direction: odometry.state().levelling() * weakest.direction_world, sigma_m: weakest.sigma_m } }
+            Ok(CloudOutcome::Corrected { matched, degenerate, .. }) => {
+                CloudUse::Corrected { matched_points: matched, degenerate: DegenerateDirection { direction: odometry.state().levelling() * degenerate.direction_world, sigma_m: degenerate.sigma_m } }
             }
             Err(OdometryError::NotCorrected(cause)) => CloudUse::NotCorrected(cause),
             Err(other) => return Err(TrackerError::Odometry(other)),
@@ -338,7 +346,10 @@ impl<M: SurfaceMap> PoseTracker<M> {
             orientation,
             velocity_m_s: state.levelled_velocity(),
             uncertainty: odometry.filter().levelled_uncertainty(),
+            largest_position_sigma_m: odometry.filter().largest_position_sigma_m(),
             cloud,
+            counts: odometry.last_cloud(),
+            dead_reckoning_for: odometry.dead_reckoning_for(),
         }))
     }
 }
@@ -351,14 +362,14 @@ mod tests {
     use rand::rngs::SmallRng;
 
     const FRAME_PERIOD: Duration = Duration::from_micros(32_500);
-    const REST_FOR: Duration = Duration::from_millis(500);
+    const STATIONARY_FOR: Duration = Duration::from_millis(500);
 
     /// A camera standing still in the simulated room, and a tracker fed from it.
     struct Bench {
         tracker: PoseTracker<PlaneVoxelMap>,
         walk: Walk,
         camera: PinholeDepthCamera,
-        mount: SensorMount,
+        extrinsics: SensorExtrinsics,
         rng: SmallRng,
         imu_through: Option<Duration>,
         depth_mm: Vec<u16>,
@@ -367,10 +378,10 @@ mod tests {
     impl Bench {
         fn new() -> Bench {
             let camera = PinholeDepthCamera::d455(212, 120);
-            let mount = SensorMount::from_depth_to_imu(PinholeDepthCamera::FACING_FORWARD, [0.0; 3]).expect("a rotation");
-            let settings = TrackerSettings { rest_for: REST_FOR, depth_stride: NonZeroUsize::MIN, ..TrackerSettings::d455() };
-            let tracker = PoseTracker::new(camera.intrinsics, mount, PlaneVoxelMap::new(PlaneVoxelSettings::indoors()), settings).expect("usable intrinsics");
-            Bench { tracker, walk: Walk::on_a_robot(Duration::from_secs(3600)), camera, mount, rng: seeded(11), imu_through: None, depth_mm: Vec::new() }
+            let extrinsics = SensorExtrinsics::from_depth_to_imu(PinholeDepthCamera::FACING_FORWARD, [0.0; 3]).expect("a rotation");
+            let settings = TrackerSettings { stationary_for: STATIONARY_FOR, depth_stride: NonZeroUsize::MIN, ..TrackerSettings::d455() };
+            let tracker = PoseTracker::new(camera.intrinsics, extrinsics, PlaneVoxelMap::new(PlaneVoxelSettings::indoors()), settings).expect("usable intrinsics");
+            Bench { tracker, walk: Walk::on_a_robot(Duration::from_secs(3600)), camera, extrinsics, rng: seeded(11), imu_through: None, depth_mm: Vec::new() }
         }
 
         fn imu_batch(&mut self, through: Duration) -> (Vec<AccelReading>, Vec<GyroReading>) {
@@ -386,7 +397,7 @@ mod tests {
 
         fn add_frame(&mut self, time: Duration) -> Result<DepthFrameOutcome, TrackerError> {
             let seconds = time.as_secs_f64();
-            self.camera.image(&Scene::living_room(), self.walk.position(seconds), self.walk.rotation(seconds), &self.mount, &mut self.rng, &mut self.depth_mm);
+            self.camera.image(&Scene::living_room(), self.walk.position(seconds), self.walk.rotation(seconds), &self.extrinsics, &mut self.rng, &mut self.depth_mm);
             self.tracker.add_depth_frame(time, DepthFrameId(time.as_micros() as u64), &self.depth_mm)
         }
 
@@ -411,17 +422,17 @@ mod tests {
     #[test]
     fn depth_frames_taken_before_the_start_get_no_pose() {
         let mut bench = Bench::new();
-        assert_eq!(bench.add_imu(FRAME_PERIOD), Ok(TrackerPhase::Resting { rested: Duration::from_micros(27_500) }));
+        assert_eq!(bench.add_imu(FRAME_PERIOD), Ok(TrackerPhase::StaticInitialization { stationary_so_far: Duration::from_micros(27_500) }));
         assert_eq!(bench.add_frame(FRAME_PERIOD), Ok(DepthFrameOutcome::AwaitingStart));
         let started = bench.rest_until_started();
         assert_eq!(bench.add_frame(started - FRAME_PERIOD), Ok(DepthFrameOutcome::AwaitingStart));
     }
 
     #[test]
-    fn odometry_starts_once_the_body_has_rested_for_the_configured_time() {
+    fn odometry_starts_once_the_body_has_been_stationary_for_the_configured_time() {
         let mut bench = Bench::new();
         let started = bench.rest_until_started();
-        assert!(started >= REST_FOR && started < REST_FOR + 2 * FRAME_PERIOD, "{started:?}");
+        assert!(started >= STATIONARY_FOR && started < STATIONARY_FOR + 2 * FRAME_PERIOD, "{started:?}");
         assert!(bench.tracker.odometry().is_some());
     }
 
@@ -435,13 +446,13 @@ mod tests {
                 reading.rad_s.z += 0.5 * (40.0 * reading.time.as_secs_f64()).sin();
             }
             match bench.tracker.add_imu(&accel, &gyro) {
-                Ok(phase) => assert!(matches!(phase, TrackerPhase::Resting { .. }), "{phase:?}"),
+                Ok(phase) => assert!(matches!(phase, TrackerPhase::StaticInitialization { .. }), "{phase:?}"),
                 Err(refusal) => break refusal,
             }
             time += FRAME_PERIOD;
         };
-        assert!(matches!(refusal, TrackerError::NotAtRest(StillStartError::Moving { gyro_spread_rad_s, .. }) if gyro_spread_rad_s > 0.1), "{refusal:?}");
-        assert!(time >= REST_FOR && bench.tracker.odometry().is_none());
+        assert!(matches!(refusal, TrackerError::NotStationary(StaticInitializationError::Moving { gyro_spread_rad_s, .. }) if gyro_spread_rad_s > 0.1), "{refusal:?}");
+        assert!(time >= STATIONARY_FOR && bench.tracker.odometry().is_none());
         let refused_at = time;
         loop {
             time += FRAME_PERIOD;
@@ -450,7 +461,7 @@ mod tests {
             }
         }
         // A whole new window, to within the batch that completes it.
-        assert!(time - refused_at > REST_FOR - FRAME_PERIOD && time - refused_at < REST_FOR + FRAME_PERIOD, "started {:?} after the refusal", time - refused_at);
+        assert!(time - refused_at > STATIONARY_FOR - FRAME_PERIOD && time - refused_at < STATIONARY_FOR + FRAME_PERIOD, "started {:?} after the refusal", time - refused_at);
     }
 
     #[test]
@@ -458,12 +469,12 @@ mod tests {
         let mut bench = Bench::new();
         let started = bench.rest_until_started();
         let first = bench.posed(started + FRAME_PERIOD);
-        assert_eq!((first.cloud, first.corrected(), first.matched_points(), first.weakest()), (CloudUse::StartedMap, false, 0, None));
+        assert_eq!((first.cloud, first.corrected(), first.matched_points(), first.degenerate()), (CloudUse::StartedMap, false, 0, None));
         let second = bench.posed(started + 2 * FRAME_PERIOD);
-        assert!(first.odometry_started == second.odometry_started && first.odometry_started <= started && first.odometry_started >= REST_FOR, "{first:?}");
+        assert!(first.odometry_started == second.odometry_started && first.odometry_started <= started && first.odometry_started >= STATIONARY_FOR, "{first:?}");
         assert!(second.corrected() && second.matched_points() > 50, "{second:?}");
-        let weakest = second.weakest().expect("a corrected frame has a weakest direction");
-        assert!((weakest.direction.length() - 1.0).abs() < 1e-9 && weakest.sigma_m > 0.0 && weakest.sigma_m < 0.05, "{weakest:?}");
+        let degenerate = second.degenerate().expect("a corrected frame has a degenerate direction");
+        assert!((degenerate.direction.length() - 1.0).abs() < 1e-9 && degenerate.sigma_m > 0.0 && degenerate.sigma_m < 0.05, "{degenerate:?}");
         assert_eq!((second.time, second.frame_id), (started + 2 * FRAME_PERIOD, DepthFrameId((started + 2 * FRAME_PERIOD).as_micros() as u64)));
         assert!(second.position_m.length() < 0.01 && second.velocity_m_s.length() < 0.05, "{second:?}");
         let sigma = second.uncertainty;
@@ -478,9 +489,17 @@ mod tests {
         bench.add_imu(started + 2 * FRAME_PERIOD).expect("samples are in order");
         let blank = bench.tracker.add_depth_frame(started + 2 * FRAME_PERIOD, DepthFrameId(2), &vec![0u16; 212 * 120]).expect("a blank frame is still a frame");
         let DepthFrameOutcome::Posed(predicted) = blank else { panic!("{blank:?}") };
-        assert!(matches!(predicted.cloud, CloudUse::NotCorrected(CorrectionError::TooFewRows { rows: 0, .. })), "{predicted:?}");
-        assert_eq!((predicted.corrected(), predicted.matched_points(), predicted.weakest()), (false, 0, None));
-        assert!(bench.posed(started + 3 * FRAME_PERIOD).corrected());
+        assert!(matches!(predicted.cloud, CloudUse::NotCorrected(MeasurementUpdateError::TooFewRows { rows: 0, .. })), "{predicted:?}");
+        assert_eq!(predicted.counts, CloudCounts { given: 0, downsampled: 0, found_surface: 0, within_gate: 0, needed: 50 });
+        assert_eq!((predicted.corrected(), predicted.matched_points(), predicted.degenerate()), (false, 0, None));
+        // No cloud has corrected the pose since odometry started, before the frame that started the map.
+        assert!(predicted.dead_reckoning_for >= 2 * FRAME_PERIOD && predicted.dead_reckoning_for < 3 * FRAME_PERIOD, "{predicted:?}");
+        let corrected = bench.posed(started + 3 * FRAME_PERIOD);
+        assert_eq!((corrected.corrected(), corrected.dead_reckoning_for), (true, Duration::ZERO));
+        let counts = corrected.counts;
+        assert!(counts.given > counts.downsampled && counts.downsampled >= counts.found_surface && counts.found_surface >= counts.within_gate, "{counts:?}");
+        assert_eq!(counts.within_gate, corrected.matched_points());
+        assert!(corrected.largest_position_sigma_m < predicted.largest_position_sigma_m, "a correction shrinks the doubt: {corrected:?}");
     }
 
     #[test]
@@ -528,7 +547,7 @@ mod tests {
                     ImuStream::Gyro => gyro.clear(),
                 }
                 match bench.tracker.add_imu(&accel, &gyro) {
-                    Ok(phase) => assert_eq!(phase, TrackerPhase::Resting { rested: Duration::ZERO }),
+                    Ok(phase) => assert_eq!(phase, TrackerPhase::StaticInitialization { stationary_so_far: Duration::ZERO }),
                     Err(refusal) => break refusal,
                 }
                 time += FRAME_PERIOD;

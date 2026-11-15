@@ -24,7 +24,7 @@ impl Default for CloudSettings {
 pub fn registration_cloud(keyframe: &Keyframe, settings: &CloudSettings) -> Vec<Vec3> {
     let depth_m = keyframe.depth_m();
     let depth = DepthImage::new(keyframe.width, keyframe.height, &depth_m);
-    let floor = FloorFrame::from_gravity_reaction(keyframe.gravity_reaction);
+    let floor = FloorFrame::from_specific_force(keyframe.specific_force);
     let cloud = sample_point_cloud(&depth, &keyframe.intrinsics, &floor, settings.range, settings.stride_px);
     voxel_downsample(&cloud.points, settings.voxel_m)
 }

@@ -1,4 +1,4 @@
-//! dora node that turns segments into persistent object updates.
+//! dora node that turns instance masks into persistent object updates.
 
 use dora_node_api::dora_core::config::DataId;
 use dora_node_api::{DoraNode, Event, MetadataParameters};

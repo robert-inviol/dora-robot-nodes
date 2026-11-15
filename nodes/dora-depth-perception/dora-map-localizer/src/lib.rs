@@ -1,13 +1,18 @@
 //! The node's handling of its inputs, apart from dora: keyframes, imu messages and odometry in, keyframe poses and
 //! the map to odom correction out.
 //!
-//! Every imu message is kept (the gyro needs every sample). A keyframe is localised once the imu message
+//! Every imu message is kept (the gyro needs every sample). A keyframe is localized once the imu message
 //! leading up to it has arrived, since that carries its camera time; a keyframe that arrives first waits for
 //! it, and a newer keyframe replaces a waiting one. With `imu = "absent"` there is no imu stream: a keyframe is
-//! localised as it arrives, timed by its capture time, and every heading is searched for. A keyframe whose turn the gyro cannot give is handled as
-//! `heading_without_gyro` says, and reported as a `GyroGap`.
+//! localized as it arrives, timed by its capture time, and every heading is searched for. A keyframe whose turn the gyro cannot give is handled as
+//! `heading_without_gyro` says, and reported as a `GyroGap` with the count of such keyframes so far. An imu message
+//! whose samples are uneven or out of order is refused with an `ImuMessageError`.
 //!
-//! With an `[odometry]` section, every registered keyframe (tracked or relocalised) is joined to the odometry pose at
+//! After an optimization, every map keyframe already sent that moved is sent again at its new pose, together with
+//! the keyframes not selected that follow it (`KeyframeSelection::NotSelected`). A map keyframe that restarted
+//! tracking after loss is sent restarted, and its moves are sent like any other map keyframe's.
+//!
+//! With an `[odometry]` section, every registered keyframe (tracked or relocalized) is joined to the odometry pose at
 //! its camera time once odometry has reached that time, and the correction is sent after every keyframe and every
 //! odometry pose that joined one. A keyframe that waits longer than the retention, or that falls before the
 //! odometry kept, is left out and reported in `unjoined`.
@@ -23,11 +28,10 @@ pub mod config;
 use std::collections::{HashMap, VecDeque};
 
 use map_localizer::cloud::registration_cloud;
-use map_localizer::gyro::{GyroHeading, KeyframeTiming};
-use glam::Vec3;
-use map_localizer::map_to_odom::{CameraMount, MapToOdomEstimator, OdomError, OdomHistory, OdomPose};
-use map_localizer::{HeadingWithoutGyro, KeyframeEstimate, Localizer, LocalizerInput};
-use perception_wire::localization::{CameraNanos, FrameId, KeyframePosesMoved, MapToOdom, MovedKeyframe, Pose4, Tracking};
+use map_localizer::gyro::{GyroHeading, ImuMessageError, KeyframeTiming};
+use map_localizer::map_to_odom::{CameraExtrinsics, ExtrinsicsError, MapToOdomEstimator, OdomError, OdomHistory, OdomPose};
+use map_localizer::{HeadingWithoutGyro, KeyframeEstimate, KeyframeSelection, Localizer, LocalizerInput};
+use perception_wire::localization::{CameraNanos, FrameId, PoseGraphUpdate, MapToOdom, UpdatedKeyframePose, Pose4Dof, Tracking};
 use perception_wire::camera::CameraCalibration;
 use perception_wire::odometry;
 use perception_wire::navigation::UnixNanos;
@@ -43,6 +47,8 @@ pub struct GyroGap {
     pub problem: HeadingError,
     /// Refuse: the keyframe was reported lost. Search: its heading was searched for.
     pub handled_by: HeadingWithoutGyro,
+    /// Keyframes whose turn the gyro could not give since the node started, this one included.
+    pub count: u64,
 }
 
 /// A registered keyframe left out of the map to odom correction.
@@ -56,8 +62,10 @@ pub struct UnjoinedKeyframe {
 pub enum OdometryInputError {
     #[error("an odom_pose message arrived but the settings have no [odometry] section")]
     NotConfigured,
-    #[error("the camera moved against its IMU: the colour camera was at {was:?} m in IMU coordinates and is now at {now:?} m")]
-    CameraMoved { was: [f32; 3], now: [f32; 3] },
+    #[error("the camera moved against its IMU: the colour camera was at {was:?} m in IMU coordinates and is now at {now:?} m, turned {turned_deg} degrees")]
+    CameraMoved { was: [f32; 3], now: [f32; 3], turned_deg: f32 },
+    #[error(transparent)]
+    Extrinsics(#[from] ExtrinsicsError),
     #[error("odometry started at camera time {received} ns, before the odom frame in use, started at {current} ns")]
     StartWentBack { current: i64, received: i64 },
     #[error(transparent)]
@@ -85,15 +93,15 @@ pub struct Handled {
     pub odometry_restarted: Option<OdometryRestart>,
     /// An odometry pose left out because no calibration has said where the colour camera sits on the IMU yet.
     pub odometry_before_calibration: Option<CameraNanos>,
-    /// The keyframes already sent that an optimisation moved, at their new poses.
-    pub moved: Option<KeyframePosesMoved>,
+    /// The keyframes already sent that an optimization moved, at their new poses.
+    pub moved: Option<PoseGraphUpdate>,
 }
 
 /// Odometry, and the registered keyframes waiting for it to reach their camera time.
 struct OdometryLink {
     settings: OdometrySettings,
     /// Where the colour camera sits on the IMU, from the camera's calibration message.
-    mount: Option<CameraMount>,
+    extrinsics: Option<CameraExtrinsics>,
     /// The camera time the odometry in use started at, and the camera time of its latest pose.
     odom_frame: Option<(CameraNanos, CameraNanos)>,
     history: OdomHistory,
@@ -105,7 +113,7 @@ struct OdometryLink {
 impl OdometryLink {
     fn new(settings: OdometrySettings) -> OdometryLink {
         OdometryLink {
-            mount: None,
+            extrinsics: None,
             odom_frame: None,
             history: OdomHistory::new(settings.retention_ns),
             estimator: MapToOdomEstimator::new(settings.estimator.clone()),
@@ -163,14 +171,20 @@ impl OdometryLink {
     }
 }
 
-/// A keyframe counts as moved once optimisation shifts it this far from the pose last sent for it.
+/// A map keyframe counts as moved once optimization shifts it this far from the pose last sent for it.
 const MOVED_M: f32 = 0.01;
 const MOVED_RAD: f32 = 0.004;
+/// A calibration whose camera axes turn further than this against the IMU from the first one is a moved camera.
+const MOUNT_TURN_TOLERANCE_RAD: f32 = 1e-3;
+/// ...and so is one whose camera centre moves further than this.
+const MOUNT_SHIFT_TOLERANCE_M: f32 = 1e-4;
 
 pub struct LocalizerNode {
     settings: NodeSettings,
-    /// The pose last sent for every keyframe sent placed (tracking or relocalised).
+    /// The pose last sent for every map keyframe (pose graph node): one entry per keyframe selected, so it grows
+    /// with the space explored, not with time.
     sent: HashMap<FrameId, room_map::Pose>,
+    gyro_gaps: u64,
     localizer: Localizer,
     gyro: GyroHeading,
     waiting: Option<Keyframe>,
@@ -186,6 +200,7 @@ impl LocalizerNode {
             odometry: settings.odometry.clone().map(OdometryLink::new),
             settings,
             sent: HashMap::new(),
+            gyro_gaps: 0,
             waiting: None,
             previous: None,
         }
@@ -195,9 +210,9 @@ impl LocalizerNode {
         &self.localizer
     }
 
-    pub fn on_imu(&mut self, imu: &Imu) -> Handled {
-        self.gyro.add(imu);
-        match self.waiting.take() {
+    pub fn on_imu(&mut self, imu: &Imu) -> Result<Handled, ImuMessageError> {
+        self.gyro.add(imu)?;
+        Ok(match self.waiting.take() {
             Some(keyframe) if keyframe.frame_id == imu.frame_id => {
                 let camera_time = self.gyro.camera_time(FrameId(keyframe.frame_id)).expect("the imu message just added holds its time");
                 self.localize_at(keyframe, camera_time)
@@ -206,20 +221,25 @@ impl LocalizerNode {
                 self.waiting = other;
                 Handled::default()
             }
-        }
+        })
     }
 
-    /// Takes where the colour camera sits on the IMU from the camera's calibration. Without odometry it is not needed
-    /// and is ignored; a calibration that moves the camera against the IMU is an error.
+    /// Takes the colour camera's extrinsics on the IMU from the camera's calibration. Without odometry they are not
+    /// needed and are ignored; a calibration whose rotations are not rotations, or that moves or turns the camera
+    /// against the IMU, is an error.
     pub fn on_calibration(&mut self, calibration: &CameraCalibration) -> Result<(), OdometryInputError> {
         let Some(link) = self.odometry.as_mut() else { return Ok(()) };
-        let camera_in_imu_m = calibration.depth_to_imu.apply(calibration.depth_to_color.inverse().apply(Vec3::ZERO));
-        match link.mount {
-            Some(mount) if mount.camera_in_imu_m.distance(camera_in_imu_m) > 1e-4 => {
-                Err(OdometryInputError::CameraMoved { was: mount.camera_in_imu_m.to_array(), now: camera_in_imu_m.to_array() })
+        let now = CameraExtrinsics::from_calibration(calibration)?;
+        match link.extrinsics {
+            Some(was) if was.camera_in_imu_m.distance(now.camera_in_imu_m) > MOUNT_SHIFT_TOLERANCE_M || was.turn_from(&now) > MOUNT_TURN_TOLERANCE_RAD => {
+                Err(OdometryInputError::CameraMoved {
+                    was: was.camera_in_imu_m.to_array(),
+                    now: now.camera_in_imu_m.to_array(),
+                    turned_deg: was.turn_from(&now).to_degrees(),
+                })
             }
             _ => {
-                link.mount = Some(CameraMount { camera_in_imu_m });
+                link.extrinsics = Some(now);
                 Ok(())
             }
         }
@@ -228,11 +248,11 @@ impl LocalizerNode {
     pub fn on_odom_pose(&mut self, pose: &odometry::OdomPose) -> Result<Handled, OdometryInputError> {
         let link = self.odometry.as_mut().ok_or(OdometryInputError::NotConfigured)?;
         let time = CameraNanos(pose.camera_ns);
-        let Some(mount) = link.mount else {
+        let Some(extrinsics) = link.extrinsics else {
             return Ok(Handled { odometry_before_calibration: Some(time), ..Handled::default() });
         };
         let odometry_restarted = link.follow(CameraNanos(pose.odom_started_camera_ns), time)?;
-        let Some(floor) = mount.floor_pose(pose.position_m, pose.orientation) else {
+        let Some(floor) = extrinsics.floor_pose(pose.position_m, pose.orientation) else {
             return Ok(Handled { headingless_odometry: Some(time), odometry_restarted, ..Handled::default() });
         };
         link.history.push(OdomPose { time, pose: floor })?;
@@ -245,7 +265,9 @@ impl LocalizerNode {
 
     fn map_to_odom(&self) -> Option<MapToOdom> {
         let link = self.odometry.as_ref()?;
-        link.estimator.estimate(self.localizer.map_version(), |frame| self.localizer.keyframe_pose(frame))
+        // Before the first odom pose there is no odom frame to correct.
+        let (odom_started, _) = link.odom_frame?;
+        link.estimator.estimate(self.localizer.map_version(), odom_started, |frame| self.localizer.keyframe_pose(frame))
     }
 
     pub fn imu_stream(&self) -> ImuStream {
@@ -266,44 +288,52 @@ impl LocalizerNode {
 
     fn localize_at(&mut self, keyframe: Keyframe, camera_time: CameraNanos) -> Handled {
         let frame_id = FrameId(keyframe.frame_id);
-        let timing = KeyframeTiming { camera_time, gravity_reaction: keyframe.gravity_reaction };
+        let timing = KeyframeTiming { camera_time, specific_force: keyframe.specific_force };
         let without_gyro = self.settings.heading_without_gyro;
         let heading = self.gyro.keyframe_heading(self.previous, timing, without_gyro);
         self.previous = Some(timing);
-        let gyro_gap = heading.gyro_problem.map(|problem| GyroGap { frame_id, problem, handled_by: without_gyro });
+        self.gyro_gaps += heading.gyro_problem.is_some() as u64;
+        let gyro_gap = heading.gyro_problem.map(|problem| GyroGap { frame_id, problem, handled_by: without_gyro, count: self.gyro_gaps });
         let cloud = registration_cloud(&keyframe, &self.settings.cloud);
         let estimate =
-            self.localizer.localize(LocalizerInput { frame_id, captured: UnixNanos(keyframe.captured_unix_ns), cloud, heading: heading.hint });
+            self.localizer.localize(LocalizerInput { frame_id, captured: UnixNanos(keyframe.captured_unix_ns), cloud, yaw_prior: heading.yaw_prior });
         let mut unjoined = Vec::new();
         if let Some(link) = self.odometry.as_mut() {
-            if estimate.tracking != Tracking::Lost {
-                link.waiting.push_back((frame_id, camera_time));
+            match estimate.tracking {
+                Tracking::Tracking | Tracking::Relocalized => link.waiting.push_back((frame_id, camera_time)),
+                // Only a registered keyframe ties the odometry to the map: a restarted keyframe's map pose is dead
+                // reckoning, like a lost one's.
+                Tracking::Restarted | Tracking::Lost => {}
             }
             link.join(&mut unjoined);
             link.expire(camera_time, &mut unjoined);
         }
         let map_to_odom = self.map_to_odom();
-        let moved = estimate.optimisation.as_ref().and_then(|_| self.moved_keyframes());
-        if estimate.tracking != Tracking::Lost {
+        let moved = estimate.optimization.as_ref().and_then(|_| self.pose_graph_update());
+        if estimate.selection == KeyframeSelection::Selected {
             self.sent.insert(frame_id, estimate.pose);
         }
         Handled { estimate: Some(estimate), gyro_gap, map_to_odom, unjoined, moved, ..Handled::default() }
     }
 
-    /// The keyframes already sent placed whose map pose has moved since it was last sent; each is counted as sent
-    /// at its new pose.
-    fn moved_keyframes(&mut self) -> Option<KeyframePosesMoved> {
+    /// The map keyframes already sent whose map pose has moved since it was last sent, each with the keyframes not
+    /// selected that follow it; each map keyframe is counted as sent at its new pose.
+    fn pose_graph_update(&mut self) -> Option<PoseGraphUpdate> {
         let mut keyframes = Vec::new();
+        let as_moved = |frame_id: FrameId, pose: room_map::Pose| {
+            let t = pose.translation;
+            UpdatedKeyframePose { frame_id, pose: Pose4Dof { x_m: t.x, y_m: t.y, z_m: t.z, yaw_rad: pose.yaw_rad } }
+        };
         for (frame_id, pose) in self.localizer.keyframe_poses() {
             let Some(sent) = self.sent.get_mut(&frame_id) else { continue };
             let shifted = sent.translation.distance(pose.translation) > MOVED_M
                 || room_map::pose::wrap_angle(sent.yaw_rad - pose.yaw_rad).abs() > MOVED_RAD;
             if shifted {
                 *sent = pose;
-                let t = pose.translation;
-                keyframes.push(MovedKeyframe { frame_id, pose: Pose4 { x_m: t.x, y_m: t.y, z_m: t.z, yaw_rad: pose.yaw_rad } });
+                keyframes.push(as_moved(frame_id, pose));
+                keyframes.extend(self.localizer.followers(frame_id).map(|(follower, pose)| as_moved(follower, pose)));
             }
         }
-        (!keyframes.is_empty()).then(|| KeyframePosesMoved { map_version: self.localizer.map_version(), keyframes })
+        (!keyframes.is_empty()).then(|| PoseGraphUpdate { map_version: self.localizer.map_version(), keyframes })
     }
 }

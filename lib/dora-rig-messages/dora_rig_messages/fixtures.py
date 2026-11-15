@@ -10,15 +10,15 @@ import pyarrow as pa
 
 import numpy as np
 
-from . import camera, localization, navigation, objects, people, space_map
+from . import camera, localization, navigation, objects, people, posed_depth, space_map
 from .drive import DriveDemand
 from .navigation import (
     GoalId, GoalKind, GoalReason, GoalState, GoalStatus, MapPose, MapVersion, NavGoal, ObjectId,
 )
-from .odometry import OdomPose, WeakestDirection
+from .odometry import OdomPose, DegenerateDirection
 from .operator import DriveMode, OperatorCommand
 from .perception import (
-    CameraIntrinsics, Concepts, Imu, Keyframe, Plane, Room, Scene, SceneObject, Segments, SurfaceKind,
+    CameraIntrinsics, Labels, Imu, Keyframe, Plane, Room, Scene, SceneObject, InstanceMasks, SurfaceKind,
 )
 from .scan import RangeReading, Scan
 from .status import DriverStatus, PilotStatus, TrackId
@@ -50,7 +50,7 @@ EXAMPLES: dict[str, Message] = {
         frame_id=42,
         captured_unix_ns=1_762_560_000_123_456_789,
         intrinsics=CameraIntrinsics(fx=640.5, fy=640.25, ppx=639.75, ppy=360.5),
-        gravity_reaction=(-0.0625, -9.75, -0.375),
+        specific_force=(-0.0625, -9.75, -0.375),
         depth_mm=np.array([[0, 1200, 1210], [2450, 65535, 400]], dtype=np.uint16),
         color_jpeg=bytes([0xFF, 0xD8, 0xFF, 0xD9]),
     ),
@@ -62,12 +62,12 @@ EXAMPLES: dict[str, Message] = {
         gyro_camera_ns=np.array([1_762_560_000_092_500_000, 1_762_560_000_095_000_000, 1_762_560_000_097_500_000], dtype=np.int64),
         gyro_rad_s=np.array([[0.0, 0.5, 0.0], [0.0, 0.25, -0.125], [0.03125, 0.0, 0.0]], dtype=np.float32),
     ),
-    "concepts": Concepts(model="claude-opus-5-5", frame_id=42, concepts=("sofa", "red blanket"), complete=False),
-    "segments": Segments(
+    "labels": Labels(model="claude-opus-5-5", frame_id=42, labels=("sofa", "red blanket"), complete=False),
+    "instance_masks": InstanceMasks(
         frame_id=42,
         labels=("sofa", "cushion"),
         scores=(0.875, 0.5),
-        segment_ids=np.array([[-1, 0, 0], [1, 0, -1]], dtype=np.int16),
+        instance_ids=np.array([[-1, 0, 0], [1, 0, -1]], dtype=np.int16),
     ),
     "scene": Scene(
         frame_id=42,
@@ -104,7 +104,7 @@ EXAMPLES: dict[str, Message] = {
         heading_sigma_rad=0.0078125,
         corrected=True,
         matched_points=1234,
-        weakest=WeakestDirection(direction=(0.0, 1.0, 0.0), sigma_m=0.125),
+        degenerate=DegenerateDirection(direction=(0.0, 1.0, 0.0), sigma_m=0.125),
     ),
     "odom_pose_predicted": OdomPose(
         camera_ns=1_762_560_000_133_000_000,
@@ -118,7 +118,7 @@ EXAMPLES: dict[str, Message] = {
         heading_sigma_rad=0.015625,
         corrected=False,
         matched_points=0,
-        weakest=None,
+        degenerate=None,
     ),
     "nav_goal_object": NavGoal(
         goal_id=GoalId(7),
@@ -156,7 +156,7 @@ EXAMPLES: dict[str, Message] = {
     ),
 }
 
-for _area in (camera, localization, navigation, objects, people, space_map):
+for _area in (camera, localization, navigation, objects, people, posed_depth, space_map):
     EXAMPLES.update(_area.FIXTURE_EXAMPLES)
 
 

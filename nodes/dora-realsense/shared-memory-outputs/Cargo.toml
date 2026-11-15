@@ -1,0 +1,12 @@
+[package]
+name = "shared-memory-outputs"
+version = "0.1.0"
+description = "Sends a dora node's outputs and stops the node with an error naming the output when a receiver has stopped releasing its shared-memory samples"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+# The accounting relies on how this exact version keeps shared-memory regions; see the crate docs.
+dora-node-api = { version = "=0.3.13", default-features = false }
+eyre = "0.6"

@@ -1,5 +1,5 @@
-//! Times the dense map on a rendered 15 m x 15 m house of six rooms: integrating each 848x480 keyframe, and
-//! slicing free space and topology from the whole map.
+//! Times the dense map on a rendered 15 m x 15 m house of six rooms: fusing each 848x480 keyframe, and
+//! slicing the occupancy grid and topology from the whole map.
 //!
 //! `cargo run --release -p dense-map --example profile_house`; `OPEN_PLAN=1` leaves out the inner walls, so every
 //! keyframe sees out to the range limit; `SHOW_PLAN=1` prints the rooms.
@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 
 use dense_map::synthetic::{house, keyframe_at, look_around, solid, wall_along_x, wall_along_y};
-use dense_map::{BlockTsdf, DenseMapSettings, DenseMapper, MapOutput};
+use dense_map::{BlockTsdf, DenseMapSettings, DenseMapper, DerivedMaps, MapOutput};
 use glam::Vec2;
 use perception_wire::navigation::{MapVersion, UnixNanos};
 use rayon::prelude::*;
@@ -39,7 +39,7 @@ fn main() {
         .collect();
     println!("rendered {} keyframes in {:.1} s", keyframes.len(), started.elapsed().as_secs_f32());
 
-    let mut mapper = DenseMapper::new(DenseMapSettings::default(), BlockTsdf::new(Default::default()));
+    let mut mapper = DenseMapper::new(DenseMapSettings::default(), BlockTsdf::new(Default::default()), UnixNanos(0));
     let mut times: Vec<Duration> = Vec::new();
     for (keyframe, pose) in keyframes {
         mapper.on_keyframe(keyframe);
@@ -50,28 +50,31 @@ fn main() {
     times.sort();
     let ms = |d: Duration| d.as_secs_f64() * 1e3;
     println!(
-        "integration per keyframe: median {:.1} ms, 90th {:.1} ms, max {:.1} ms; {} blocks",
+        "fusion per keyframe: median {:.1} ms, 90th {:.1} ms, max {:.1} ms; {} blocks",
         ms(times[times.len() / 2]),
         ms(times[times.len() * 9 / 10]),
         ms(times[times.len() - 1]),
         mapper.field().block_count()
     );
 
+    let mut derived = DerivedMaps::new(&DenseMapSettings::default());
     for round in 0..3 {
         let started = Instant::now();
-        let outputs = mapper.slice_now(UnixNanos(round)).expect("a floor");
+        let sliced = derived.slice(mapper.field(), MapVersion(1), UnixNanos(round)).expect("a floor");
         let elapsed = started.elapsed();
+        let outputs: Vec<MapOutput> =
+            std::iter::once(MapOutput::OccupancyGrid(sliced.occupancy_grid)).chain(sliced.topology.map(MapOutput::Topology)).collect();
         let mut summary = String::new();
         for output in &outputs {
             match output {
-                MapOutput::FreeSpace(f) => summary += &format!("free space {}x{}; ", f.width, f.height),
+                MapOutput::OccupancyGrid(f) => summary += &format!("free space {}x{}; ", f.width, f.height),
                 MapOutput::Topology(t) => {
                     summary += &format!("{} rooms, {} doorways, {} places, {} edges", t.rooms.len(), t.doorways.len(), t.places.len(), t.edges.len())
                 }
-                MapOutput::SurfacePatches(s) => summary += &format!("{} surface patches; ", s.patches.len()),
+                MapOutput::MeshBlocks(s) => summary += &format!("{} mesh blocks; ", s.blocks.len()),
             }
         }
-        println!("free space and topology {round}: {:.1} ms; {summary}", ms(elapsed));
+        println!("the occupancy grid and topology {round}: {:.1} ms; {summary}", ms(elapsed));
         if round == 0 && std::env::var_os("SHOW_PLAN").is_some() {
             show_plan(&outputs);
         }
@@ -81,7 +84,7 @@ fn main() {
 /// The plan as text, one character per 20 cm: the room's last id digit, '#' occupied, '.' free outside rooms,
 /// ' ' unknown, 'D' a doorway.
 fn show_plan(outputs: &[MapOutput]) {
-    let (Some(MapOutput::FreeSpace(free)), Some(MapOutput::Topology(topology))) = (outputs.first(), outputs.get(1)) else { return };
+    let (Some(MapOutput::OccupancyGrid(free)), Some(MapOutput::Topology(topology))) = (outputs.first(), outputs.get(1)) else { return };
     let step = 4;
     for row in (0..free.height).step_by(step).rev() {
         let line: String = (0..free.width)

@@ -9,11 +9,12 @@ license.workspace = true
 [dependencies]
 depth-perception = { path = "../depth-perception" }
 perception-wire = { path = "../perception-wire" }
-# The camera node's keyframe picker settings, which bound the turn between keyframes of a recording.
+# The camera node's keyframe selector settings, which bound the turn between keyframes of a recording.
 rgbd-keyframes = { path = "../../dora-realsense/rgbd-keyframes" }
 dora-node-api.workspace = true
 eyre.workspace = true
 glam = "0.29"
 jpeg-decoder = { version = "0.3", default-features = false }
 rayon = "1.10"
+rustc-hash = "2"
 serde_json = "1"

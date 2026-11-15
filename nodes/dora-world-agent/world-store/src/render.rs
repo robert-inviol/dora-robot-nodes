@@ -3,7 +3,7 @@
 use world_model::Point;
 
 use crate::geometry::{bounds, polygon_contains};
-use crate::types::{Cell, FreeSpace};
+use crate::types::{Cell, OccupancyGrid};
 
 pub const PX_PER_M: f32 = 40.0;
 const GLYPH_SCALE: usize = 2;
@@ -79,11 +79,11 @@ impl Canvas {
         }
     }
 
-    /// Paints every pixel by the free-space cell under it; pixels off the grid stay as they are.
-    pub fn paint_free_space(&mut self, free_space: &FreeSpace) {
+    /// Paints every pixel by the occupancy grid cell under it; pixels off the grid stay as they are.
+    pub fn paint_occupancy_grid(&mut self, occupancy_grid: &OccupancyGrid) {
         for row in 0..self.height {
             for column in 0..self.width {
-                let colour = match free_space.at(self.to_map(column, row)) {
+                let colour = match occupancy_grid.at(self.to_map(column, row)) {
                     Some(Cell::Occupied) => OCCUPIED,
                     Some(Cell::Unknown) => UNKNOWN,
                     Some(Cell::Free { .. }) | None => continue,

@@ -1,7 +1,7 @@
 [package]
 name = "dora-object-map"
 version = "0.1.0"
-description = "dora node that turns segments into persistent object updates"
+description = "dora node that turns instance masks into persistent object updates"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

@@ -39,6 +39,13 @@ pub struct SubmapSection {
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+pub struct KeyframeSelectionSection {
+    pub min_translation_m: f32,
+    pub min_rotation_deg: f32,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct TrackingSection {
     pub accept_fitness: f32,
     pub max_step_m: f32,
@@ -61,7 +68,7 @@ pub struct LoopSection {
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-pub struct RelocaliseSection {
+pub struct RelocalizeSection {
     pub radius_m: f32,
     pub min_fitness: f32,
     pub restart_after_lost: usize,
@@ -70,7 +77,7 @@ pub struct RelocaliseSection {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct GraphSection {
-    pub optimise_interval_s: f64,
+    pub optimize_interval_s: f64,
     pub version_move_m: f32,
     pub version_turn_deg: f32,
 }
@@ -79,7 +86,7 @@ pub struct GraphSection {
 #[serde(default, deny_unknown_fields)]
 pub struct GyroSection {
     pub buffer_s: f64,
-    pub min_still_s: f64,
+    pub min_stationary_s: f64,
     pub heading_without_gyro: HeadingWithoutGyroSetting,
     pub imu: ImuStream,
 }
@@ -187,9 +194,10 @@ impl From<HeadingWithoutGyroSetting> for HeadingWithoutGyro {
 pub struct NodeConfig {
     pub cloud: CloudSection,
     pub submap: SubmapSection,
+    pub keyframe_selection: KeyframeSelectionSection,
     pub tracking: TrackingSection,
     pub loops: LoopSection,
-    pub relocalise: RelocaliseSection,
+    pub relocalize: RelocalizeSection,
     pub graph: GraphSection,
     pub gyro: GyroSection,
     pub odometry: Option<OdometrySection>,
@@ -206,6 +214,13 @@ impl Default for SubmapSection {
     fn default() -> Self {
         let d = LocalizerSettings::default().submap;
         SubmapSection { radius_m: d.radius_m, max_keyframes: d.max_keyframes }
+    }
+}
+
+impl Default for KeyframeSelectionSection {
+    fn default() -> Self {
+        let d = LocalizerSettings::default().keyframe_selection;
+        KeyframeSelectionSection { min_translation_m: d.min_translation_m, min_rotation_deg: d.min_rotation_deg }
     }
 }
 
@@ -237,17 +252,17 @@ impl Default for LoopSection {
     }
 }
 
-impl Default for RelocaliseSection {
+impl Default for RelocalizeSection {
     fn default() -> Self {
-        let d = LocalizerSettings::default().relocalise;
-        RelocaliseSection { radius_m: d.radius_m, min_fitness: d.min_fitness, restart_after_lost: d.restart_after_lost }
+        let d = LocalizerSettings::default().relocalize;
+        RelocalizeSection { radius_m: d.radius_m, min_fitness: d.min_fitness, restart_after_lost: d.restart_after_lost }
     }
 }
 
 impl Default for GraphSection {
     fn default() -> Self {
         let d = LocalizerSettings::default().graph;
-        GraphSection { optimise_interval_s: d.optimise_interval_ns as f64 * 1e-9, version_move_m: d.version_move_m, version_turn_deg: d.version_turn_deg }
+        GraphSection { optimize_interval_s: d.optimize_interval_ns as f64 * 1e-9, version_move_m: d.version_move_m, version_turn_deg: d.version_turn_deg }
     }
 }
 
@@ -256,7 +271,7 @@ impl Default for GyroSection {
         let d = GyroSettings::default();
         GyroSection {
             buffer_s: d.buffer_ns as f64 * 1e-9,
-            min_still_s: d.still.min_still_ns as f64 * 1e-9,
+            min_stationary_s: d.stationary.min_stationary_ns as f64 * 1e-9,
             heading_without_gyro: HeadingWithoutGyro::default().into(),
             imu: ImuStream::default(),
         }
@@ -299,6 +314,8 @@ impl NodeConfig {
         localizer.submap.radius_m = self.submap.radius_m;
         localizer.submap.max_keyframes = self.submap.max_keyframes;
         localizer.submap.voxel_m = self.cloud.voxel_m;
+        localizer.keyframe_selection.min_translation_m = self.keyframe_selection.min_translation_m;
+        localizer.keyframe_selection.min_rotation_deg = self.keyframe_selection.min_rotation_deg;
         localizer.tracking.accept_fitness = self.tracking.accept_fitness;
         localizer.tracking.max_step_m = self.tracking.max_step_m;
         localizer.tracking.gyro_yaw_weight = self.tracking.gyro_yaw_weight;
@@ -311,15 +328,15 @@ impl NodeConfig {
         localizer.loops.max_rmse_m = self.loops.max_rmse_m;
         localizer.loops.max_correction_m = self.loops.max_correction_m;
         localizer.loops.max_correction_deg = self.loops.max_correction_deg;
-        localizer.relocalise.radius_m = self.relocalise.radius_m;
-        localizer.relocalise.min_fitness = self.relocalise.min_fitness;
-        localizer.relocalise.restart_after_lost = self.relocalise.restart_after_lost;
-        localizer.graph.optimise_interval_ns = (self.graph.optimise_interval_s * 1e9).round() as i64;
+        localizer.relocalize.radius_m = self.relocalize.radius_m;
+        localizer.relocalize.min_fitness = self.relocalize.min_fitness;
+        localizer.relocalize.restart_after_lost = self.relocalize.restart_after_lost;
+        localizer.graph.optimize_interval_ns = (self.graph.optimize_interval_s * 1e9).round() as i64;
         localizer.graph.version_move_m = self.graph.version_move_m;
         localizer.graph.version_turn_deg = self.graph.version_turn_deg;
         let cloud = CloudSettings { stride_px: self.cloud.stride_px, voxel_m: self.cloud.voxel_m, ..CloudSettings::default() };
         let mut gyro = GyroSettings { buffer_ns: (self.gyro.buffer_s * 1e9).round() as i64, ..GyroSettings::default() };
-        gyro.still.min_still_ns = (self.gyro.min_still_s * 1e9).round() as i64;
+        gyro.stationary.min_stationary_ns = (self.gyro.min_stationary_s * 1e9).round() as i64;
         NodeSettings {
             localizer,
             cloud,
@@ -389,10 +406,10 @@ mod tests {
 
     #[test]
     fn heading_search_is_chosen_by_name() {
-        let config: NodeConfig = toml::from_str("[gyro]\nheading_without_gyro = \"search\"\nmin_still_s = 0.5\n").unwrap();
+        let config: NodeConfig = toml::from_str("[gyro]\nheading_without_gyro = \"search\"\nmin_stationary_s = 0.5\n").unwrap();
         let settings = config.settings();
         assert_eq!(settings.heading_without_gyro, HeadingWithoutGyro::Search);
-        assert_eq!(settings.gyro.still.min_still_ns, 500_000_000);
+        assert_eq!(settings.gyro.stationary.min_stationary_ns, 500_000_000);
         assert!(toml::from_str::<NodeConfig>("[gyro]\nheading_without_gyro = \"guess\"\n").is_err());
     }
 

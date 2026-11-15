@@ -1,4 +1,4 @@
-//! The field's surface as triangles, one patch per block, by surface nets.
+//! The field's surface as triangles, one mesh block per block, by surface nets.
 //!
 //! A cell is the cube between eight neighbouring voxel centres. Each cell whose corners are all observed and do not
 //! all share a sign holds one vertex: the mean of the points where the distance crosses zero along its edges. Each
@@ -6,12 +6,14 @@
 //! the quads of the edges that start at its voxels, so it reads its neighbours' voxels one deep, and the vertices it
 //! shares with them come out the same in both.
 
+use std::time::{Duration, Instant};
+
 use glam::{IVec3, Vec3};
-use perception_wire::space_map::SurfacePatch;
+use perception_wire::space_map::MeshBlock;
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::tsdf::{DistanceField, Sample, BLOCK_EDGE_VOXELS};
+use crate::tsdf::{Tsdf, Sample, BLOCK_EDGE_VOXELS};
 
 const EDGE: i32 = BLOCK_EDGE_VOXELS;
 /// Voxels read along each axis: one before the block to one after it.
@@ -21,8 +23,8 @@ const CELLS: i32 = EDGE + 1;
 const AXES: [IVec3; 3] = [IVec3::X, IVec3::Y, IVec3::Z];
 
 /// The block's surface: every quad of an edge that starts at one of its voxels, as two triangles anticlockwise seen
-/// from the free side. A block without surface gives a patch without triangles.
-pub fn mesh_block(field: &dyn DistanceField, block: IVec3) -> SurfacePatch {
+/// from the free side. A block without surface gives a mesh block without triangles.
+pub fn mesh_block(field: &dyn Tsdf, block: IVec3) -> MeshBlock {
     let voxel_m = field.voxel_m();
     let first = block * EDGE;
     let sample_at = |local: IVec3| ((local.x + 1) + SPAN * ((local.y + 1) + SPAN * (local.z + 1))) as usize;
@@ -81,7 +83,7 @@ pub fn mesh_block(field: &dyn DistanceField, block: IVec3) -> SurfacePatch {
     if triangles.is_empty() {
         positions_m.clear();
     }
-    SurfacePatch { block, positions_m, triangles }
+    MeshBlock { block, positions_m, triangles }
 }
 
 /// The vertex of a cell inside it, from its lowest corner, in voxels; None unless every corner is observed and the
@@ -116,55 +118,86 @@ fn cell_vertex(distance: impl Fn(IVec3) -> Option<f32>) -> Option<Vec3> {
     Some(sum / crossings as f32)
 }
 
-/// Whether `now` looks the same as `sent`: the same triangles over the same vertices, none moved further than
-/// `min_move_m`.
-fn looks_the_same(sent: &SurfacePatch, now: &SurfacePatch, min_move_m: f32) -> bool {
-    sent.triangles == now.triangles
-        && sent.positions_m.len() == now.positions_m.len()
-        && sent.positions_m.iter().zip(&now.positions_m).all(|(a, b)| a.distance_squared(*b) <= min_move_m * min_move_m)
+/// When a block's surface is sent again: only once it has changed enough to see, and not sooner than a period after
+/// it was last sent, so that noise at the edge of what the camera sees does not resend it every pass.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ResendRule {
+    /// A vertex in a cell that has one both times has moved further than this.
+    pub min_vertex_move_m: f32,
+    /// Or more than this fraction of the cells holding a vertex appeared or went.
+    pub min_changed_cells: f32,
+    pub min_block_period: Duration,
 }
 
-/// The surfaces last sent, so that a block is sent again only when its surface changed enough to see.
-pub struct SurfaceMesher {
-    /// A block whose triangles are the same is sent again only once a vertex has moved further than this.
-    min_move_m: f32,
-    sent: FxHashMap<IVec3, SurfacePatch>,
+/// The cell each vertex lies in, keyed by cell: surface nets put at most one vertex in a cell, inside it.
+fn vertex_cells(mesh_block: &MeshBlock, voxel_m: f32) -> FxHashMap<IVec3, Vec3> {
+    mesh_block.positions_m.iter().map(|&p| (((p / voxel_m) - 0.5).floor().as_ivec3(), p)).collect()
 }
 
-impl SurfaceMesher {
-    pub fn new(min_move_m: f32) -> SurfaceMesher {
-        SurfaceMesher { min_move_m, sent: FxHashMap::default() }
+fn changed_enough(sent: &FxHashMap<IVec3, Vec3>, now: &FxHashMap<IVec3, Vec3>, rule: &ResendRule) -> bool {
+    let differing = now.keys().filter(|cell| !sent.contains_key(cell)).count() + sent.keys().filter(|cell| !now.contains_key(cell)).count();
+    if differing as f32 > rule.min_changed_cells * sent.len().max(now.len()) as f32 {
+        return true;
+    }
+    let limit = rule.min_vertex_move_m * rule.min_vertex_move_m;
+    now.iter().any(|(cell, p)| sent.get(cell).is_some_and(|q| p.distance_squared(*q) > limit))
+}
+
+/// A meshing pass: the mesh blocks to send, and the blocks whose change waits for their period to pass.
+#[derive(Debug, Default)]
+pub struct MeshPass {
+    pub blocks: Vec<MeshBlock>,
+    pub deferred: Vec<IVec3>,
+}
+
+/// The surfaces last sent and when, so that a block is sent again only when its surface changed enough to see.
+pub struct BlockMesher {
+    rule: ResendRule,
+    /// The vertex cells of every block whose surface was last sent with triangles.
+    sent: FxHashMap<IVec3, FxHashMap<IVec3, Vec3>>,
+    sent_at: FxHashMap<IVec3, Instant>,
+}
+
+impl BlockMesher {
+    pub fn new(rule: ResendRule) -> BlockMesher {
+        BlockMesher { rule, sent: FxHashMap::default(), sent_at: FxHashMap::default() }
     }
 
-    /// Meshes every block whose surface the `changed` blocks can reach (they and their neighbours) and returns the
-    /// patches that differ from the last ones sent: new surface, other triangles, a vertex moved further than the
-    /// minimum move, or a patch without triangles for a block whose surface is gone.
-    pub fn changed_patches(&mut self, field: &dyn DistanceField, changed: &FxHashSet<IVec3>) -> Vec<SurfacePatch> {
+    /// Meshes every block whose surface the `changed` blocks can reach (they and their neighbours). A block goes in
+    /// the pass's mesh blocks when its surface is new, changed enough by the rule, or gone (a mesh block without triangles),
+    /// and its period has passed; a block that changed within its period is deferred.
+    pub fn mesh_changed_blocks(&mut self, field: &dyn Tsdf, changed: &FxHashSet<IVec3>, now: Instant) -> MeshPass {
+        let voxel_m = field.voxel_m();
         let reach: FxHashSet<IVec3> = changed
             .iter()
             .flat_map(|&block| (-1..=1).flat_map(move |z| (-1..=1).flat_map(move |y| (-1..=1).map(move |x| block + IVec3::new(x, y, z)))))
             .collect();
-        let meshed: Vec<SurfacePatch> = reach.into_par_iter().map(|block| mesh_block(field, block)).collect();
-        let mut patches = Vec::new();
-        for patch in meshed {
-            let unchanged = match (self.sent.get(&patch.block), patch.triangles.is_empty()) {
-                (None, true) => true,
-                (Some(_), true) => {
-                    self.sent.remove(&patch.block);
-                    false
-                }
-                (Some(sent), false) => looks_the_same(sent, &patch, self.min_move_m),
-                (None, false) => false,
+        let meshed: Vec<MeshBlock> = reach.into_par_iter().map(|block| mesh_block(field, block)).collect();
+        let mut pass = MeshPass::default();
+        for mesh_block in meshed {
+            let cells = (!mesh_block.triangles.is_empty()).then(|| vertex_cells(&mesh_block, voxel_m));
+            let differs = match (self.sent.get(&mesh_block.block), &cells) {
+                (None, None) => false,
+                (Some(_), None) | (None, Some(_)) => true,
+                (Some(sent), Some(now)) => changed_enough(sent, now, &self.rule),
             };
-            if !unchanged {
-                if !patch.triangles.is_empty() {
-                    self.sent.insert(patch.block, patch.clone());
-                }
-                patches.push(patch);
+            if !differs {
+                continue;
             }
+            let waiting = self.sent_at.get(&mesh_block.block).is_some_and(|at| now.duration_since(*at) < self.rule.min_block_period);
+            if waiting {
+                pass.deferred.push(mesh_block.block);
+                continue;
+            }
+            self.sent_at.insert(mesh_block.block, now);
+            match cells {
+                Some(cells) => self.sent.insert(mesh_block.block, cells),
+                None => self.sent.remove(&mesh_block.block),
+            };
+            pass.blocks.push(mesh_block);
         }
-        patches.sort_by_key(|patch| patch.block.to_array());
-        patches
+        pass.blocks.sort_by_key(|mesh_block| mesh_block.block.to_array());
+        pass
     }
 }
 
@@ -184,14 +217,14 @@ mod tests {
         high: IVec3,
     }
 
-    impl DistanceField for Wall {
+    impl Tsdf for Wall {
         fn voxel_m(&self) -> f32 {
             VOXEL_M
         }
         fn cleared(&self) -> Wall {
             Wall { wall_m: self.wall_m, low: IVec3::ZERO, high: IVec3::NEG_ONE }
         }
-        fn integrate(&mut self, _: &PosedDepth) {}
+        fn fuse(&mut self, _: &PosedDepth) {}
         fn voxel(&self, index: IVec3) -> Sample {
             if index.cmplt(self.low).any() || index.cmpgt(self.high).any() {
                 return Sample::Unobserved;
@@ -217,28 +250,28 @@ mod tests {
         Wall { wall_m, low: IVec3::splat(-40), high: IVec3::splat(40) }
     }
 
-    fn normal(patch: &SurfacePatch, triangle: [u32; 3]) -> Vec3 {
-        let [a, b, c] = triangle.map(|i| patch.positions_m[i as usize]);
+    fn normal(mesh_block: &MeshBlock, triangle: [u32; 3]) -> Vec3 {
+        let [a, b, c] = triangle.map(|i| mesh_block.positions_m[i as usize]);
         (b - a).cross(c - a).normalize()
     }
 
     #[test]
     fn a_wall_meshes_into_triangles_on_it_facing_the_free_side() {
         // The wall at y = 0.5 m crosses block y = 1 (0.4 to 0.8 m).
-        let patch = mesh_block(&wall(0.51), IVec3::new(0, 1, 0));
-        assert_eq!(patch.triangles.len(), 2 * EDGE as usize * EDGE as usize, "one quad per voxel edge across the wall");
-        for p in &patch.positions_m {
+        let mesh_block = mesh_block(&wall(0.51), IVec3::new(0, 1, 0));
+        assert_eq!(mesh_block.triangles.len(), 2 * EDGE as usize * EDGE as usize, "one quad per voxel edge across the wall");
+        for p in &mesh_block.positions_m {
             assert!((p.y - 0.51).abs() < 1e-4, "{p}");
         }
-        for &triangle in &patch.triangles {
-            assert!(normal(&patch, triangle).dot(Vec3::NEG_Y) > 0.999, "faces the camera's side");
+        for &triangle in &mesh_block.triangles {
+            assert!(normal(&mesh_block, triangle).dot(Vec3::NEG_Y) > 0.999, "faces the camera's side");
         }
     }
 
     #[test]
     fn a_block_the_wall_does_not_cross_has_no_surface() {
-        let patch = mesh_block(&wall(0.51), IVec3::new(0, 3, 0));
-        assert!(patch.triangles.is_empty() && patch.positions_m.is_empty());
+        let mesh_block = mesh_block(&wall(0.51), IVec3::new(0, 3, 0));
+        assert!(mesh_block.triangles.is_empty() && mesh_block.positions_m.is_empty());
     }
 
     #[test]
@@ -259,26 +292,55 @@ mod tests {
     #[test]
     fn surface_next_to_unobserved_voxels_is_left_out() {
         let half = Wall { wall_m: 0.51, low: IVec3::splat(-40), high: IVec3::new(3, 40, 40) };
-        let patch = mesh_block(&half, IVec3::new(0, 1, 0));
+        let mesh_block = mesh_block(&half, IVec3::new(0, 1, 0));
         // Voxels up to x = 3 are observed, so cells up to x = 2 have vertices and edges at x = 0, 1, 2 have quads.
-        assert_eq!(patch.triangles.len(), 2 * 3 * EDGE as usize, "no quad uses a cell with an unobserved corner");
-        assert!(patch.positions_m.iter().all(|p| p.x <= 0.15 + 1e-6));
+        assert_eq!(mesh_block.triangles.len(), 2 * 3 * EDGE as usize, "no quad uses a cell with an unobserved corner");
+        assert!(mesh_block.positions_m.iter().all(|p| p.x <= 0.15 + 1e-6));
     }
+
+    const EVERY_PASS: ResendRule = ResendRule { min_vertex_move_m: 0.005, min_changed_cells: 0.1, min_block_period: Duration::ZERO };
 
     #[test]
     fn only_changed_surfaces_are_sent_again_and_a_vanished_one_once_as_empty() {
-        let mut mesher = SurfaceMesher::new(0.005);
+        let mut mesher = BlockMesher::new(EVERY_PASS);
         let changed: FxHashSet<IVec3> = [IVec3::new(0, 1, 0)].into_iter().collect();
-        let first = mesher.changed_patches(&wall(0.51), &changed);
+        let now = Instant::now();
+        let first = mesher.mesh_changed_blocks(&wall(0.51), &changed, now).blocks;
         assert_eq!(first.len(), 9, "the block and its eight neighbours across the wall's plane");
         assert!(first.iter().all(|p| p.block.y == 1 && !p.triangles.is_empty()));
-        assert!(mesher.changed_patches(&wall(0.51), &changed).is_empty(), "nothing changed");
-        assert!(mesher.changed_patches(&wall(0.513), &changed).is_empty(), "a 3 mm move is below the minimum");
-        let moved = mesher.changed_patches(&wall(0.53), &changed);
+        assert!(mesher.mesh_changed_blocks(&wall(0.51), &changed, now).blocks.is_empty(), "nothing changed");
+        assert!(mesher.mesh_changed_blocks(&wall(0.513), &changed, now).blocks.is_empty(), "a 3 mm move is below the minimum");
+        let moved = mesher.mesh_changed_blocks(&wall(0.53), &changed, now).blocks;
         assert_eq!(moved.len(), 9, "the wall moved 2 cm from what was sent, within the same blocks");
-        let gone = mesher.changed_patches(&wall(1.51), &changed);
+        let gone = mesher.mesh_changed_blocks(&wall(1.51), &changed, now).blocks;
         assert_eq!(gone.len(), 9);
         assert!(gone.iter().all(|p| p.triangles.is_empty()), "the wall left these blocks");
-        assert!(mesher.changed_patches(&wall(1.51), &changed).is_empty(), "an emptied block is sent once");
+        assert!(mesher.mesh_changed_blocks(&wall(1.51), &changed, now).blocks.is_empty(), "an emptied block is sent once");
+    }
+
+    #[test]
+    fn a_block_that_changes_again_within_its_period_waits_for_it() {
+        let rule = ResendRule { min_block_period: Duration::from_secs(5), ..EVERY_PASS };
+        let mut mesher = BlockMesher::new(rule);
+        let changed: FxHashSet<IVec3> = [IVec3::new(0, 1, 0)].into_iter().collect();
+        let start = Instant::now();
+        assert_eq!(mesher.mesh_changed_blocks(&wall(0.51), &changed, start).blocks.len(), 9);
+        let early = mesher.mesh_changed_blocks(&wall(0.53), &changed, start + Duration::from_secs(1));
+        assert!(early.blocks.is_empty());
+        assert_eq!(early.deferred.len(), 9, "the change waits");
+        let later = mesher.mesh_changed_blocks(&wall(0.53), &changed, start + Duration::from_secs(5));
+        assert_eq!(later.blocks.len(), 9, "and goes once the period has passed");
+    }
+
+    #[test]
+    fn a_few_cells_coming_and_going_or_small_moves_are_not_a_change() {
+        let cells = |count: i32, shift_m: f32| -> FxHashMap<IVec3, Vec3> {
+            (0..count).map(|i| (IVec3::new(i, 0, 0), Vec3::new(i as f32 * 0.05 + shift_m, 0.0, 0.0))).collect()
+        };
+        let rule = ResendRule { min_vertex_move_m: 0.02, min_changed_cells: 0.1, min_block_period: Duration::ZERO };
+        let sent = cells(100, 0.0);
+        assert!(!changed_enough(&sent, &cells(95, 0.01), &rule), "5 of 100 cells gone, the rest moved 1 cm");
+        assert!(changed_enough(&sent, &cells(85, 0.0), &rule), "15 of 100 cells gone");
+        assert!(changed_enough(&sent, &cells(100, 0.03), &rule), "every vertex moved 3 cm");
     }
 }

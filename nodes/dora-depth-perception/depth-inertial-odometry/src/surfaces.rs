@@ -159,11 +159,21 @@ pub struct PlaneVoxelSettings {
     pub max_thickness_sigmas: f32,
     /// They must spread at least this far across the plane in both directions.
     pub min_spread_m: f32,
+    /// The depth sensor's bias on a surface, one sigma along its normal: the error every view of it
+    /// shares, which averaging more views does not remove. A voxel's plane claims at most the weight
+    /// of one over its square however many points have fallen in it, so its sigma at its centre never
+    /// falls below this.
+    pub plane_sigma_floor_m: f32,
 }
 
 impl PlaneVoxelSettings {
     pub fn indoors() -> PlaneVoxelSettings {
-        PlaneVoxelSettings { voxel_m: 0.25, min_points: 6, max_thickness_m: 0.02, max_thickness_sigmas: 1.2, min_spread_m: 0.04 }
+        PlaneVoxelSettings { voxel_m: 0.25, min_points: 6, max_thickness_m: 0.02, max_thickness_sigmas: 1.2, min_spread_m: 0.04, plane_sigma_floor_m: 0.002 }
+    }
+
+    /// The most weight a voxel's plane claims: one over the square of [`Self::plane_sigma_floor_m`].
+    pub fn max_plane_weight(&self) -> f64 {
+        1.0 / (self.plane_sigma_floor_m as f64).powi(2)
     }
 }
 
@@ -239,9 +249,11 @@ impl PlaneVoxelMap {
         }
         let centre = cell.as_vec3() * self.settings.voxel_m + mean.as_vec3();
         // The plane is known as well as the mean of its points: their own sigmas, or their scatter
-        // where that is larger.
-        let from_weights = (1.0 / seen.weight).sqrt();
-        let centre_sigma_m = from_weights.max(thickness_m / (seen.points as f64).sqrt());
+        // where that is larger, with the weight and the count of points cut down together to the
+        // weight the plane may claim.
+        let claimed = seen.weight.min(self.settings.max_plane_weight());
+        let claimed_points = seen.points as f64 * claimed / seen.weight;
+        let centre_sigma_m = (1.0 / claimed).sqrt().max(thickness_m / claimed_points.sqrt());
         Some(VoxelPlane {
             centre,
             plane: Plane { normal, offset: -normal.dot(centre) },
@@ -393,7 +405,7 @@ mod tests {
     fn the_foot_of_a_wall_is_thin_enough_to_pass_the_thickness_limit_in_metres_alone() {
         let mut map = PlaneVoxelMap::new(PlaneVoxelSettings { max_thickness_sigmas: f32::INFINITY, ..PlaneVoxelSettings::indoors() });
         map.insert(&floor_meeting_a_wall());
-        let surface = map.surface_near(Vec3::new(0.1, 0.1, 0.02)).expect("the join is thinner than the limit in metres");
+        let surface = map.surface_near(Vec3::new(0.1, 0.1, 0.02)).expect("the join is downsampler than the limit in metres");
         assert!(surface.plane.normal.z.abs() < 0.999, "the plane leans towards the wall: {surface:?}");
     }
 
@@ -413,12 +425,28 @@ mod tests {
     fn a_plane_seen_more_often_is_known_better() {
         let mut rng = SmallRng::seed_from_u64(9);
         let mut map = PlaneVoxelMap::new(PlaneVoxelSettings::indoors());
-        map.insert(&noisy_wall(1600, 0.006, &mut rng));
+        // Points this noisy leave a voxel's first plane short of the weight it may claim.
+        map.insert(&noisy_wall(1200, 0.012, &mut rng));
         let once = map.surface_near(Vec3::new(2.0, 0.1, 0.5)).expect("the wall answers").sigma_m;
         for _ in 0..20 {
-            map.insert(&noisy_wall(1600, 0.006, &mut rng));
+            map.insert(&noisy_wall(1200, 0.012, &mut rng));
         }
         let often = map.surface_near(Vec3::new(2.0, 0.1, 0.5)).expect("the wall answers").sigma_m;
-        assert!(often < 0.5 * once, "sigma {once} after one cloud, {often} after twenty-one");
+        assert!(often < 0.8 * once, "sigma {once} after one cloud, {often} after twenty-one");
+    }
+
+    #[test]
+    fn a_plane_seen_ever_more_often_is_known_no_better_than_the_floor() {
+        let mut rng = SmallRng::seed_from_u64(9);
+        let settings = PlaneVoxelSettings::indoors();
+        let mut map = PlaneVoxelMap::new(settings);
+        let mut sigmas = Vec::new();
+        for _ in 0..300 {
+            map.insert(&noisy_wall(1600, 0.006, &mut rng));
+            sigmas.push(map.surface_near(Vec3::new(2.0, 0.1, 0.5)).expect("the wall answers").sigma_m);
+        }
+        let (after_a_hundred, after_three_hundred) = (sigmas[99], sigmas[299]);
+        assert!(after_three_hundred >= settings.plane_sigma_floor_m, "{after_three_hundred} under the floor {}", settings.plane_sigma_floor_m);
+        assert!(after_three_hundred > 0.95 * after_a_hundred, "sigma {after_a_hundred} after a hundred clouds, {after_three_hundred} after three hundred");
     }
 }

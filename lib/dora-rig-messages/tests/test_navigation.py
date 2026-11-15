@@ -4,14 +4,14 @@ import pytest
 from dora_rig_messages.fixtures import read_fixture
 from dora_rig_messages.navigation import (
     FIXTURE_EXAMPLES,
-    SPACE_ANSWER_TYPE,
+    SPATIAL_ANSWER_TYPE,
     GoalId,
     QuestionId,
     Reference,
     ReferenceKind,
     Revision,
-    SpaceAnswer,
-    SpaceQuestion,
+    SpatialAnswer,
+    SpatialQuery,
 )
 
 
@@ -31,19 +31,19 @@ def test_a_pose_reference_has_no_id_and_every_other_kind_has_one():
 
 
 def test_an_answer_without_references_or_goal_is_written_with_an_empty_list_and_a_null_goal():
-    answer = SpaceAnswer(QuestionId(1), Revision(0), True, "claude-haiku-5-5", "Nothing like that here.", (), None)
+    answer = SpatialAnswer(QuestionId(1), Revision(0), True, "claude-haiku-5-5", "Nothing like that here.", (), None)
 
     row = answer.to_arrow()
 
-    assert row.type == SPACE_ANSWER_TYPE
+    assert row.type == SPATIAL_ANSWER_TYPE
     assert row[0].as_py()["references"] == []
     assert row[0].as_py()["goal_id"] is None
-    assert SpaceAnswer.from_arrow(row) == answer
+    assert SpatialAnswer.from_arrow(row) == answer
 
 
 def test_a_question_is_not_read_as_an_answer():
     with pytest.raises(ValueError, match="expected wire type"):
-        SpaceAnswer.from_arrow(SpaceQuestion(QuestionId(1), 0, "planner", "Hi?").to_arrow())
+        SpatialAnswer.from_arrow(SpatialQuery(QuestionId(1), 0, "planner", "Hi?").to_arrow())
 
 
 def test_an_unknown_reference_kind_is_rejected():
@@ -59,8 +59,8 @@ def test_an_unknown_reference_kind_is_rejected():
                 "goal_id": GoalId(3),
             }
         ],
-        type=SPACE_ANSWER_TYPE,
+        type=SPATIAL_ANSWER_TYPE,
     )
 
     with pytest.raises(ValueError, match="'doorway' is not a valid ReferenceKind"):
-        SpaceAnswer.from_arrow(row)
+        SpatialAnswer.from_arrow(row)

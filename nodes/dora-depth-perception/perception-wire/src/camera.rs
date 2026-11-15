@@ -61,7 +61,7 @@ pub struct CameraCalibration {
     pub depth_to_imu: RigidTransform,
 }
 
-fn stream_intrinsics_type() -> DataType {
+pub(crate) fn stream_intrinsics_type() -> DataType {
     let mut fields = vec![required("width", DataType::UInt16), required("height", DataType::UInt16)];
     let DataType::Struct(floats) = floats_struct(&["fx", "fy", "ppx", "ppy"]) else { unreachable!() };
     fields.extend(floats.iter().map(|f| f.as_ref().clone()));

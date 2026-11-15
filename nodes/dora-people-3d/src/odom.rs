@@ -4,13 +4,15 @@ use std::collections::VecDeque;
 
 use glam::{Affine3A, Mat3, Vec3};
 use perception_wire::camera::{CameraCalibration, RigidTransform};
+use perception_wire::localization::CameraNanos;
 use perception_wire::odometry::OdomPose;
 
 /// What the odometry can say about one camera time.
 #[derive(Clone, Copy, Debug)]
-pub enum CameraPlacement {
-    /// The transform from the colour camera's frame into the odom frame `odom_started_camera_ns` names.
-    Placed { camera_to_odom: Affine3A, odom_started_camera_ns: i64 },
+pub enum CameraPoseLookup {
+    /// The transform from the colour camera's frame into the odom frame `odom_started` names: the odom frame of the
+    /// odometry poses the camera time was interpolated between.
+    Interpolated { camera_to_odom: Affine3A, odom_started: CameraNanos },
     /// The odometry has not reached this time yet.
     NotYet,
     /// The odometry will never cover this time: it is before the current odom frame's oldest pose kept here.
@@ -48,13 +50,13 @@ impl OdomHistory {
     }
 
     /// Where the colour camera was at `camera_ns`, between the two poses either side of it.
-    pub fn camera_at(&self, camera_ns: i64, calibration: &CameraCalibration) -> CameraPlacement {
-        let (Some(oldest), Some(newest)) = (self.poses.front(), self.poses.back()) else { return CameraPlacement::NotYet };
+    pub fn camera_at(&self, camera_ns: i64, calibration: &CameraCalibration) -> CameraPoseLookup {
+        let (Some(oldest), Some(newest)) = (self.poses.front(), self.poses.back()) else { return CameraPoseLookup::NotYet };
         if camera_ns < oldest.camera_ns {
-            return CameraPlacement::Never;
+            return CameraPoseLookup::Never;
         }
         if camera_ns > newest.camera_ns {
-            return CameraPlacement::NotYet;
+            return CameraPoseLookup::NotYet;
         }
         let after = self.poses.partition_point(|p| p.camera_ns < camera_ns);
         let later = &self.poses[after];
@@ -66,7 +68,7 @@ impl OdomHistory {
             earlier.position_m.lerp(later.position_m, t),
         );
         let color_to_body = affine(&calibration.depth_to_imu) * affine(&calibration.depth_to_color.inverse());
-        CameraPlacement::Placed { camera_to_odom: body_to_odom * color_to_body, odom_started_camera_ns: later.odom_started_camera_ns }
+        CameraPoseLookup::Interpolated { camera_to_odom: body_to_odom * color_to_body, odom_started: CameraNanos(later.odom_started_camera_ns) }
     }
 }
 
@@ -90,7 +92,7 @@ mod tests {
             heading_sigma_rad: 0.01,
             corrected: true,
             matched_points: 100,
-            weakest: None,
+            degenerate: None,
         }
     }
 
@@ -106,10 +108,10 @@ mod tests {
         }
     }
 
-    fn placed(placement: CameraPlacement) -> Affine3A {
-        match placement {
-            CameraPlacement::Placed { camera_to_odom, .. } => camera_to_odom,
-            other => panic!("not placed: {other:?}"),
+    fn interpolated(lookup: CameraPoseLookup) -> Affine3A {
+        match lookup {
+            CameraPoseLookup::Interpolated { camera_to_odom, .. } => camera_to_odom,
+            other => panic!("not interpolated: {other:?}"),
         }
     }
 
@@ -119,7 +121,7 @@ mod tests {
         // The body 1 m up odom z, turned a quarter about odom z: body x points along odom y.
         let turned = Quat::from_rotation_z(std::f32::consts::FRAC_PI_2);
         history.push(pose(100, 0, Vec3::new(0.0, 0.0, 1.0), turned));
-        let camera_to_odom = placed(history.camera_at(100, &calibration()));
+        let camera_to_odom = interpolated(history.camera_at(100, &calibration()));
         // The colour camera's origin is 4 cm right of the IMU, along body x, so 4 cm along odom y.
         let origin = camera_to_odom.transform_point3(Vec3::ZERO);
         assert!(origin.abs_diff_eq(Vec3::new(0.0, 0.04, 1.0), 1e-6), "{origin}");
@@ -129,21 +131,21 @@ mod tests {
     }
 
     #[test]
-    fn a_time_between_two_poses_is_placed_between_them() {
+    fn a_time_between_two_poses_is_interpolated_between_them() {
         let mut history = OdomHistory::new(2_000_000_000);
         history.push(pose(100, 0, Vec3::ZERO, Quat::IDENTITY));
         history.push(pose(200, 0, Vec3::new(1.0, 0.0, 0.0), Quat::IDENTITY));
-        let origin = placed(history.camera_at(150, &calibration())).transform_point3(Vec3::ZERO);
+        let origin = interpolated(history.camera_at(150, &calibration())).transform_point3(Vec3::ZERO);
         assert!(origin.abs_diff_eq(Vec3::new(0.54, 0.0, 0.0), 1e-6), "{origin}");
     }
 
     #[test]
     fn times_outside_the_poses_are_not_yet_or_never() {
         let mut history = OdomHistory::new(2_000_000_000);
-        assert!(matches!(history.camera_at(100, &calibration()), CameraPlacement::NotYet));
+        assert!(matches!(history.camera_at(100, &calibration()), CameraPoseLookup::NotYet));
         history.push(pose(100, 0, Vec3::ZERO, Quat::IDENTITY));
-        assert!(matches!(history.camera_at(150, &calibration()), CameraPlacement::NotYet));
-        assert!(matches!(history.camera_at(50, &calibration()), CameraPlacement::Never));
+        assert!(matches!(history.camera_at(150, &calibration()), CameraPoseLookup::NotYet));
+        assert!(matches!(history.camera_at(50, &calibration()), CameraPoseLookup::Never));
     }
 
     #[test]
@@ -151,9 +153,9 @@ mod tests {
         let mut history = OdomHistory::new(2_000_000_000);
         assert!(!history.push(pose(100, 0, Vec3::ZERO, Quat::IDENTITY)));
         assert!(history.push(pose(300, 250, Vec3::ZERO, Quat::IDENTITY)));
-        assert!(matches!(history.camera_at(200, &calibration()), CameraPlacement::Never));
+        assert!(matches!(history.camera_at(200, &calibration()), CameraPoseLookup::Never));
         match history.camera_at(300, &calibration()) {
-            CameraPlacement::Placed { odom_started_camera_ns, .. } => assert_eq!(odom_started_camera_ns, 250),
+            CameraPoseLookup::Interpolated { odom_started, .. } => assert_eq!(odom_started, CameraNanos(250)),
             other => panic!("{other:?}"),
         }
     }

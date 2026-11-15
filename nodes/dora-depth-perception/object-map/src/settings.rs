@@ -10,7 +10,7 @@ use serde::Deserialize;
 pub struct ObjectMapSettings {
     /// Edge of the cubes that object points are counted in.
     pub voxel_size_m: f32,
-    /// Keyframes that wait for their pose and segments; the oldest is dropped beyond this.
+    /// Keyframes that wait for their pose and instance masks; the oldest is dropped beyond this.
     pub pending_frames: usize,
     pub detection: DetectionSettings,
     pub association: AssociationSettings,
@@ -45,9 +45,9 @@ pub struct AssociationSettings {
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ConfirmationSettings {
-    /// Sightings, in different keyframes, that make a candidate an object.
-    pub sightings: u32,
-    /// A candidate not confirmed this long after its first sighting is dropped.
+    /// Observations, in different keyframes, that make a candidate an object.
+    pub observations: u32,
+    /// A candidate not confirmed this long after its first observation is dropped.
     pub window_s: f64,
 }
 
@@ -123,7 +123,7 @@ impl Default for AssociationSettings {
 
 impl Default for ConfirmationSettings {
     fn default() -> Self {
-        ConfirmationSettings { sightings: 3, window_s: 60.0 }
+        ConfirmationSettings { observations: 3, window_s: 60.0 }
     }
 }
 

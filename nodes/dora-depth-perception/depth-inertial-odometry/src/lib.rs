@@ -11,7 +11,7 @@
 //! start at rest.
 //!
 //! Other sensors join through [`filter::PoseInformation`]: anything that can say "this body point lies
-//! on that world plane" adds its measurements to the same correction as the cloud's.
+//! on that world plane" adds its measurements to the same measurement update as the cloud's.
 
 pub mod association;
 pub mod depth_image;
@@ -21,7 +21,7 @@ pub mod map;
 pub mod odometry;
 pub mod simulation;
 pub mod surfaces;
-pub mod thinning;
+pub mod downsampling;
 pub mod tracker;
 
 pub use filter::State;

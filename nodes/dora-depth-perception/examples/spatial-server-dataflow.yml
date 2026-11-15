@@ -1,36 +1,37 @@
 # The spatial server on the mapping machine (strixen): localizer, dense map, object map, the spatial agent and the
 # rig view page for people to watch (http://<this machine>:8094), fed live over Zenoh. Keyframes, their IMU,
-# odometry, the camera's calibration and people come from the camera machine's dataflow
-# (dora-realsense/examples/pose-dataflow.yml); SAM 3 segments come from a GPU machine running the perception
-# dataflow with `segments` published to rig/segments; questions come from whichever agent asks them.
+# odometry, posed depth frames, the camera's calibration and people come from the camera machine's dataflow
+# (dora-realsense/examples/pose-dataflow.yml); SAM 3 instance masks come from a GPU machine running the perception
+# dataflow with `instance_masks` published to rig/instance_masks; questions come from whichever agent asks them.
 # ZENOH_CONNECT is the camera machine's address.
 # Paths are relative to this file. Build with `cargo build --release` in nodes/dora-depth-perception,
 # nodes/dora-world-agent, nodes/dora-rig-view and nodes/dora-zenoh-bridge before `dora start`.
 nodes:
-  - id: link
+  - id: bridge
     path: ../../dora-zenoh-bridge/target/release/dora-zenoh-bridge
     env:
       ZENOH_CONNECT: tcp/192.0.2.10:7447
-      ZENOH_SUBSCRIBE: rig/keyframe=keyframe,rig/imu=imu,rig/segments=segments,rig/space_question=space_question,rig/goal_status=goal_status,rig/people_tracks=people_tracks,rig/odom_pose=odom_pose,rig/calibration=calibration
-      ZENOH_PUBLISH: keyframe_pose=rig/keyframe_pose,free_space=rig/free_space,topology=rig/topology,keep_out=rig/keep_out,object_update=rig/object_update,space_answer=rig/space_answer,nav_goal=rig/nav_goal
+      ZENOH_SUBSCRIBE: rig/keyframe=keyframe,rig/imu=imu,rig/instance_masks=instance_masks,rig/spatial_query=spatial_query,rig/goal_status=goal_status,rig/people_tracks=people_tracks,rig/odom_pose=odom_pose,rig/calibration=calibration,rig/posed_depth=posed_depth
+      ZENOH_PUBLISH: keyframe_pose=rig/keyframe_pose,occupancy_grid=rig/occupancy_grid,topology=rig/topology,keep_out=rig/keep_out,object_update=rig/object_update,spatial_answer=rig/spatial_answer,nav_goal=rig/nav_goal
     inputs:
       tick: dora/timer/millis/5
       keyframe_pose: localizer/keyframe_pose
-      free_space: dense_map/free_space
+      occupancy_grid: dense_map/occupancy_grid
       topology: dense_map/topology
       keep_out: dense_map/keep_out
       object_update: objects/object_update
-      space_answer: spatial_agent/space_answer
+      spatial_answer: spatial_agent/spatial_answer
       nav_goal: spatial_agent/nav_goal
     outputs:
       - keyframe
       - imu
-      - segments
-      - space_question
+      - instance_masks
+      - spatial_query
       - goal_status
       - people_tracks
       - odom_pose
       - calibration
+      - posed_depth
 
   - id: localizer
     path: ../target/release/dora-map-localizer
@@ -39,23 +40,23 @@ nodes:
       RUST_LOG: info
     inputs:
       keyframe:
-        source: link/keyframe
+        source: bridge/keyframe
         queue_size: 1
       imu:
-        source: link/imu
+        source: bridge/imu
         queue_size: 1000
       # Every pose is needed, in camera-time order.
       odom_pose:
-        source: link/odom_pose
+        source: bridge/odom_pose
         queue_size: 1000
       # Where the colour camera sits on the IMU; the same message every second.
       calibration:
-        source: link/calibration
+        source: bridge/calibration
         queue_size: 1
     outputs:
       - keyframe_pose
       - map_to_odom
-      - keyframe_poses_moved
+      - pose_graph_update
 
   - id: dense_map
     path: ../target/release/dora-dense-map
@@ -64,24 +65,32 @@ nodes:
       RUST_LOG: info
     inputs:
       keyframe:
-        source: link/keyframe
+        source: bridge/keyframe
         queue_size: 32
       keyframe_pose:
         source: localizer/keyframe_pose
         queue_size: 32
-      # Keyframes already placed that an optimisation moved.
-      keyframe_poses_moved:
-        source: localizer/keyframe_poses_moved
+      # Keyframes already fused that a pose graph optimization moved.
+      pose_graph_update:
+        source: localizer/pose_graph_update
         queue_size: 32
       object_update:
         source: objects/object_update
         queue_size: 64
-      tick: dora/timer/millis/250
+      # Fused as they arrive, at their odometry pose corrected by the latest map_to_odom; only the newest matters.
+      posed_depth:
+        source: bridge/posed_depth
+        queue_size: 2
+      map_to_odom: localizer/map_to_odom
+      # Collects and starts background rebuilds, meshing (at most every mesh.period_s, 0.2 s) and slicing.
+      tick: dora/timer/millis/50
+      # The rig view missed a mesh blocks message or joined late: the whole surface goes out as a snapshot.
+      mesh_snapshot_request: rig_view/mesh_snapshot_request
     outputs:
-      - free_space
+      - occupancy_grid
       - topology
       - keep_out
-      - surface_patches
+      - mesh_blocks
 
   - id: objects
     path: ../target/release/dora-object-map
@@ -90,13 +99,13 @@ nodes:
       RUST_LOG: info
     inputs:
       keyframe:
-        source: link/keyframe
+        source: bridge/keyframe
         queue_size: 32
       keyframe_pose:
         source: localizer/keyframe_pose
         queue_size: 32
-      segments:
-        source: link/segments
+      instance_masks:
+        source: bridge/instance_masks
         queue_size: 8
     outputs:
       - object_update
@@ -107,11 +116,11 @@ nodes:
       SPATIAL_AGENT_CONFIG: ../../dora-world-agent/world-agent/spatial-agent.example.toml
       RUST_LOG: info
     inputs:
-      space_question: link/space_question
-      goal_status: link/goal_status
+      spatial_query: bridge/spatial_query
+      goal_status: bridge/goal_status
       topology: dense_map/topology
-      free_space:
-        source: dense_map/free_space
+      occupancy_grid:
+        source: dense_map/occupancy_grid
         queue_size: 1
       object_update:
         source: objects/object_update
@@ -119,57 +128,60 @@ nodes:
       keyframe_pose:
         source: localizer/keyframe_pose
         queue_size: 32
-      # People are placed in the map from the odometry frame with the localizer's map_to_odom; until the first
+      # People are transformed into the map frame from the odometry frame with the localizer's map_to_odom; until the first
       # correction they are logged and left out.
       people_tracks:
-        source: link/people_tracks
+        source: bridge/people_tracks
         queue_size: 8
       map_to_odom: localizer/map_to_odom
     outputs:
-      - space_answer
+      - spatial_answer
       - nav_goal
 
   # Planes and the room from each keyframe on its own (dora-depth-perception), for the rig view.
-  - id: geometry
+  - id: plane_segmentation
     path: ../target/release/dora-depth-perception
     inputs:
       keyframe:
-        source: link/keyframe
+        source: bridge/keyframe
         queue_size: 1
     outputs:
-      - structure
-      - scene
+      - room_layout
 
   - id: rig_view
     path: ../../dora-rig-view/target/release/dora-rig-view
     env:
+      # The address the page is served on.
+      RIG_VIEW_ADDRESS: "0.0.0.0"
       RIG_VIEW_PORT: "8094"
       RUST_LOG: info
     inputs:
-      # Sends the robot and the people to the page at most ten times a second.
-      tick: dora/timer/millis/100
       keyframe:
-        source: link/keyframe
+        source: bridge/keyframe
         queue_size: 4
       keyframe_pose: localizer/keyframe_pose
-      keyframe_poses_moved:
-        source: localizer/keyframe_poses_moved
+      pose_graph_update:
+        source: localizer/pose_graph_update
         queue_size: 32
       odom_pose:
-        source: link/odom_pose
+        source: bridge/odom_pose
         queue_size: 1
       map_to_odom: localizer/map_to_odom
       people_tracks:
-        source: link/people_tracks
+        source: bridge/people_tracks
         queue_size: 1
-      # Every patch is needed: each one is the only message that says how its block looks now.
-      surface_patches:
-        source: dense_map/surface_patches
+      # Every mesh block is needed: each one is the only message that says how its block looks now. A message the full
+      # queue drops shows as a gap in the sequence, and the rig view asks for a snapshot.
+      mesh_blocks:
+        source: dense_map/mesh_blocks
         queue_size: 32
       object_update:
         source: objects/object_update
         queue_size: 256
       topology: dense_map/topology
-      layout:
-        source: geometry/structure
+      room_layout:
+        source: plane_segmentation/room_layout
         queue_size: 1
+    outputs:
+      # Asks the dense map for its whole surface after a missed mesh blocks message.
+      - mesh_snapshot_request

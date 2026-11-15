@@ -10,9 +10,11 @@ readme = "../README.md"
 [dependencies]
 rgbd-frames = { path = "../rgbd-frames" }
 rgbd-keyframes = { path = "../rgbd-keyframes" }
+shared-memory-outputs = { path = "../shared-memory-outputs" }
 perception-wire = { path = "../../dora-depth-perception/perception-wire" }
 # The node API has to match the version of the dora CLI that runs the dataflow.
 dora-node-api = { version = "=0.3.13", default-features = false }
 eyre = "0.6"
 glam = "0.29"
 realsense-rust = "1.3"
+realsense-sys = "=2.56.5"

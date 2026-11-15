@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "dora-scene-view"
 version = "0.1.0"
-description = "A dora node serving a live 3D debug view of keyframes, segments and scenes"
+description = "A dora node serving a live 3D debug view of keyframes, instance masks and scenes"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.11"

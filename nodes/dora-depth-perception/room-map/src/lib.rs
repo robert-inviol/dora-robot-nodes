@@ -9,8 +9,8 @@
 pub mod fusion;
 pub mod grid;
 pub mod heading;
-pub mod keyframe_gaps;
-pub mod placement;
+pub mod timing_yaw_prior;
+pub mod run_alignment;
 pub mod pose;
 pub mod recording;
 pub mod registration;

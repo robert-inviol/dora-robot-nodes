@@ -14,14 +14,14 @@ use super::{checked, field, floats, item, items, list_values, one_list, scalar};
 /// The direction of travel a depth cloud pinned down least, in the odom frame and either way round, and the one
 /// sigma the cloud alone leaves along it.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct WeakestDirection {
+pub struct DegenerateDirection {
     pub direction: Vec3,
     pub sigma_m: f32,
 }
 
 /// Where odometry says the robot is at one depth frame.
 ///
-/// The odom frame is fixed where the IMU rested when odometry started, with z up; it drifts against the real room
+/// The odom frame is fixed where the IMU was during static initialization, with z up; it drifts against the real room
 /// as the robot travels. The body frame is the IMU's own axes (on the D455: x right, y down, z forward).
 ///
 /// `camera_ns` strictly increases from one pose to the next. A consumer that wants the pose at another camera time
@@ -56,11 +56,11 @@ pub struct OdomPose {
     /// Cloud points that found a surface in the map; 0 when the cloud did not correct the pose.
     pub matched_points: u32,
     /// Absent when the cloud did not correct the pose.
-    pub weakest: Option<WeakestDirection>,
+    pub degenerate: Option<DegenerateDirection>,
 }
 
-const WEAKEST_DIRECTION: &str = "weakest_direction";
-const WEAKEST_SIGMA_M: &str = "weakest_sigma_m";
+const DEGENERATE_DIRECTION: &str = "degenerate_direction";
+const DEGENERATE_SIGMA_M: &str = "degenerate_sigma_m";
 
 fn odom_pose_fields() -> Fields {
     Fields::from(vec![
@@ -75,8 +75,8 @@ fn odom_pose_fields() -> Fields {
         field("heading_sigma_rad", DataType::Float32),
         field("corrected", DataType::Boolean),
         field("matched_points", DataType::UInt32),
-        field(WEAKEST_DIRECTION, items(DataType::Float32)),
-        field(WEAKEST_SIGMA_M, DataType::Float32),
+        field(DEGENERATE_DIRECTION, items(DataType::Float32)),
+        field(DEGENERATE_SIGMA_M, DataType::Float32),
     ])
 }
 
@@ -98,13 +98,13 @@ pub fn decode_odom_pose(array: &dyn Array) -> Result<OdomPose> {
         bail!("odom pose row is null");
     }
     let present = |name: &str| !column(row, name).is_null(0);
-    if let Some(missing) = odom_pose_fields().iter().map(|field| field.name()).find(|name| ![WEAKEST_DIRECTION, WEAKEST_SIGMA_M].contains(&name.as_str()) && !present(name)) {
+    if let Some(missing) = odom_pose_fields().iter().map(|field| field.name()).find(|name| ![DEGENERATE_DIRECTION, DEGENERATE_SIGMA_M].contains(&name.as_str()) && !present(name)) {
         bail!("odom pose is missing {missing}");
     }
-    let weakest = match (present(WEAKEST_DIRECTION), present(WEAKEST_SIGMA_M)) {
-        (true, true) => Some(WeakestDirection { direction: Vec3::from_array(values(row, WEAKEST_DIRECTION)?), sigma_m: scalar::<Float32Type>(row, WEAKEST_SIGMA_M) }),
+    let degenerate = match (present(DEGENERATE_DIRECTION), present(DEGENERATE_SIGMA_M)) {
+        (true, true) => Some(DegenerateDirection { direction: Vec3::from_array(values(row, DEGENERATE_DIRECTION)?), sigma_m: scalar::<Float32Type>(row, DEGENERATE_SIGMA_M) }),
         (false, false) => None,
-        (true, false) | (false, true) => bail!("odom pose has one of {WEAKEST_DIRECTION} and {WEAKEST_SIGMA_M} without the other"),
+        (true, false) | (false, true) => bail!("odom pose has one of {DEGENERATE_DIRECTION} and {DEGENERATE_SIGMA_M} without the other"),
     };
     Ok(OdomPose {
         camera_ns: scalar::<Int64Type>(row, "camera_ns"),
@@ -118,13 +118,13 @@ pub fn decode_odom_pose(array: &dyn Array) -> Result<OdomPose> {
         heading_sigma_rad: scalar::<Float32Type>(row, "heading_sigma_rad"),
         corrected: column(row, "corrected").as_boolean().value(0),
         matched_points: scalar::<UInt32Type>(row, "matched_points"),
-        weakest,
+        degenerate,
     })
 }
 
 pub fn encode_odom_pose(pose: &OdomPose) -> StructArray {
-    let weakest_direction = match pose.weakest {
-        Some(weakest) => one_list(floats(weakest.direction.to_array())),
+    let degenerate_direction = match pose.degenerate {
+        Some(degenerate) => one_list(floats(degenerate.direction.to_array())),
         None => Arc::new(ListArray::new(item(DataType::Float32), OffsetBuffer::from_lengths([0]), floats([]), Some(NullBuffer::new_null(1)))),
     };
     let columns: Vec<ArrayRef> = vec![
@@ -139,8 +139,8 @@ pub fn encode_odom_pose(pose: &OdomPose) -> StructArray {
         floats([pose.heading_sigma_rad]),
         Arc::new(BooleanArray::from(vec![pose.corrected])),
         Arc::new(UInt32Array::from(vec![pose.matched_points])),
-        weakest_direction,
-        Arc::new(Float32Array::from(vec![pose.weakest.map(|weakest| weakest.sigma_m)])),
+        degenerate_direction,
+        Arc::new(Float32Array::from(vec![pose.degenerate.map(|degenerate| degenerate.sigma_m)])),
     ];
     StructArray::new(odom_pose_fields(), columns, None)
 }
@@ -181,18 +181,18 @@ mod tests {
             heading_sigma_rad: 0.0078125,
             corrected: true,
             matched_points: 1234,
-            weakest: Some(WeakestDirection { direction: Vec3::Y, sigma_m: 0.125 }),
+            degenerate: Some(DegenerateDirection { direction: Vec3::Y, sigma_m: 0.125 }),
         };
         assert_eq!(pose, expected);
         assert_eq!(encode_odom_pose(&pose), golden);
     }
 
     #[test]
-    fn a_predicted_odom_pose_has_no_weakest_direction_and_encodes_back_to_its_fixture() {
+    fn a_predicted_odom_pose_has_no_degenerate_direction_and_encodes_back_to_its_fixture() {
         let golden = fixture("odom_pose_predicted");
         let pose = decode_odom_pose(&golden).unwrap();
         assert_eq!((pose.camera_ns, pose.odom_started_camera_ns, pose.depth_frame_id), (1_762_560_000_133_000_000, 1_762_559_990_000_000_000, 43));
-        assert_eq!((pose.corrected, pose.matched_points, pose.weakest), (false, 0, None));
+        assert_eq!((pose.corrected, pose.matched_points, pose.degenerate), (false, 0, None));
         assert_eq!(pose.orientation, Quat::from_xyzw(0.0, 0.0, 1.0, 0.0));
         assert_eq!(encode_odom_pose(&pose), golden);
     }
@@ -205,12 +205,12 @@ mod tests {
     }
 
     #[test]
-    fn an_odom_pose_with_half_of_its_weakest_direction_is_rejected() {
-        let without_sigma = with_column(&fixture("odom_pose"), WEAKEST_SIGMA_M, Arc::new(Float32Array::from(vec![None])));
-        let without_direction = with_column(&fixture("odom_pose_predicted"), WEAKEST_SIGMA_M, floats([0.125]));
+    fn an_odom_pose_with_half_of_its_degenerate_direction_is_rejected() {
+        let without_sigma = with_column(&fixture("odom_pose"), DEGENERATE_SIGMA_M, Arc::new(Float32Array::from(vec![None])));
+        let without_direction = with_column(&fixture("odom_pose_predicted"), DEGENERATE_SIGMA_M, floats([0.125]));
         for half in [without_sigma, without_direction] {
             let error = decode_odom_pose(&half).err().unwrap();
-            assert!(error.to_string().contains("one of weakest_direction and weakest_sigma_m without the other"), "{error}");
+            assert!(error.to_string().contains("one of degenerate_direction and degenerate_sigma_m without the other"), "{error}");
         }
     }
 

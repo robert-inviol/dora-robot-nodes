@@ -1,4 +1,4 @@
-"""Where each keyframe is in the map, where optimisation moved past keyframes to, and the correction from the
+"""Where each keyframe is in the map, where optimization moved past keyframes to, and the correction from the
 robot's odometry frame to the map.
 
 The map frame is z up, gravity aligned, metres. A keyframe pose (x, y, z, yaw) is applied to that keyframe's
@@ -17,14 +17,19 @@ from .navigation import MapVersion
 from .wire import one_row, only_row
 
 FrameId = NewType("FrameId", int)
+# A time on the depth camera's own clock, shared by all its sensors, in nanoseconds; not a unix time.
+CameraNanos = NewType("CameraNanos", int)
 
 
 class Tracking(Enum):
     # Registered against the map around the previous keyframe.
     TRACKING = "tracking"
-    # Placed again by matching stored keyframes after tracking was lost.
-    RELOCALISED = "relocalised"
-    # Not registered: the pose is dead reckoning from the gyro and the last known position.
+    # Registered again by matching stored keyframes after tracking was lost.
+    RELOCALIZED = "relocalized"
+    # Starts a new run after tracking was lost: in the map, joined to it only by a dead-reckoning edge, not
+    # registered against it. Its pose is dead reckoning, which later pose graph updates move.
+    RESTARTED = "restarted"
+    # Not registered and not in the map: the pose is dead reckoning from the gyro and the last known position.
     LOST = "lost"
 
 
@@ -32,7 +37,7 @@ KEYFRAME_POSE_TYPE = pa.struct(
     [
         ("frame_id", pa.uint64()),
         ("captured_unix_ns", pa.int64()),
-        # The pose graph the pose comes from; it rises whenever optimisation moves past keyframes.
+        # The pose graph the pose comes from; it rises whenever optimization moves past keyframes.
         ("map_version", pa.uint64()),
         ("x_m", pa.float32()),
         ("y_m", pa.float32()),
@@ -51,6 +56,9 @@ MAP_TO_ODOM_TYPE = pa.struct(
         ("map_version", pa.uint64()),
         # On the depth camera's own clock: odometry poses from this time on are corrected with this transform.
         ("valid_from_camera_ns", pa.int64()),
+        # The odom frame the correction takes points out of, named as odom poses name it: the camera time at which
+        # odometry started. Odom poses of another odom frame cannot be corrected with it.
+        ("odom_started_camera_ns", pa.int64()),
         # p_map = R_z(yaw) p_odom + (x, y, z).
         ("x_m", pa.float32()),
         ("y_m", pa.float32()),
@@ -72,11 +80,11 @@ MOVED_KEYFRAME_TYPE = pa.struct(
     ]
 )
 
-# Sent after an optimisation of the pose graph that moved keyframes already sent: every one that moved, with its new
+# Sent after an optimization of the pose graph that moved keyframes already sent: every one that moved, with its new
 # pose. A keyframe's own keyframe_pose is never sent again; this is how its later poses arrive.
 KEYFRAME_POSES_MOVED_TYPE = pa.struct(
     [
-        # The pose graph the poses come from: the optimisation's.
+        # The pose graph the poses come from: the optimization's.
         pa.field("map_version", pa.uint64(), nullable=False),
         pa.field("keyframes", pa.list_(pa.field("item", MOVED_KEYFRAME_TYPE, nullable=False)), nullable=False),
     ]
@@ -150,7 +158,8 @@ class KeyframePose:
 @dataclass(frozen=True)
 class MapToOdom:
     map_version: MapVersion
-    valid_from_camera_ns: int
+    valid_from_camera_ns: CameraNanos
+    odom_started_camera_ns: CameraNanos
     x_m: float
     y_m: float
     z_m: float
@@ -164,12 +173,18 @@ class MapToOdom:
             _finite(name, getattr(self, name))
         for name in ("sigma_xy_m", "sigma_z_m", "sigma_yaw_rad"):
             _finite_not_negative(name, getattr(self, name))
+        if self.valid_from_camera_ns < self.odom_started_camera_ns:
+            raise ValueError(
+                f"valid_from_camera_ns {self.valid_from_camera_ns} is before its odom frame started, at "
+                f"{self.odom_started_camera_ns}"
+            )
 
     def to_arrow(self) -> pa.Array:
         return one_row(
             {
                 "map_version": self.map_version,
                 "valid_from_camera_ns": self.valid_from_camera_ns,
+                "odom_started_camera_ns": self.odom_started_camera_ns,
                 "x_m": self.x_m,
                 "y_m": self.y_m,
                 "z_m": self.z_m,
@@ -186,7 +201,8 @@ class MapToOdom:
         row = only_row(array, MAP_TO_ODOM_TYPE)
         return cls(
             map_version=MapVersion(row["map_version"]),
-            valid_from_camera_ns=row["valid_from_camera_ns"],
+            valid_from_camera_ns=CameraNanos(row["valid_from_camera_ns"]),
+            odom_started_camera_ns=CameraNanos(row["odom_started_camera_ns"]),
             x_m=row["x_m"],
             y_m=row["y_m"],
             z_m=row["z_m"],
@@ -198,7 +214,7 @@ class MapToOdom:
 
 
 @dataclass(frozen=True)
-class MovedKeyframe:
+class UpdatedKeyframePose:
     frame_id: FrameId
     x_m: float
     y_m: float
@@ -211,29 +227,29 @@ class MovedKeyframe:
 
 
 @dataclass(frozen=True)
-class KeyframePosesMoved:
+class PoseGraphUpdate:
     map_version: MapVersion
-    keyframes: tuple[MovedKeyframe, ...]
+    keyframes: tuple[UpdatedKeyframePose, ...]
 
     def to_arrow(self) -> pa.Array:
         return one_row({"map_version": self.map_version, "keyframes": [vars(k) for k in self.keyframes]}, KEYFRAME_POSES_MOVED_TYPE)
 
     @classmethod
-    def from_arrow(cls, array: pa.Array) -> "KeyframePosesMoved":
+    def from_arrow(cls, array: pa.Array) -> "PoseGraphUpdate":
         row = only_row(array, KEYFRAME_POSES_MOVED_TYPE)
         return cls(
             map_version=MapVersion(row["map_version"]),
-            keyframes=tuple(MovedKeyframe(**{**k, "frame_id": FrameId(k["frame_id"])}) for k in row["keyframes"]),
+            keyframes=tuple(UpdatedKeyframePose(**{**k, "frame_id": FrameId(k["frame_id"])}) for k in row["keyframes"]),
         )
 
 
 # Golden examples of this module's messages, merged into fixtures.EXAMPLES. Every float is exact in float32.
-FIXTURE_EXAMPLES: dict[str, KeyframePose | MapToOdom | KeyframePosesMoved] = {
-    "keyframe_poses_moved": KeyframePosesMoved(
+FIXTURE_EXAMPLES: dict[str, KeyframePose | MapToOdom | PoseGraphUpdate] = {
+    "pose_graph_update": PoseGraphUpdate(
         map_version=MapVersion(8),
         keyframes=(
-            MovedKeyframe(FrameId(40), x_m=1.0, y_m=-0.5, z_m=0.0625, yaw_rad=0.5),
-            MovedKeyframe(FrameId(42), x_m=1.3125, y_m=-0.4375, z_m=0.0625, yaw_rad=0.8125),
+            UpdatedKeyframePose(FrameId(40), x_m=1.0, y_m=-0.5, z_m=0.0625, yaw_rad=0.5),
+            UpdatedKeyframePose(FrameId(42), x_m=1.3125, y_m=-0.4375, z_m=0.0625, yaw_rad=0.8125),
         ),
     ),
     "keyframe_pose_tracking": KeyframePose(
@@ -260,9 +276,22 @@ FIXTURE_EXAMPLES: dict[str, KeyframePose | MapToOdom | KeyframePosesMoved] = {
         residual_m=0.0,
         inlier_fraction=0.0,
     ),
+    "keyframe_pose_restarted": KeyframePose(
+        frame_id=FrameId(47),
+        captured_unix_ns=1_762_560_003_123_456_789,
+        map_version=MapVersion(8),
+        x_m=2.5,
+        y_m=-0.75,
+        z_m=0.0625,
+        yaw_rad=1.25,
+        tracking=Tracking.RESTARTED,
+        residual_m=0.0,
+        inlier_fraction=0.0,
+    ),
     "map_to_odom": MapToOdom(
         map_version=MapVersion(7),
-        valid_from_camera_ns=1_762_560_000_100_000_000,
+        valid_from_camera_ns=CameraNanos(1_762_560_000_100_000_000),
+        odom_started_camera_ns=CameraNanos(1_762_559_990_000_000_000),
         x_m=0.5,
         y_m=-0.25,
         z_m=0.0,

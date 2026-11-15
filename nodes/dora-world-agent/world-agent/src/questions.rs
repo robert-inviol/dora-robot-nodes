@@ -1,4 +1,4 @@
-//! Answers each space question by fanning it out to every configured model at once, each in a fresh session with
+//! Answers each spatial query by fanning it out to every configured model at once, each in a fresh session with
 //! the same digest and the same tools.
 //!
 //! The fast model's answer goes out at once as revision 0. Every later answer goes to the reconciler with the answer
@@ -15,7 +15,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 
-use perception_wire::navigation::{GoalTarget, NavGoal, QuestionId, Revision, SpaceAnswer, SpaceQuestion};
+use perception_wire::navigation::{GoalTarget, NavGoal, QuestionId, Revision, SpatialAnswer, SpatialQuery};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -91,14 +91,14 @@ struct Thread {
     snapshot: Option<WorldSnapshot>,
     next: Revision,
     final_sent: bool,
-    out: mpsc::UnboundedSender<SpaceAnswer>,
+    out: mpsc::UnboundedSender<SpatialAnswer>,
 }
 
 impl Thread {
     fn publish(&mut self, standing: &Standing, is_final: bool) {
         assert!(!self.final_sent, "a message after the final one for {}", self.question);
         let goal_target = standing.goal.map(|g| g.target);
-        let answer = SpaceAnswer {
+        let answer = SpatialAnswer {
             question_id: self.question,
             revision: self.next,
             is_final,
@@ -126,7 +126,7 @@ pub struct QuestionDesk<W, C, G> {
     answerers: Vec<Answerer<C>>,
     reconciler: Arc<C>,
     settings: DeskSettings,
-    out: mpsc::UnboundedSender<SpaceAnswer>,
+    out: mpsc::UnboundedSender<SpatialAnswer>,
     tasks: TaskTracker,
     cancel: CancellationToken,
 }
@@ -141,7 +141,7 @@ impl<W: WorldModel, C: ModelClient, G: GoalSink> QuestionDesk<W, C, G> {
         answerers: Vec<Answerer<C>>,
         reconciler: Arc<C>,
         settings: DeskSettings,
-        out: mpsc::UnboundedSender<SpaceAnswer>,
+        out: mpsc::UnboundedSender<SpatialAnswer>,
     ) -> Self {
         assert_eq!(
             answerers.iter().filter(|a| a.role == AnswererRole::Fast).count(),
@@ -152,7 +152,7 @@ impl<W: WorldModel, C: ModelClient, G: GoalSink> QuestionDesk<W, C, G> {
     }
 
     /// Starts answering; the answers go out on the desk's channel.
-    pub fn ask(self: &Arc<Self>, question: SpaceQuestion) {
+    pub fn ask(self: &Arc<Self>, question: SpatialQuery) {
         let desk = self.clone();
         self.tasks.spawn(async move { desk.answer(question).await });
     }
@@ -175,7 +175,7 @@ impl<W: WorldModel, C: ModelClient, G: GoalSink> QuestionDesk<W, C, G> {
         }
     }
 
-    async fn answer(self: Arc<Self>, question: SpaceQuestion) {
+    async fn answer(self: Arc<Self>, question: SpatialQuery) {
         let id = question.question_id;
         tracing::info!(question = %id, asker = question.asker.0, text = question.text, "question");
         let mut thread = Thread { question: id, snapshot: None, next: Revision::FIRST, final_sent: false, out: self.out.clone() };
@@ -211,7 +211,7 @@ impl<W: WorldModel, C: ModelClient, G: GoalSink> QuestionDesk<W, C, G> {
 
     /// Runs every answerer and the reconciler until all are done or the deadline passes, publishing as it goes, and
     /// returns the answer standing at the end; None when nothing was sent.
-    async fn converge(&self, question: &SpaceQuestion, digest: &Digest, thread: &mut Thread) -> Option<Standing> {
+    async fn converge(&self, question: &SpatialQuery, digest: &Digest, thread: &mut Thread) -> Option<Standing> {
         let id = question.question_id;
         let deadline = tokio::time::sleep(self.settings.deadline);
         tokio::pin!(deadline);
@@ -307,7 +307,7 @@ impl<W: WorldModel, C: ModelClient, G: GoalSink> QuestionDesk<W, C, G> {
     /// sent, or None when the verdict keeps the standing answer.
     async fn reconcile(
         &self,
-        question: &SpaceQuestion,
+        question: &SpatialQuery,
         digest: &Digest,
         current: &Standing,
         later: &LaterAnswer,

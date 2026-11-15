@@ -1,35 +1,35 @@
-//! Keyframes, their poses and their segments arrive separately and in any order; a frame is ready once all
+//! Keyframes, their poses and their instance masks arrive separately and in any order; a frame is ready once all
 //! three are in.
 
 use std::collections::VecDeque;
 
 use eyre::{bail, Result};
 use perception_wire::navigation::MapVersion;
-use perception_wire::{Keyframe, Segments};
+use perception_wire::{Keyframe, InstanceMasks};
 use room_map::Pose;
 use tracing::{debug, info, warn};
 
 use crate::ObservedFrame;
 
-/// Where the localizer put a keyframe.
+/// Where the localizer put a keyframe, if it registered it against the map.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub enum Placement {
-    Placed { pose: Pose, map_version: MapVersion },
-    /// The localizer lost track: the keyframe has no trustworthy pose.
-    Lost,
+pub enum KeyframeMapPose {
+    Registered { pose: Pose, map_version: MapVersion },
+    /// The localizer did not register the keyframe against the map: the keyframe has no trustworthy pose.
+    NotRegistered,
 }
 
 #[derive(Default)]
 struct Pending {
     frame_id: u64,
     keyframe: Option<Keyframe>,
-    placement: Option<Placement>,
-    segments: Option<Segments>,
+    map_pose: Option<KeyframeMapPose>,
+    instance_masks: Option<InstanceMasks>,
 }
 
 impl Pending {
     fn missing(&self) -> Vec<&'static str> {
-        [(self.keyframe.is_none(), "keyframe"), (self.placement.is_none(), "pose"), (self.segments.is_none(), "segments")]
+        [(self.keyframe.is_none(), "keyframe"), (self.map_pose.is_none(), "pose"), (self.instance_masks.is_none(), "instance masks")]
             .into_iter()
             .filter_map(|(missing, part)| missing.then_some(part))
             .collect()
@@ -53,14 +53,14 @@ impl FrameJoiner {
         self.take_if_complete()
     }
 
-    pub fn add_placement(&mut self, frame_id: u64, placement: Placement) -> Result<Option<ObservedFrame>> {
-        self.entry(frame_id).placement = Some(placement);
+    pub fn add_map_pose(&mut self, frame_id: u64, map_pose: KeyframeMapPose) -> Result<Option<ObservedFrame>> {
+        self.entry(frame_id).map_pose = Some(map_pose);
         self.take_if_complete()
     }
 
-    pub fn add_segments(&mut self, segments: Segments) -> Result<Option<ObservedFrame>> {
-        let entry = self.entry(segments.frame_id);
-        entry.segments = Some(segments);
+    pub fn add_instance_masks(&mut self, instance_masks: InstanceMasks) -> Result<Option<ObservedFrame>> {
+        let entry = self.entry(instance_masks.frame_id);
+        entry.instance_masks = Some(instance_masks);
         self.take_if_complete()
     }
 
@@ -71,7 +71,7 @@ impl FrameJoiner {
         if self.pending.len() == self.capacity {
             let dropped = self.pending.pop_front().expect("a full queue has a front");
             // The segmenter skips keyframes as a matter of course; any other part going missing is a fault upstream.
-            if dropped.segments.is_some() {
+            if dropped.instance_masks.is_some() {
                 warn!(frame_id = dropped.frame_id, missing = ?dropped.missing(), "frame dropped before all its parts arrived");
             } else {
                 debug!(frame_id = dropped.frame_id, "keyframe dropped: the segmenter skipped it");
@@ -84,21 +84,21 @@ impl FrameJoiner {
     /// The frame that has all three parts, removed; none when it was lost by the localizer.
     fn take_if_complete(&mut self) -> Result<Option<ObservedFrame>> {
         let Some(at) = self.pending.iter().position(|p| p.missing().is_empty()) else { return Ok(None) };
-        let Pending { frame_id, keyframe, placement, segments } = self.pending.remove(at).expect("position is in range");
-        let (keyframe, segments) = (keyframe.expect("complete"), segments.expect("complete"));
-        if (segments.width, segments.height) != (keyframe.width, keyframe.height) {
+        let Pending { frame_id, keyframe, map_pose, instance_masks } = self.pending.remove(at).expect("position is in range");
+        let (keyframe, instance_masks) = (keyframe.expect("complete"), instance_masks.expect("complete"));
+        if (instance_masks.width, instance_masks.height) != (keyframe.width, keyframe.height) {
             bail!(
-                "segments for frame {frame_id} are {}x{}, the keyframe {}x{}",
-                segments.width,
-                segments.height,
+                "instance masks for frame {frame_id} are {}x{}, the keyframe {}x{}",
+                instance_masks.width,
+                instance_masks.height,
                 keyframe.width,
                 keyframe.height
             );
         }
-        Ok(match placement.expect("complete") {
-            Placement::Placed { pose, map_version } => Some(ObservedFrame { keyframe, segments, pose, map_version }),
-            Placement::Lost => {
-                info!(frame_id, "frame skipped: the localizer had lost track");
+        Ok(match map_pose.expect("complete") {
+            KeyframeMapPose::Registered { pose, map_version } => Some(ObservedFrame { keyframe, instance_masks, pose, map_version }),
+            KeyframeMapPose::NotRegistered => {
+                info!(frame_id, "frame skipped: the localizer did not register it against the map");
                 None
             }
         })
@@ -120,41 +120,41 @@ mod tests {
             width: 2,
             height: 1,
             intrinsics: CameraIntrinsics { fx: 1.0, fy: 1.0, ppx: 1.0, ppy: 0.5 },
-            gravity_reaction: Vec3::new(0.0, -9.81, 0.0),
+            specific_force: Vec3::new(0.0, -9.81, 0.0),
             depth_mm: ScalarBuffer::from(vec![1000u16, 1000]),
             color_jpeg: Vec::new(),
         }
     }
 
-    fn segments(frame_id: u64, width: usize) -> Segments {
-        Segments {
+    fn instance_masks(frame_id: u64, width: usize) -> InstanceMasks {
+        InstanceMasks {
             frame_id,
             width,
             height: 1,
             labels: vec!["box".to_owned()],
             scores: vec![0.9],
-            segment_ids: ScalarBuffer::from(vec![0i16; width]),
+            instance_ids: ScalarBuffer::from(vec![0i16; width]),
         }
     }
 
-    const PLACED: Placement = Placement::Placed { pose: Pose::IDENTITY, map_version: MapVersion(4) };
+    const REGISTERED: KeyframeMapPose = KeyframeMapPose::Registered { pose: Pose::IDENTITY, map_version: MapVersion(4) };
 
     #[test]
     fn a_frame_is_ready_once_its_three_parts_are_in_whatever_their_order() {
         let mut joiner = FrameJoiner::new(4);
-        assert!(joiner.add_segments(segments(7, 2)).unwrap().is_none());
+        assert!(joiner.add_instance_masks(instance_masks(7, 2)).unwrap().is_none());
         assert!(joiner.add_keyframe(keyframe(8)).unwrap().is_none());
-        assert!(joiner.add_placement(7, PLACED).unwrap().is_none());
+        assert!(joiner.add_map_pose(7, REGISTERED).unwrap().is_none());
         let frame = joiner.add_keyframe(keyframe(7)).unwrap().expect("all three parts of frame 7 are in");
-        assert_eq!((frame.keyframe.frame_id, frame.segments.frame_id, frame.map_version), (7, 7, MapVersion(4)));
+        assert_eq!((frame.keyframe.frame_id, frame.instance_masks.frame_id, frame.map_version), (7, 7, MapVersion(4)));
     }
 
     #[test]
     fn a_frame_the_localizer_lost_is_skipped() {
         let mut joiner = FrameJoiner::new(4);
         joiner.add_keyframe(keyframe(7)).unwrap();
-        joiner.add_segments(segments(7, 2)).unwrap();
-        assert!(joiner.add_placement(7, Placement::Lost).unwrap().is_none());
+        joiner.add_instance_masks(instance_masks(7, 2)).unwrap();
+        assert!(joiner.add_map_pose(7, KeyframeMapPose::NotRegistered).unwrap().is_none());
         assert!(joiner.pending.is_empty());
     }
 
@@ -163,18 +163,18 @@ mod tests {
         let mut joiner = FrameJoiner::new(2);
         for frame_id in 1..=3 {
             joiner.add_keyframe(keyframe(frame_id)).unwrap();
-            joiner.add_placement(frame_id, PLACED).unwrap();
+            joiner.add_map_pose(frame_id, REGISTERED).unwrap();
         }
-        assert!(joiner.add_segments(segments(1, 2)).unwrap().is_none(), "frame 1 was dropped");
-        assert!(joiner.add_segments(segments(3, 2)).unwrap().is_some());
+        assert!(joiner.add_instance_masks(instance_masks(1, 2)).unwrap().is_none(), "frame 1 was dropped");
+        assert!(joiner.add_instance_masks(instance_masks(3, 2)).unwrap().is_some());
     }
 
     #[test]
-    fn segments_of_another_size_than_their_keyframe_are_an_error() {
+    fn instance_masks_of_another_size_than_their_keyframe_are_an_error() {
         let mut joiner = FrameJoiner::new(4);
         joiner.add_keyframe(keyframe(7)).unwrap();
-        joiner.add_placement(7, PLACED).unwrap();
-        let error = joiner.add_segments(segments(7, 3)).err().unwrap();
+        joiner.add_map_pose(7, REGISTERED).unwrap();
+        let error = joiner.add_instance_masks(instance_masks(7, 3)).err().unwrap();
         assert!(error.to_string().contains("are 3x1, the keyframe 2x1"), "{error}");
     }
 }

@@ -1,7 +1,7 @@
 [package]
 name = "dense-map"
 version = "0.1.0"
-description = "A block-sparse TSDF, its free-space grid, and rooms, doorways and places cut from it"
+description = "A block-sparse TSDF, its occupancy grid, and rooms, doorways and places cut from it"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -14,3 +14,6 @@ rayon = "1.10"
 rustc-hash = "2"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
+
+[dev-dependencies]
+dora-node-api.workspace = true

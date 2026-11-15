@@ -4,7 +4,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use perception_wire::navigation::{GoalStatus, SpaceAnswer, SpaceQuestion};
+use perception_wire::navigation::{GoalStatus, SpatialAnswer, SpatialQuery};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -53,7 +53,7 @@ impl<W: WorldModel, G: GoalSink, S: RoomNameSink> SpatialService<W, G, S> {
         world: Arc<W>,
         goal_sink: G,
         room_names: S,
-        answers: mpsc::UnboundedSender<SpaceAnswer>,
+        answers: mpsc::UnboundedSender<SpatialAnswer>,
     ) -> Result<Self, StartError> {
         prepare_work_dir(&config.claude.work_dir)?;
         let registry = Arc::new(AgentRegistry::default());
@@ -106,7 +106,7 @@ impl<W: WorldModel, G: GoalSink, S: RoomNameSink> SpatialService<W, G, S> {
         Ok(Self { desk, namer, goals, clients, _mcp: mcp })
     }
 
-    pub fn ask(&self, question: SpaceQuestion) {
+    pub fn ask(&self, question: SpatialQuery) {
         self.desk.ask(question);
     }
 

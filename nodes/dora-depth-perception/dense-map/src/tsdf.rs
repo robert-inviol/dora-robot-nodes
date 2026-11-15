@@ -1,6 +1,8 @@
 //! A truncated signed distance field: the distance from each voxel to the nearest surface along the camera's view,
 //! averaged over every keyframe that saw it.
 
+use std::sync::Arc;
+
 use glam::{IVec3, Vec3};
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -30,8 +32,8 @@ pub struct Bounds {
     pub max: Vec3,
 }
 
-/// A distance field on a regular voxel grid whose voxel `i` spans `[i, i + 1) * voxel_m` on each axis.
-pub trait DistanceField: Send + Sync + 'static {
+/// A truncated signed distance field (TSDF) on a regular voxel grid whose voxel `i` spans `[i, i + 1) * voxel_m` on each axis.
+pub trait Tsdf: Send + Sync + 'static {
     fn voxel_m(&self) -> f32;
 
     /// An empty field with the same settings.
@@ -39,7 +41,7 @@ pub trait DistanceField: Send + Sync + 'static {
     where
         Self: Sized;
 
-    fn integrate(&mut self, depth: &PosedDepth);
+    fn fuse(&mut self, depth: &PosedDepth);
 
     fn voxel(&self, index: IVec3) -> Sample;
 
@@ -57,8 +59,28 @@ pub trait DistanceField: Send + Sync + 'static {
     /// `b * BLOCK_EDGE_VOXELS` up to the next block's.
     fn blocks(&self) -> Vec<IVec3>;
 
-    /// The blocks integration changed since the last call; the call empties the record.
+    /// The blocks fusion changed since the last call; the call empties the record.
     fn take_changed_blocks(&mut self) -> FxHashSet<IVec3>;
+}
+
+/// A distance field held in blocks, which depth is fused into block by block, so that part of it can be rebuilt.
+pub trait BlockField: Tsdf + Sized {
+    /// The blocks a depth frame touches: every block a ray through a sampled pixel crosses, from the camera to
+    /// just behind the surface it hits.
+    fn footprint(&self, depth: &PosedDepth) -> FxHashSet<IVec3>;
+
+    /// Fuses a depth frame into its footprint, which it returns.
+    fn fuse_into_footprint(&mut self, depth: &PosedDepth) -> FxHashSet<IVec3>;
+
+    /// Fuses a depth frame into the blocks of its footprint that are in `within`, leaving every other block alone.
+    fn fuse_within(&mut self, depth: &PosedDepth, within: &FxHashSet<IVec3>);
+
+    /// Makes each of `blocks` what it is in `rebuilt`: a block `rebuilt` does not hold is removed.
+    fn replace_blocks(&mut self, rebuilt: &Self, blocks: &FxHashSet<IVec3>);
+
+    /// A copy of the field as it stands, for reading on another thread while this one changes; cheap, as blocks are
+    /// shared until either side changes them.
+    fn snapshot(&self) -> Self;
 }
 
 /// The edge of a block, in voxels.
@@ -74,8 +96,8 @@ struct Block {
 }
 
 impl Block {
-    fn empty() -> Box<Block> {
-        Box::new(Block { distance_m: [0.0; BLOCK_VOXELS], weight: [0.0; BLOCK_VOXELS] })
+    fn empty() -> Arc<Block> {
+        Arc::new(Block { distance_m: [0.0; BLOCK_VOXELS], weight: [0.0; BLOCK_VOXELS] })
     }
 }
 
@@ -94,7 +116,8 @@ fn split(voxel: IVec3) -> (IVec3, usize) {
 #[derive(Clone)]
 pub struct BlockTsdf {
     settings: TsdfSettings,
-    blocks: FxHashMap<IVec3, Box<Block>>,
+    /// Shared with snapshots until fused into.
+    blocks: FxHashMap<IVec3, Arc<Block>>,
     changed: FxHashSet<IVec3>,
 }
 
@@ -143,7 +166,7 @@ impl BlockTsdf {
             })
     }
 
-    fn integrate_block(&self, index: IVec3, block: &mut Block, depth: &PosedDepth) {
+    fn fuse_block(&self, index: IVec3, block: &mut Block, depth: &PosedDepth) {
         let voxel_m = self.settings.voxel_m;
         let (truncation, weight) = (self.settings.truncation_m, self.settings.observation_weight);
         let map_to_camera = depth.pose.camera_to_map.transpose();
@@ -184,6 +207,15 @@ impl BlockTsdf {
         }
     }
 
+    /// Fuses a depth frame into each of `targets`, allocating the blocks not held yet.
+    fn fuse_blocks(&mut self, depth: &PosedDepth, targets: impl Iterator<Item = IVec3>) {
+        let mut taken: Vec<(IVec3, Arc<Block>)> =
+            targets.map(|index| (index, self.blocks.remove(&index).unwrap_or_else(Block::empty))).collect();
+        taken.par_iter_mut().for_each(|(index, block)| self.fuse_block(*index, Arc::make_mut(block), depth));
+        self.changed.extend(taken.iter().map(|(index, _)| *index));
+        self.blocks.extend(taken);
+    }
+
     fn voxel_parts(&self, block: &Block, i: usize) -> Sample {
         if block.weight[i] < self.settings.min_observed_weight {
             Sample::Unobserved
@@ -193,7 +225,7 @@ impl BlockTsdf {
     }
 }
 
-impl DistanceField for BlockTsdf {
+impl Tsdf for BlockTsdf {
     fn voxel_m(&self) -> f32 {
         self.settings.voxel_m
     }
@@ -202,16 +234,8 @@ impl DistanceField for BlockTsdf {
         BlockTsdf::new(self.settings)
     }
 
-    fn integrate(&mut self, depth: &PosedDepth) {
-        let in_view = self.blocks_in_view(depth);
-        for index in &in_view {
-            self.blocks.entry(*index).or_insert_with(Block::empty);
-        }
-        let mut targets: Vec<(IVec3, Box<Block>)> =
-            in_view.iter().map(|index| (*index, self.blocks.remove(index).expect("allocated above"))).collect();
-        targets.par_iter_mut().for_each(|(index, block)| self.integrate_block(*index, block, depth));
-        self.blocks.extend(targets);
-        self.changed.extend(in_view);
+    fn fuse(&mut self, depth: &PosedDepth) {
+        self.fuse_into_footprint(depth);
     }
 
     fn voxel(&self, index: IVec3) -> Sample {
@@ -277,6 +301,37 @@ impl DistanceField for BlockTsdf {
     }
 }
 
+impl BlockField for BlockTsdf {
+    fn footprint(&self, depth: &PosedDepth) -> FxHashSet<IVec3> {
+        self.blocks_in_view(depth)
+    }
+
+    fn fuse_into_footprint(&mut self, depth: &PosedDepth) -> FxHashSet<IVec3> {
+        let footprint = self.blocks_in_view(depth);
+        self.fuse_blocks(depth, footprint.iter().copied());
+        footprint
+    }
+
+    fn fuse_within(&mut self, depth: &PosedDepth, within: &FxHashSet<IVec3>) {
+        let footprint = self.blocks_in_view(depth);
+        self.fuse_blocks(depth, footprint.into_iter().filter(|index| within.contains(index)));
+    }
+
+    fn replace_blocks(&mut self, rebuilt: &BlockTsdf, blocks: &FxHashSet<IVec3>) {
+        for index in blocks {
+            match rebuilt.blocks.get(index) {
+                Some(block) => self.blocks.insert(*index, block.clone()),
+                None => self.blocks.remove(index),
+            };
+        }
+        self.changed.extend(blocks.iter().copied());
+    }
+
+    fn snapshot(&self) -> BlockTsdf {
+        self.clone()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use depth_perception::CameraIntrinsics;
@@ -300,11 +355,11 @@ mod tests {
     }
 
     #[test]
-    fn a_wall_ahead_is_a_zero_crossing_with_free_space_before_it() {
+    fn a_wall_ahead_is_a_zero_crossing_with_occupancy_grid_before_it() {
         let mut depth_mm = Vec::new();
         let depth = facing_wall(2.0, &mut depth_mm);
         let mut tsdf = BlockTsdf::new(TsdfSettings::default());
-        tsdf.integrate(&depth);
+        tsdf.fuse(&depth);
         let Sample::Observed { distance_m } = tsdf.sample(Vec3::new(0.0, 1.0, 0.0)) else { panic!("unobserved") };
         assert_eq!(distance_m, 0.2, "truncated in front");
         let Sample::Observed { distance_m } = tsdf.sample(Vec3::new(0.01, 1.92, 0.01)) else { panic!("unobserved") };
@@ -320,7 +375,7 @@ mod tests {
         let mut depth_mm = Vec::new();
         let depth = facing_wall(2.0, &mut depth_mm);
         let mut tsdf = BlockTsdf::new(TsdfSettings::default());
-        tsdf.integrate(&depth);
+        tsdf.fuse(&depth);
         let surface = tsdf.surface();
         assert!(surface.len() > 100, "{}", surface.len());
         for point in &surface {
@@ -334,17 +389,17 @@ mod tests {
         let mut near_mm = Vec::new();
         let mut far_mm = Vec::new();
         let mut tsdf = BlockTsdf::new(TsdfSettings::default());
-        tsdf.integrate(&facing_wall(2.0, &mut near_mm));
-        tsdf.integrate(&facing_wall(2.1, &mut far_mm));
+        tsdf.fuse(&facing_wall(2.0, &mut near_mm));
+        tsdf.fuse(&facing_wall(2.1, &mut far_mm));
         let Sample::Observed { distance_m } = tsdf.sample(Vec3::new(0.01, 2.02, 0.01)) else { panic!("unobserved") };
         assert!((distance_m - 0.025).abs() < 1e-4, "halfway between the two walls: {distance_m}");
     }
 
     #[test]
-    fn integration_records_the_blocks_it_changed_until_they_are_taken() {
+    fn fusion_records_the_blocks_it_changed_until_they_are_taken() {
         let mut depth_mm = Vec::new();
         let mut tsdf = BlockTsdf::new(TsdfSettings::default());
-        tsdf.integrate(&facing_wall(2.0, &mut depth_mm));
+        tsdf.fuse(&facing_wall(2.0, &mut depth_mm));
         let changed = tsdf.take_changed_blocks();
         assert!(!changed.is_empty());
         assert_eq!(changed.len(), tsdf.blocks().len(), "every block was new");
@@ -355,7 +410,7 @@ mod tests {
     fn a_cleared_field_holds_nothing() {
         let mut depth_mm = Vec::new();
         let mut tsdf = BlockTsdf::new(TsdfSettings::default());
-        tsdf.integrate(&facing_wall(2.0, &mut depth_mm));
+        tsdf.fuse(&facing_wall(2.0, &mut depth_mm));
         assert!(tsdf.bounds().is_some());
         assert_eq!(tsdf.cleared().bounds(), None);
     }

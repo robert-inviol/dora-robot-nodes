@@ -1,7 +1,7 @@
 //! The camera's turn about the vertical between keyframes, from the IMU.
 //!
 //! The gyro reports angular velocity in the camera's own axes; its component along the up direction (the
-//! keyframe's gravity reaction) is the rate of turning about the vertical, anticlockwise seen from above,
+//! keyframe's specific force) is the rate of turning about the vertical, anticlockwise seen from above,
 //! which is the sense of a pose's yaw. The gyro reads a small, slowly drifting rate even when still: that
 //! bias is measured on every span where the camera is still, and interpolated between them.
 
@@ -10,6 +10,10 @@ use std::fmt;
 use glam::Vec3;
 use perception_wire::Imu;
 
+/// Two consecutive gyro samples further apart than this many of the gyro's sample steps (the median spacing of
+/// the stream's samples) leave a gap the gyro cannot be integrated across.
+pub const MAX_GYRO_GAP_STEPS: i64 = 10;
+
 /// Every accel and gyro sample of a walk, each stream in camera-clock order.
 #[derive(Clone, Debug)]
 pub struct ImuStream {
@@ -17,47 +21,49 @@ pub struct ImuStream {
     gyro_rad_s: Vec<Vec3>,
     accel_ns: Vec<i64>,
     accel_m_s2: Vec<Vec3>,
+    /// `MAX_GYRO_GAP_STEPS` of the gyro's sample step; `None` with fewer than two gyro samples.
+    max_gyro_gap_ns: Option<i64>,
 }
 
 #[derive(Clone, Debug)]
-pub struct StillSettings {
+pub struct StationaryDetectionSettings {
     /// The walk is judged still or moving in windows this long.
     pub window_ns: i64,
-    /// A still window has no gyro sample turning faster than this; a hand-held camera never stays under it.
+    /// A stationary window has no gyro sample turning faster than this; a hand-held camera never stays under it.
     pub max_rate_rad_s: f32,
-    /// A still window's mean accel magnitude is within this of standard gravity, allowing for the
+    /// A stationary window's mean accel magnitude is within this of standard gravity, allowing for the
     /// accelerometer's own scale error.
     pub max_gravity_error_m_s2: f32,
     /// ...and its accel magnitude varies by no more than this (standard deviation).
     pub max_accel_spread_m_s2: f32,
-    /// The bias needs at least this much still time in all to average down the gyro's noise.
-    pub min_still_ns: i64,
+    /// The bias needs at least this much stationary time in all to average down the gyro's noise.
+    pub min_stationary_ns: i64,
 }
 
-impl Default for StillSettings {
+impl Default for StationaryDetectionSettings {
     fn default() -> Self {
-        StillSettings {
+        StationaryDetectionSettings {
             window_ns: 500_000_000,
             max_rate_rad_s: 0.05,
             max_gravity_error_m_s2: 0.5,
             max_accel_spread_m_s2: 0.05,
-            min_still_ns: 1_000_000_000,
+            min_stationary_ns: 1_000_000_000,
         }
     }
 }
 
 const STANDARD_GRAVITY_M_S2: f32 = 9.80665;
 
-/// Adjacent still windows, merged.
+/// Adjacent stationary windows, merged.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct StillSpan {
+pub struct StationarySpan {
     pub start_ns: i64,
     pub end_ns: i64,
     /// The mean gyro reading over the span: the bias at that time.
     pub gyro_bias_rad_s: Vec3,
 }
 
-/// The gyro bias over the walk: each still span's reading at its midpoint, linearly interpolated between
+/// The gyro bias over the walk: each stationary span's reading at its midpoint, linearly interpolated between
 /// spans and held constant before the first and after the last.
 #[derive(Clone, Debug)]
 pub struct GyroBias {
@@ -70,10 +76,10 @@ impl GyroBias {
         GyroBias { times_ns: vec![0], biases_rad_s: vec![bias_rad_s] }
     }
 
-    pub fn from_spans(spans: &[StillSpan], settings: &StillSettings) -> Result<GyroBias, HeadingError> {
-        let still_ns: i64 = spans.iter().map(|s| s.end_ns - s.start_ns).sum();
-        if still_ns < settings.min_still_ns {
-            return Err(HeadingError::TooLittleStillTime { still_ns, needed_ns: settings.min_still_ns });
+    pub fn from_spans(spans: &[StationarySpan], settings: &StationaryDetectionSettings) -> Result<GyroBias, HeadingError> {
+        let stationary_ns: i64 = spans.iter().map(|s| s.end_ns - s.start_ns).sum();
+        if stationary_ns < settings.min_stationary_ns {
+            return Err(HeadingError::TooLittleStationaryTime { stationary_ns, needed_ns: settings.min_stationary_ns });
         }
         Ok(GyroBias {
             times_ns: spans.iter().map(|s| (s.start_ns + s.end_ns) / 2).collect(),
@@ -97,19 +103,21 @@ impl GyroBias {
 #[derive(Clone, Debug, PartialEq)]
 pub enum HeadingError {
     NoGyroSamples,
-    TooLittleStillTime { still_ns: i64, needed_ns: i64 },
+    TooLittleStationaryTime { stationary_ns: i64, needed_ns: i64 },
     NotCovered { from_ns: i64, to_ns: i64, first_ns: i64, last_ns: i64 },
     KeyframesOutOfOrder { index: usize },
+    /// Consecutive gyro samples inside the span are further apart than `limit_ns`: samples are missing there.
+    SampleGap { before_ns: i64, after_ns: i64, limit_ns: i64 },
 }
 
 impl fmt::Display for HeadingError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             HeadingError::NoGyroSamples => write!(f, "the imu recording has no gyro samples"),
-            HeadingError::TooLittleStillTime { still_ns, needed_ns } => write!(
+            HeadingError::TooLittleStationaryTime { stationary_ns, needed_ns } => write!(
                 f,
                 "the camera is still for only {:.1} s, {:.1} s are needed to measure the gyro's bias; start a walk by holding the camera still",
-                *still_ns as f64 * 1e-9,
+                *stationary_ns as f64 * 1e-9,
                 *needed_ns as f64 * 1e-9
             ),
             HeadingError::NotCovered { from_ns, to_ns, first_ns, last_ns } => write!(
@@ -117,11 +125,27 @@ impl fmt::Display for HeadingError {
                 "gyro samples run from {first_ns} to {last_ns} ns, not over the keyframe span {from_ns} to {to_ns} ns"
             ),
             HeadingError::KeyframesOutOfOrder { index } => write!(f, "keyframe {index} is not later than the one before it"),
+            HeadingError::SampleGap { before_ns, after_ns, limit_ns } => write!(
+                f,
+                "no gyro samples from {before_ns} to {after_ns} ns, a gap of {:.3} s where samples come at least every {:.3} s; imu messages are missing",
+                (after_ns - before_ns) as f64 * 1e-9,
+                *limit_ns as f64 * 1e-9
+            ),
         }
     }
 }
 
 impl std::error::Error for HeadingError {}
+
+/// The median spacing of increasing sample times; `None` with fewer than two.
+fn median_step_ns(times_ns: &[i64]) -> Option<i64> {
+    let mut steps: Vec<i64> = times_ns.windows(2).map(|w| w[1] - w[0]).collect();
+    if steps.is_empty() {
+        return None;
+    }
+    let middle = steps.len() / 2;
+    Some(*steps.select_nth_unstable(middle).1)
+}
 
 fn sorted_unique(samples: impl Iterator<Item = (i64, Vec3)>) -> (Vec<i64>, Vec<Vec3>) {
     let mut samples: Vec<(i64, Vec3)> = samples.collect();
@@ -145,12 +169,13 @@ impl ImuStream {
         if gyro_ns.is_empty() {
             return Err(HeadingError::NoGyroSamples);
         }
-        Ok(ImuStream { gyro_ns, gyro_rad_s, accel_ns, accel_m_s2 })
+        let max_gyro_gap_ns = median_step_ns(&gyro_ns).map(|step| step * MAX_GYRO_GAP_STEPS);
+        Ok(ImuStream { gyro_ns, gyro_rad_s, accel_ns, accel_m_s2, max_gyro_gap_ns })
     }
 
     /// The spans where the camera is still: every window with a steady gyro and an accelerometer reading only
-    /// gravity, steadily; adjacent still windows are merged.
-    pub fn still_spans(&self, settings: &StillSettings) -> Vec<StillSpan> {
+    /// gravity, steadily; adjacent stationary windows are merged.
+    pub fn stationary_spans(&self, settings: &StationaryDetectionSettings) -> Vec<StationarySpan> {
         let mut spans: Vec<(i64, i64, Vec3, usize)> = Vec::new();
         let mut start = 0;
         while start < self.gyro_ns.len() {
@@ -182,7 +207,7 @@ impl ImuStream {
             }
             start = end;
         }
-        spans.into_iter().map(|(start_ns, end_ns, sum, count)| StillSpan { start_ns, end_ns, gyro_bias_rad_s: sum / count as f32 }).collect()
+        spans.into_iter().map(|(start_ns, end_ns, sum, count)| StationarySpan { start_ns, end_ns, gyro_bias_rad_s: sum / count as f32 }).collect()
     }
 
     fn rate_at(&self, k: usize, up: Vec3, bias: &GyroBias) -> f32 {
@@ -190,12 +215,20 @@ impl ImuStream {
     }
 
     /// The turn about `up` from `from_ns` to `to_ns`: the bias-corrected rate integrated by the trapezoid
-    /// rule, with the rate interpolated at both ends.
+    /// rule, with the rate interpolated at both ends. Refused when the samples do not reach both ends, or when two
+    /// consecutive samples around or inside the span are further apart than `MAX_GYRO_GAP_STEPS` sample steps.
     pub fn turn_about(&self, up: Vec3, bias: &GyroBias, from_ns: i64, to_ns: i64) -> Result<f32, HeadingError> {
         let times = &self.gyro_ns;
         let (first, last) = (times[0], times[times.len() - 1]);
         if from_ns < first || to_ns > last {
             return Err(HeadingError::NotCovered { from_ns, to_ns, first_ns: first, last_ns: last });
+        }
+        if let Some(limit_ns) = self.max_gyro_gap_ns {
+            let before_span = times.partition_point(|&s| s <= from_ns).saturating_sub(1);
+            let after_span = times.partition_point(|&s| s < to_ns).min(times.len() - 1);
+            if let Some(gap) = times[before_span..=after_span].windows(2).find(|w| w[1] - w[0] > limit_ns) {
+                return Err(HeadingError::SampleGap { before_ns: gap[0], after_ns: gap[1], limit_ns });
+            }
         }
         let rate_at_time = |t: i64| -> f32 {
             let after = times.partition_point(|&s| s < t).min(times.len() - 1);
@@ -217,23 +250,23 @@ impl ImuStream {
 }
 
 /// The turn about the vertical from each keyframe to the next, from the keyframes' camera times and their
-/// up directions in camera axes (their gravity reactions, any length).
-pub fn keyframe_turns(stream: &ImuStream, bias: &GyroBias, times_ns: &[i64], gravity_reactions: &[Vec3]) -> Result<Vec<f32>, HeadingError> {
-    assert_eq!(times_ns.len(), gravity_reactions.len(), "an up direction for every keyframe");
+/// up directions in camera axes (their specific forces, any length).
+pub fn keyframe_turns(stream: &ImuStream, bias: &GyroBias, times_ns: &[i64], specific_forces: &[Vec3]) -> Result<Vec<f32>, HeadingError> {
+    assert_eq!(times_ns.len(), specific_forces.len(), "an up direction for every keyframe");
     (1..times_ns.len())
         .map(|k| {
             if times_ns[k] <= times_ns[k - 1] {
                 return Err(HeadingError::KeyframesOutOfOrder { index: k });
             }
-            let up = (gravity_reactions[k - 1].normalize() + gravity_reactions[k].normalize()).normalize();
+            let up = (specific_forces[k - 1].normalize() + specific_forces[k].normalize()).normalize();
             stream.turn_about(up, bias, times_ns[k - 1], times_ns[k])
         })
         .collect()
 }
 
-/// For each keyframe from the second on, whether it and the one before lie inside one still span: the camera
+/// For each keyframe from the second on, whether it and the one before lie inside one stationary span: the camera
 /// did not move between them.
-pub fn still_between(spans: &[StillSpan], times_ns: &[i64]) -> Vec<bool> {
+pub fn stationary_between(spans: &[StationarySpan], times_ns: &[i64]) -> Vec<bool> {
     (1..times_ns.len())
         .map(|k| spans.iter().any(|s| s.start_ns <= times_ns[k - 1] && times_ns[k] <= s.end_ns))
         .collect()
@@ -271,32 +304,32 @@ mod tests {
     }
 
     #[test]
-    fn still_spans_are_found_anywhere_and_give_the_bias_there() {
+    fn stationary_spans_are_found_anywhere_and_give_the_bias_there() {
         let bias = |s: f32| Vec3::new(0.002 + 0.001 * s, -0.002, 0.001);
         let turning = |s: f32| (2.0..4.0).contains(&s) || (6.0..8.0).contains(&s);
         let imu = stream(10.0, |s| bias(s) + if turning(s) { UP * 0.8 } else { Vec3::ZERO }, turning);
-        let spans = imu.still_spans(&StillSettings::default());
+        let spans = imu.stationary_spans(&StationaryDetectionSettings::default());
         let bounds: Vec<(f32, f32)> = spans.iter().map(|s| (s.start_ns as f32 * 1e-9, s.end_ns as f32 * 1e-9)).collect();
         assert_eq!(spans.len(), 3, "{bounds:?}");
         for span in &spans {
             let middle = (span.start_ns + span.end_ns) as f32 * 0.5e-9;
             assert!((span.gyro_bias_rad_s - bias(middle)).length() < 1e-4, "{span:?}");
         }
-        let model = GyroBias::from_spans(&spans, &StillSettings::default()).unwrap();
+        let model = GyroBias::from_spans(&spans, &StationaryDetectionSettings::default()).unwrap();
         assert!((model.at(5_000_000_000) - bias(5.0)).length() < 2e-4, "{}", model.at(5_000_000_000));
     }
 
     #[test]
     fn a_shaking_accelerometer_is_not_still_even_with_a_quiet_gyro() {
         let imu = stream(3.0, |_| Vec3::ZERO, |_| true);
-        assert!(imu.still_spans(&StillSettings::default()).is_empty());
+        assert!(imu.stationary_spans(&StationaryDetectionSettings::default()).is_empty());
     }
 
     #[test]
     fn a_walk_that_never_holds_still_cannot_measure_its_bias() {
         let imu = stream(3.0, |s| UP * (0.3 + 0.2 * s.sin()), |_| true);
-        let spans = imu.still_spans(&StillSettings::default());
-        assert!(matches!(GyroBias::from_spans(&spans, &StillSettings::default()), Err(HeadingError::TooLittleStillTime { .. })));
+        let spans = imu.stationary_spans(&StationaryDetectionSettings::default());
+        assert!(matches!(GyroBias::from_spans(&spans, &StationaryDetectionSettings::default()), Err(HeadingError::TooLittleStationaryTime { .. })));
     }
 
     #[test]
@@ -311,8 +344,24 @@ mod tests {
     }
 
     #[test]
-    fn keyframes_inside_one_still_span_are_still_between() {
-        let spans = [StillSpan { start_ns: 0, end_ns: 1_000, gyro_bias_rad_s: Vec3::ZERO }];
-        assert_eq!(still_between(&spans, &[100, 900, 1_500]), vec![true, false]);
+    fn a_turn_across_missing_samples_is_refused() {
+        let full = stream(3.0, |_| UP * 0.5, |_| true);
+        let keep = |t: &i64| !(1_000_000_000..1_600_000_000).contains(t);
+        let gyro_ns: Vec<i64> = full.gyro_ns.iter().copied().filter(keep).collect();
+        let gyro: Vec<Vec3> = full.gyro_ns.iter().zip(&full.gyro_rad_s).filter(|(t, _)| keep(t)).map(|(_, r)| *r).collect();
+        let holed = ImuStream::new(gyro_ns, gyro, full.accel_ns.clone(), full.accel_m_s2.clone()).unwrap();
+        let zero = GyroBias::constant(Vec3::ZERO);
+        let error = holed.turn_about(UP, &zero, 500_000_000, 2_000_000_000).unwrap_err();
+        assert!(matches!(error, HeadingError::SampleGap { before_ns: 997_500_000, after_ns: 1_600_000_000, .. }), "{error}");
+        let error = holed.turn_about(UP, &zero, 1_200_000_000, 2_000_000_000).unwrap_err();
+        assert!(matches!(error, HeadingError::SampleGap { .. }), "a span starting inside the gap: {error}");
+        let after = holed.turn_about(UP, &zero, 1_700_000_000, 2_700_000_000).unwrap();
+        assert!((after - 0.5).abs() < 1e-4, "a span clear of the gap turns: {after}");
+    }
+
+    #[test]
+    fn keyframes_inside_one_stationary_span_are_stationary_between() {
+        let spans = [StationarySpan { start_ns: 0, end_ns: 1_000, gyro_bias_rad_s: Vec3::ZERO }];
+        assert_eq!(stationary_between(&spans, &[100, 900, 1_500]), vec![true, false]);
     }
 }

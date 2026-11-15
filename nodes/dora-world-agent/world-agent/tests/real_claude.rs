@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use perception_wire::navigation::{Asker, GoalTarget, ObjectId, QuestionId, SpaceQuestion};
+use perception_wire::navigation::{Asker, GoalTarget, ObjectId, QuestionId, SpatialQuery};
 use tokio::sync::mpsc;
 use world_agent::clock;
 use world_agent::config::{ModelName, SpatialConfig};
@@ -47,7 +47,7 @@ async fn haiku_answers_moves_the_robot_and_reconciles_through_the_mcp_endpoint()
     .await
     .unwrap();
 
-    service.ask(SpaceQuestion {
+    service.ask(SpatialQuery {
         question_id: QuestionId(1),
         asked: clock::now(),
         asker: Asker("test".to_owned()),

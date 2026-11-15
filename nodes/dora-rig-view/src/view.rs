@@ -58,6 +58,8 @@ pub enum NoticeTopic {
     /// While set, the robot is not drawn.
     Robot,
     People,
+    /// While set, the surface drawn may not be the dense map's: a snapshot of it is awaited.
+    Surface,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -65,6 +67,8 @@ pub struct PersonView {
     pub track_id: u64,
     /// tentative, confirmed or lost.
     pub state: &'static str,
+    /// True when this frame gave the track no position: the torso and joints are the ones it was last seen with.
+    pub stale: bool,
     pub torso: Option<[f32; 3]>,
     /// The fitted skeleton's joints in COCO-17 order; null where the fit has none.
     pub joints: Vec<Option<[f32; 3]>>,
@@ -113,10 +117,12 @@ pub struct RoomBoxView {
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Update {
-    /// The first message on every connection: forget everything drawn so far.
+    /// The first message on every connection, and the first of the whole scene sent again to every page when the
+    /// dense map's surface is replaced: forget everything drawn so far but the keyframe clouds, which a page clears
+    /// when it connects.
     Reset,
-    /// Where a keyframe's cloud goes; a keyframe the localizer lost is not drawn.
-    KeyframePose { frame_id: u64, pose: FloorPose, placed: bool },
+    /// Where a keyframe's cloud goes; a keyframe the localizer lost is not drawn, a restarted one is.
+    KeyframePose { frame_id: u64, pose: FloorPose, drawn: bool },
     /// The keyframe's cloud is no longer kept; remove it.
     KeyframeDropped { frame_id: u64 },
     /// The IMU body in the map, and its orientation as a quaternion (x, y, z, w) from body axes (x right, y down,
@@ -141,19 +147,22 @@ pub enum Update {
     ObjectGone { object_id: u64 },
     /// The whole latest topology; it replaces the one before.
     Topology { rooms: Vec<RoomView>, doorways: Vec<DoorwayView>, places: Vec<PlaceView>, edges: Vec<[u64; 2]> },
-    /// The planes and the room of the latest keyframe whose layout came, in its floor frame, placed with its pose; not
-    /// drawn while the keyframe is not placed. It replaces the one before.
-    Layout {
+    /// The planes and the room of the latest keyframe whose room layout came, in its floor frame, at its map pose; not
+    /// drawn while that pose is not drawn. It replaces the one before.
+    RoomLayout {
         frame_id: u64,
         pose: FloorPose,
-        placed: bool,
+        drawn: bool,
         planes: Vec<PlaneView>,
         room: Option<RoomBoxView>,
         /// Why there is no room.
         room_problem: Option<String>,
     },
-    /// Why a layer is not drawn, or null once it is again.
+    /// Why a layer is not drawn, or may be out of date, or null once it is drawn again.
     Notice { topic: NoticeTopic, text: Option<String> },
+    /// How the dense map's surface messages have come: gaps in their sequence, each one or more missed messages,
+    /// and snapshots of the whole surface that replaced the one held.
+    SurfaceStream { gaps: u64, snapshots: u64 },
 }
 
 /// Millimetre precision is all the page draws, and it keeps the JSON short.

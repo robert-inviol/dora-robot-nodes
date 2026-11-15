@@ -5,9 +5,9 @@ use std::time::Duration;
 use glam::{DQuat, DVec3, Vec3};
 
 use crate::association::{measure, AssociationSettings, BodyPoint, RangeNoise};
-use crate::filter::{Correction, CorrectionError, CorrectionSettings, ErrorStateFilter, ImuNoise, InitialUncertainty, PoseInformation, State, WeakestTranslation};
+use crate::filter::{MeasurementUpdate, MeasurementUpdateError, MeasurementUpdateSettings, ErrorStateFilter, ImuNoise, InitialUncertainty, PoseInformation, State, DegenerateTranslation};
 use crate::surfaces::{MapPoint, SurfaceMap};
-use crate::thinning::{SensorMount, Thinner, ThinningSettings};
+use crate::downsampling::{SensorExtrinsics, Downsampler, DownsamplingSettings};
 
 /// One reading of the IMU, on the camera's clock.
 #[derive(Clone, Copy, Debug)]
@@ -22,10 +22,10 @@ pub struct OdometrySettings {
     pub gravity_m_s2: f64,
     pub imu_noise: ImuNoise,
     pub start_uncertainty: InitialUncertainty,
-    pub sensor_mount: SensorMount,
-    pub thinning: ThinningSettings,
+    pub sensor_extrinsics: SensorExtrinsics,
+    pub downsampling: DownsamplingSettings,
     pub association: AssociationSettings,
-    pub correction: CorrectionSettings,
+    pub measurement_update: MeasurementUpdateSettings,
     /// The map keeps a cube of this half side about the body.
     pub map_half_extent_m: f32,
     /// The map is trimmed once the body has moved this far since the last trim.
@@ -51,10 +51,10 @@ impl OdometrySettings {
                 gyro_bias_rad_s: 5e-3,
                 accel_bias_m_s2: 0.1,
             },
-            sensor_mount: SensorMount::AT_BODY,
-            thinning: ThinningSettings { voxel_m: 0.1, min_range_m: 0.4, max_range_m: 6.0, min_readings: 4, flat_within_m: 0.003, flat_noise_sigmas: 1.5, facing_known_below: 0.3 },
+            sensor_extrinsics: SensorExtrinsics::AT_BODY,
+            downsampling: DownsamplingSettings { voxel_m: 0.1, min_range_m: 0.4, max_range_m: 6.0, min_readings: 4, flat_within_m: 0.003, flat_noise_sigmas: 1.5, facing_known_below: 0.3 },
             association: AssociationSettings { gate_sigmas: 4.0, huber_sigmas: 2.0, min_facing_agreement: 0.8, noise: RangeNoise { base_m: 0.005, per_square_m: 0.005 } },
-            correction: CorrectionSettings { max_iterations: 4, settled_m: 1e-4, settled_rad: 1e-4, min_rows: 50 },
+            measurement_update: MeasurementUpdateSettings { max_iterations: 4, settled_m: 1e-4, settled_rad: 1e-4, min_rows: 50 },
             map_half_extent_m: 8.0,
             map_trim_after_m: 1.0,
         }
@@ -63,40 +63,58 @@ impl OdometrySettings {
 
 /// The body held still: enough to find which way is up and what the gyro reads at rest.
 #[derive(Clone, Copy, Debug)]
-pub struct StillStart {
+pub struct StaticInitialization {
     pub state: State,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub enum StillStartError {
+pub enum StaticInitializationError {
     NoSamples,
     /// The IMU was not at rest: the largest spread of any gyro axis, and of any accelerometer axis.
     Moving { gyro_spread_rad_s: f64, accel_spread_m_s2: f64 },
+    /// The gyro read a steady turn: the size of its mean rate.
+    Rotating { mean_gyro_rad_s: f64 },
+    /// The accelerometer's mean reading is not the size of gravity, so it does not measure gravity
+    /// alone.
+    NotGravity { mean_accel_m_s2: f64, gravity_m_s2: f64 },
 }
 
-impl std::fmt::Display for StillStartError {
+impl std::fmt::Display for StaticInitializationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            StillStartError::NoSamples => write!(f, "no IMU samples to start from"),
-            StillStartError::Moving { gyro_spread_rad_s, accel_spread_m_s2 } => {
+            StaticInitializationError::NoSamples => write!(f, "no IMU samples to start from"),
+            StaticInitializationError::Moving { gyro_spread_rad_s, accel_spread_m_s2 } => {
                 write!(f, "the IMU was moving at the start: gyro spread {gyro_spread_rad_s:.4} rad/s, accelerometer spread {accel_spread_m_s2:.3} m/s2")
+            }
+            StaticInitializationError::Rotating { mean_gyro_rad_s } => write!(f, "the IMU was turning steadily at the start: mean gyro rate {mean_gyro_rad_s:.4} rad/s"),
+            StaticInitializationError::NotGravity { mean_accel_m_s2, gravity_m_s2 } => {
+                write!(f, "the accelerometer read {mean_accel_m_s2:.3} m/s2 at the start, not gravity's {gravity_m_s2:.3} m/s2")
             }
         }
     }
 }
 
-impl std::error::Error for StillStartError {}
+impl std::error::Error for StaticInitializationError {}
 
-impl StillStart {
+impl StaticInitialization {
     const MAX_GYRO_SPREAD_RAD_S: f64 = 0.02;
     const MAX_ACCEL_SPREAD_M_S2: f64 = 0.3;
+    /// The mean gyro rate at rest is the gyro's bias, which is well under this for a calibrated IMU;
+    /// a steady turn shows as a larger mean with no spread.
+    const MAX_MEAN_GYRO_RAD_S: f64 = 0.05;
+    /// At rest the accelerometer's mean reading is gravity, off only by its bias and scale error.
+    const MAX_GRAVITY_ERROR_M_S2: f64 = 0.5;
 
-    /// A starting state at the world origin with zero heading, from samples taken at rest. The world's
-    /// z is where the accelerometer says up is, which its bias throws off; the state's `up` starts
-    /// there and is corrected as the filter learns the bias.
-    pub fn from_samples(samples: &[ImuSample]) -> Result<StillStart, StillStartError> {
+    /// A starting state at the world origin with zero heading, from samples taken at rest under
+    /// gravity of `gravity_m_s2` (static initialization). The world's z is where the accelerometer
+    /// says up is, which its bias throws off; the state's `up` starts there and is corrected as the
+    /// filter learns the bias.
+    ///
+    /// The samples are taken as stationary when neither stream spreads, the mean gyro rate is no more
+    /// than a bias, and the mean acceleration is the size of gravity.
+    pub fn from_samples(samples: &[ImuSample], gravity_m_s2: f64) -> Result<StaticInitialization, StaticInitializationError> {
         if samples.is_empty() {
-            return Err(StillStartError::NoSamples);
+            return Err(StaticInitializationError::NoSamples);
         }
         let count = samples.len() as f64;
         let mean = |pick: fn(&ImuSample) -> DVec3| samples.iter().map(pick).sum::<DVec3>() / count;
@@ -107,11 +125,17 @@ impl StillStart {
         let (gyro, accel) = (mean(|s| s.gyro_rad_s), mean(|s| s.accel_m_s2));
         let (gyro_spread_rad_s, accel_spread_m_s2) = (spread(|s| s.gyro_rad_s, gyro), spread(|s| s.accel_m_s2, accel));
         if gyro_spread_rad_s > Self::MAX_GYRO_SPREAD_RAD_S || accel_spread_m_s2 > Self::MAX_ACCEL_SPREAD_M_S2 {
-            return Err(StillStartError::Moving { gyro_spread_rad_s, accel_spread_m_s2 });
+            return Err(StaticInitializationError::Moving { gyro_spread_rad_s, accel_spread_m_s2 });
+        }
+        if gyro.length() > Self::MAX_MEAN_GYRO_RAD_S {
+            return Err(StaticInitializationError::Rotating { mean_gyro_rad_s: gyro.length() });
+        }
+        if (accel.length() - gravity_m_s2).abs() > Self::MAX_GRAVITY_ERROR_M_S2 {
+            return Err(StaticInitializationError::NotGravity { mean_accel_m_s2: accel.length(), gravity_m_s2 });
         }
         // At rest the accelerometer reads the reaction to gravity, which points up.
         let rotation = DQuat::from_rotation_arc(accel.normalize(), DVec3::Z);
-        Ok(StillStart { state: State { position: DVec3::ZERO, rotation, velocity: DVec3::ZERO, gyro_bias: gyro, accel_bias: DVec3::ZERO, up: DVec3::Z } })
+        Ok(StaticInitialization { state: State { position: DVec3::ZERO, rotation, velocity: DVec3::ZERO, gyro_bias: gyro, accel_bias: DVec3::ZERO, up: DVec3::Z } })
     }
 }
 
@@ -124,14 +148,29 @@ pub enum CloudOutcome {
         iterations: usize,
         /// Points that found a surface in the map.
         matched: usize,
-        /// Points of the thinned cloud.
+        /// Points of the downsampled cloud.
         offered: usize,
         /// Root mean square of the matched points' residuals, in sigmas.
         rms_sigmas: f64,
         /// The direction the cloud pinned down least. A sigma far above the others' centimetres means
         /// the scene left that direction to the IMU.
-        weakest: WeakestTranslation,
+        degenerate: DegenerateTranslation,
     },
+}
+
+/// How a cloud's points fared, whether or not the cloud corrected the estimate.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CloudCounts {
+    /// Points of the cloud as given, before downsampling.
+    pub given: usize,
+    /// Points of the downsampled cloud.
+    pub downsampled: usize,
+    /// Downsampled points that landed where the map holds a surface facing their way, in the last linearisation.
+    pub found_surface: usize,
+    /// Of those, the points whose innovation passed the gate: the cloud's rows in the measurement update.
+    pub within_gate: usize,
+    /// The fewest rows a measurement update takes.
+    pub needed: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -142,7 +181,7 @@ pub enum OdometryError {
     NoImuYet,
     /// The cloud could not correct the estimate, which keeps the IMU's prediction; the cloud is not
     /// added to the map.
-    NotCorrected(CorrectionError),
+    NotCorrected(MeasurementUpdateError),
 }
 
 impl std::fmt::Display for OdometryError {
@@ -163,14 +202,17 @@ pub struct DepthInertialOdometry<M> {
     settings: OdometrySettings,
     last_imu: Option<ImuSample>,
     estimate_at: Duration,
+    /// When a cloud last corrected the estimate, or the first IMU sample came.
+    corrected_at: Option<Duration>,
     trimmed_at: DVec3,
-    thinner: Thinner,
-    thinned: Vec<BodyPoint>,
+    downsampler: Downsampler,
+    downsampled: Vec<BodyPoint>,
     world_points: Vec<MapPoint>,
+    last_cloud: CloudCounts,
 }
 
 impl<M: SurfaceMap> DepthInertialOdometry<M> {
-    pub fn new(start: StillStart, map: M, settings: OdometrySettings) -> DepthInertialOdometry<M> {
+    pub fn new(start: StaticInitialization, map: M, settings: OdometrySettings) -> DepthInertialOdometry<M> {
         let filter = ErrorStateFilter::new(start.state, settings.start_uncertainty, settings.imu_noise, settings.gravity_m_s2);
         DepthInertialOdometry {
             filter,
@@ -178,11 +220,18 @@ impl<M: SurfaceMap> DepthInertialOdometry<M> {
             settings,
             last_imu: None,
             estimate_at: Duration::ZERO,
+            corrected_at: None,
             trimmed_at: start.state.position,
-            thinner: Thinner::default(),
-            thinned: Vec::new(),
+            downsampler: Downsampler::default(),
+            downsampled: Vec::new(),
             world_points: Vec::new(),
+            last_cloud: CloudCounts::default(),
         }
+    }
+
+    /// How the points of the last cloud given to [`Self::add_cloud`] fared; all zero before the first.
+    pub fn last_cloud(&self) -> CloudCounts {
+        self.last_cloud
     }
 
     /// The estimate in the world frame, which is fixed where the start put it and is level only as
@@ -199,6 +248,13 @@ impl<M: SurfaceMap> DepthInertialOdometry<M> {
         &self.map
     }
 
+    /// How long the IMU alone has carried the estimate (dead reckoning): the time since a cloud last
+    /// corrected it, or since the static initialization when none has. Zero straight after a
+    /// measurement update.
+    pub fn dead_reckoning_for(&self) -> Duration {
+        self.estimate_at.saturating_sub(self.corrected_at.unwrap_or(self.estimate_at))
+    }
+
     /// Moves the estimate on to this sample's time.
     pub fn add_imu(&mut self, sample: ImuSample) -> Result<(), OdometryError> {
         if let Some(last) = self.last_imu {
@@ -209,6 +265,7 @@ impl<M: SurfaceMap> DepthInertialOdometry<M> {
             self.filter.predict(0.5 * (last.gyro_rad_s + sample.gyro_rad_s), 0.5 * (last.accel_m_s2 + sample.accel_m_s2), seconds);
         }
         self.estimate_at = sample.time;
+        self.corrected_at.get_or_insert(sample.time);
         self.last_imu = Some(sample);
         Ok(())
     }
@@ -218,7 +275,7 @@ impl<M: SurfaceMap> DepthInertialOdometry<M> {
         self.add_cloud_with(time, sensor_points, |_| PoseInformation::default())
     }
 
-    /// As [`Self::add_cloud`], with another sensor's point-to-plane measurements joining the correction.
+    /// As [`Self::add_cloud`], with another sensor's point-to-plane measurements joining the measurement update.
     pub fn add_cloud_with(&mut self, time: Duration, sensor_points: &[Vec3], others: impl Fn(&State) -> PoseInformation) -> Result<CloudOutcome, OdometryError> {
         let last = self.last_imu.ok_or(OdometryError::NoImuYet)?;
         if time < self.estimate_at {
@@ -226,28 +283,36 @@ impl<M: SurfaceMap> DepthInertialOdometry<M> {
         }
         self.filter.predict(last.gyro_rad_s, last.accel_m_s2, (time - self.estimate_at).as_secs_f64());
         self.estimate_at = time;
-        self.thinner.thin(sensor_points, &self.settings.sensor_mount, &self.settings.thinning, &self.settings.association.noise, &mut self.thinned);
+        self.downsampler.downsample(sensor_points, &self.settings.sensor_extrinsics, &self.settings.downsampling, &self.settings.association.noise, &mut self.downsampled);
+        self.last_cloud = CloudCounts { given: sensor_points.len(), downsampled: self.downsampled.len(), needed: self.settings.measurement_update.min_rows, ..CloudCounts::default() };
 
         let outcome = if self.map.is_empty() {
             CloudOutcome::StartedMap
         } else {
-            let (map, thinned, association) = (&self.map, &self.thinned, &self.settings.association);
-            let Correction { iterations, information } = self
+            let (map, downsampled, association) = (&self.map, &self.downsampled, &self.settings.association);
+            let predicted_pose_covariance = self.filter.pose_covariance();
+            let last_cloud = &mut self.last_cloud;
+            let MeasurementUpdate { iterations, information } = self
                 .filter
-                .correct(&self.settings.correction, |state| measure(thinned, map, state, association).merge(others(state)))
+                .update(&self.settings.measurement_update, |state| {
+                    let cloud = measure(downsampled, map, state, &predicted_pose_covariance, association);
+                    (last_cloud.found_surface, last_cloud.within_gate) = (cloud.found_surface, cloud.information.rows);
+                    cloud.information.merge(others(state))
+                })
                 .map_err(OdometryError::NotCorrected)?;
+            self.corrected_at = Some(time);
             CloudOutcome::Corrected {
                 iterations,
                 matched: information.rows,
-                offered: self.thinned.len(),
+                offered: self.downsampled.len(),
                 rms_sigmas: (information.squared_sigmas / information.rows as f64).sqrt(),
-                weakest: information.weakest_translation(),
+                degenerate: information.degenerate_translation(),
             }
         };
 
         let state = *self.filter.state();
         self.world_points.clear();
-        self.world_points.extend(self.thinned.iter().map(|point| MapPoint { position: state.to_world(point.position.as_dvec3()).as_vec3(), sigma_m: point.sigma_m }));
+        self.world_points.extend(self.downsampled.iter().map(|point| MapPoint { position: state.to_world(point.position.as_dvec3()).as_vec3(), sigma_m: point.sigma_m }));
         self.map.insert(&self.world_points);
         if (state.position - self.trimmed_at).length() > self.settings.map_trim_after_m as f64 {
             self.map.keep_within(state.position.as_vec3(), self.settings.map_half_extent_m);
@@ -274,7 +339,7 @@ mod tests {
     fn a_still_start_finds_which_way_is_up_and_the_gyro_bias() {
         let tilt = DQuat::from_euler(glam::EulerRot::ZYX, 0.0, 0.15, -0.1);
         let bias = DVec3::new(0.003, -0.002, 0.001);
-        let start = StillStart::from_samples(&resting(400, tilt.conjugate() * DVec3::new(0.0, 0.0, 9.81), bias)).expect("the samples are at rest");
+        let start = StaticInitialization::from_samples(&resting(400, tilt.conjugate() * DVec3::new(0.0, 0.0, 9.81), bias), 9.81).expect("the samples are at rest");
         let up = start.state.rotation * (tilt.conjugate() * DVec3::Z);
         assert!((up - DVec3::Z).length() < 1e-3, "{up}");
         assert!((start.state.gyro_bias - bias).length() < 1e-4, "{}", start.state.gyro_bias);
@@ -286,6 +351,20 @@ mod tests {
         for (i, sample) in samples.iter_mut().enumerate() {
             sample.gyro_rad_s.z = 0.5 * (i as f64 * 0.05).sin();
         }
-        assert!(matches!(StillStart::from_samples(&samples), Err(StillStartError::Moving { .. })));
+        assert!(matches!(StaticInitialization::from_samples(&samples, 9.81), Err(StaticInitializationError::Moving { .. })));
+    }
+
+    #[test]
+    fn a_start_during_a_steady_turn_is_refused() {
+        // A turn about up at a constant rate: the gyro does not spread and the accelerometer reads
+        // gravity alone.
+        let samples = resting(400, DVec3::new(0.0, 0.0, 9.81), DVec3::new(0.0, 0.0, 0.3));
+        assert!(matches!(StaticInitialization::from_samples(&samples, 9.81), Err(StaticInitializationError::Rotating { mean_gyro_rad_s }) if (mean_gyro_rad_s - 0.3).abs() < 1e-3));
+    }
+
+    #[test]
+    fn a_start_whose_accelerometer_does_not_read_gravity_is_refused() {
+        let samples = resting(400, DVec3::new(0.0, 0.0, 10.6), DVec3::ZERO);
+        assert!(matches!(StaticInitialization::from_samples(&samples, 9.81), Err(StaticInitializationError::NotGravity { .. })));
     }
 }

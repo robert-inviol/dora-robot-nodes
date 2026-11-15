@@ -6,7 +6,7 @@
 use rusqlite::{Connection, Transaction};
 
 /// Each entry moves the schema from version `index` to `index + 1`.
-const MIGRATIONS: [&str; 2] = [r#"
+const MIGRATIONS: [&str; 3] = [r#"
 CREATE TABLE map_version (
     map_version INTEGER PRIMARY KEY,
     first_seen_unix_ns INTEGER NOT NULL
@@ -241,6 +241,40 @@ CREATE TABLE track_joint (
     PRIMARY KEY (track_id, seen_unix_ns, joint),
     FOREIGN KEY (track_id, seen_unix_ns) REFERENCES track_pose
 );
+"#, r#"
+-- track_pose with speed_m_s NULL when the people tracker had not measured it. SQLite cannot drop NOT NULL in place,
+-- so this migration copies track_pose into a new table, and track_joint with it, since it references track_pose.
+CREATE TABLE track_pose_nullable_speed (
+    track_id INTEGER NOT NULL REFERENCES track,
+    seen_unix_ns INTEGER NOT NULL,
+    map_version INTEGER NOT NULL,
+    x_m REAL NOT NULL,
+    y_m REAL NOT NULL,
+    z_m REAL NOT NULL,
+    -- The direction walked in, or faced when standing still; NULL when neither is known.
+    heading_rad REAL,
+    -- NULL when the people tracker had not measured it.
+    speed_m_s REAL,
+    PRIMARY KEY (track_id, seen_unix_ns)
+);
+INSERT INTO track_pose_nullable_speed SELECT track_id, seen_unix_ns, map_version, x_m, y_m, z_m, heading_rad, speed_m_s FROM track_pose;
+
+CREATE TABLE track_joint_nullable_speed (
+    track_id INTEGER NOT NULL,
+    seen_unix_ns INTEGER NOT NULL,
+    joint TEXT NOT NULL CHECK (joint IN ('nose', 'left_eye', 'right_eye', 'left_ear', 'right_ear', 'left_shoulder', 'right_shoulder', 'left_elbow', 'right_elbow', 'left_wrist', 'right_wrist', 'left_hip', 'right_hip', 'left_knee', 'right_knee', 'left_ankle', 'right_ankle')),
+    x_m REAL NOT NULL,
+    y_m REAL NOT NULL,
+    z_m REAL NOT NULL,
+    PRIMARY KEY (track_id, seen_unix_ns, joint),
+    FOREIGN KEY (track_id, seen_unix_ns) REFERENCES track_pose_nullable_speed
+);
+INSERT INTO track_joint_nullable_speed SELECT track_id, seen_unix_ns, joint, x_m, y_m, z_m FROM track_joint;
+
+DROP TABLE track_joint;
+DROP TABLE track_pose;
+ALTER TABLE track_pose_nullable_speed RENAME TO track_pose;
+ALTER TABLE track_joint_nullable_speed RENAME TO track_joint;
 "#];
 
 pub const SCHEMA_VERSION: u32 = MIGRATIONS.len() as u32;
@@ -259,17 +293,22 @@ pub fn schema_version(connection: &Connection) -> rusqlite::Result<u32> {
 
 /// Runs the migrations the database has not had, each in its own transaction.
 pub fn migrate(connection: &mut Connection) -> Result<u32, MigrationError> {
+    migrate_to(connection, SCHEMA_VERSION)
+}
+
+/// Runs the migrations up to schema version `version`.
+fn migrate_to(connection: &mut Connection, version: u32) -> Result<u32, MigrationError> {
     let found = schema_version(connection)?;
     if found > SCHEMA_VERSION {
         return Err(MigrationError::NewerThanKnown { found, known: SCHEMA_VERSION });
     }
-    for (index, sql) in MIGRATIONS.iter().enumerate().skip(found as usize) {
+    for (index, sql) in MIGRATIONS.iter().enumerate().take(version as usize).skip(found as usize) {
         let transaction: Transaction<'_> = connection.transaction()?;
         transaction.execute_batch(sql)?;
         transaction.pragma_update(None, "user_version", index as u32 + 1)?;
         transaction.commit()?;
     }
-    Ok(SCHEMA_VERSION)
+    Ok(schema_version(connection)?)
 }
 
 #[cfg(test)]
@@ -310,6 +349,40 @@ mod tests {
         let mut connection = Connection::open_in_memory().unwrap();
         connection.pragma_update(None, "user_version", SCHEMA_VERSION + 1).unwrap();
         assert!(matches!(migrate(&mut connection), Err(MigrationError::NewerThanKnown { .. })));
+    }
+
+    #[test]
+    fn a_populated_database_at_version_2_keeps_its_people_and_takes_an_unknown_speed() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        connection.pragma_update(None, "foreign_keys", true).unwrap();
+        assert_eq!(migrate_to(&mut connection, 2).unwrap(), 2);
+        connection
+            .execute_batch(
+                "INSERT INTO track VALUES (7, 100, 200);
+                 INSERT INTO track_pose VALUES (7, 100, 3, 1.0, 2.0, 1.2, 0.5, 0.0), (7, 200, 3, 1.5, 2.0, 1.2, NULL, 0.8);
+                 INSERT INTO track_joint VALUES (7, 100, 'nose', 1.0, 2.0, 1.6), (7, 200, 'left_ankle', 1.5, 2.1, 0.1);",
+            )
+            .unwrap();
+        assert!(connection.execute("INSERT INTO track_pose VALUES (7, 300, 3, 0.0, 0.0, 0.0, NULL, NULL)", []).is_err(), "version 2 needs a speed");
+
+        assert_eq!(migrate(&mut connection).unwrap(), SCHEMA_VERSION);
+        assert_eq!(schema_version(&connection).unwrap(), 3);
+        let poses: Vec<(i64, f64, Option<f64>, Option<f64>)> = connection
+            .prepare("SELECT seen_unix_ns, x_m, heading_rad, speed_m_s FROM track_pose ORDER BY seen_unix_ns")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(poses, [(100, 1.0, Some(0.5), Some(0.0)), (200, 1.5, None, Some(0.8))]);
+        let joints: i64 = connection.query_row("SELECT count(*) FROM track_joint", [], |row| row.get(0)).unwrap();
+        assert_eq!(joints, 2);
+        connection.execute("INSERT INTO track_pose VALUES (7, 300, 3, 0.0, 0.0, 0.0, NULL, NULL)", []).unwrap();
+        connection.execute("INSERT INTO track_joint VALUES (7, 300, 'nose', 0.0, 0.0, 1.6)", []).unwrap();
+        let orphan = connection.execute("INSERT INTO track_joint VALUES (7, 999, 'nose', 0.0, 0.0, 1.6)", []);
+        assert!(orphan.is_err(), "track_joint still references track_pose");
+        let tables = tables(&connection);
+        assert!(!tables.iter().any(|name| name.contains("nullable_speed")), "{tables:?}");
     }
 
     #[test]

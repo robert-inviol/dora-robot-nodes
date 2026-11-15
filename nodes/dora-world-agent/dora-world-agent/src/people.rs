@@ -1,22 +1,29 @@
-//! Placing the people tracker's confirmed tracks in the map.
+//! Transforming the people tracker's confirmed tracks into the map frame.
 //!
-//! Tracks in the odometry frame are carried into the map with the localizer's latest map to odom correction. Tracks
-//! in the camera frame cannot be placed: the node does not know where the camera was. A track's joints are its
+//! Tracks in the odometry frame are carried into the map with the localizer's latest map to odom correction, when
+//! that correction was made in the odom frame the tracks name: after odometry starts again, the last correction
+//! belongs to the old odom frame and would put people in the wrong place. Tracks in the camera frame cannot be
+//! transformed: the node does not know where the camera was. A track's joints are its
 //! `skeleton_3d`, the joints fitted to the person's skeleton; the raw `keypoints_3d` are not recorded.
 
-use perception_wire::localization::MapToOdom;
+use perception_wire::localization::{CameraNanos, MapToOdom};
 use perception_wire::navigation::{TrackId, UnixNanos};
 use perception_wire::people::{self, PeopleTracks, PositionFrame, TrackState};
 use world_agent::world::Joint;
-use world_store::{FloorVelocity, JointPlacement, PersonSighting, Position3};
+use world_store::{FloorVelocity, JointInMap, PersonObservation, Position3};
 
-/// Why a people tracks frame was not placed in the map.
+/// Why a people tracks frame was not transformed into the map frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
-pub enum Unplaced {
-    #[error("people tracks are in the camera frame; only odometry-frame tracks can be placed in the map")]
+pub enum NotTransformed {
+    #[error("people tracks are in the camera frame; only odometry-frame tracks can be transformed into the map frame")]
     CameraFrame,
     #[error("people tracks are in the odometry frame and the localizer has sent no map to odom correction yet")]
     NoCorrection,
+    #[error(
+        "people tracks are in the odom frame started at camera time {tracks:?} and the localizer's latest map to odom \
+         correction is for the one started at {correction:?}"
+    )]
+    CorrectionFromAnotherOdomFrame { tracks: CameraNanos, correction: CameraNanos },
 }
 
 #[derive(Clone, Debug, PartialEq, thiserror::Error)]
@@ -26,17 +33,20 @@ pub struct WrongJointCount {
     pub joints: usize,
 }
 
-/// The confirmed tracks of one frame placed in the map, each with every joint its skeleton fit placed. A confirmed
+/// The confirmed tracks of one frame transformed into the map frame, each with every joint its skeleton fit found. A confirmed
 /// track with no torso position is left out.
-pub fn place_people(
+pub fn transform_people_to_map(
     frame: &PeopleTracks,
     correction: Option<&MapToOdom>,
     seen: UnixNanos,
-) -> Result<Result<Vec<PersonSighting>, Unplaced>, WrongJointCount> {
+) -> Result<Result<Vec<PersonObservation>, NotTransformed>, WrongJointCount> {
     let correction = match (frame.position_frame, correction) {
-        (PositionFrame::Camera, _) => return Ok(Err(Unplaced::CameraFrame)),
-        (PositionFrame::Odom, None) => return Ok(Err(Unplaced::NoCorrection)),
-        (PositionFrame::Odom, Some(correction)) => correction,
+        (PositionFrame::Camera, _) => return Ok(Err(NotTransformed::CameraFrame)),
+        (PositionFrame::Odom { .. }, None) => return Ok(Err(NotTransformed::NoCorrection)),
+        (PositionFrame::Odom { odom_started }, Some(correction)) if correction.odom_started != odom_started => {
+            return Ok(Err(NotTransformed::CorrectionFromAnotherOdomFrame { tracks: odom_started, correction: correction.odom_started }));
+        }
+        (PositionFrame::Odom { .. }, Some(correction)) => correction,
     };
     let (sin, cos) = correction.correction.yaw_rad.sin_cos();
     let c = correction.correction;
@@ -45,7 +55,7 @@ pub fn place_people(
         y_m: sin * p.x_m + cos * p.y_m + c.y_m,
         z_m: p.z_m + c.z_m,
     };
-    let mut sightings = Vec::new();
+    let mut observations = Vec::new();
     for track in frame.tracks.iter().filter(|t| t.state == TrackState::Confirmed) {
         if track.skeleton_3d.len() != Joint::ALL.len() {
             return Err(WrongJointCount { track: track.track_id, joints: track.skeleton_3d.len() });
@@ -54,10 +64,10 @@ pub fn place_people(
         let joints = Joint::ALL
             .into_iter()
             .zip(&track.skeleton_3d)
-            .filter_map(|(joint, point)| point.as_ref().map(|p| JointPlacement { joint, position: to_map(p) }))
+            .filter_map(|(joint, point)| point.as_ref().map(|p| JointInMap { joint, position: to_map(p) }))
             .collect();
         let velocity = track.velocity.map(|v| FloorVelocity { vx_m_s: cos * v.vx_m_s - sin * v.vy_m_s, vy_m_s: sin * v.vx_m_s + cos * v.vy_m_s });
-        sightings.push(PersonSighting {
+        observations.push(PersonObservation {
             track: TrackId(track.track_id),
             seen,
             map_version: correction.map_version,
@@ -66,12 +76,12 @@ pub fn place_people(
             joints,
         });
     }
-    Ok(Ok(sightings))
+    Ok(Ok(observations))
 }
 
 #[cfg(test)]
 mod tests {
-    use perception_wire::localization::{CameraNanos, Pose4};
+    use perception_wire::localization::Pose4Dof;
     use perception_wire::navigation::MapVersion;
     use perception_wire::people::{Keypoint, PersonTrack, PixelBox, Velocity};
 
@@ -99,15 +109,19 @@ mod tests {
     }
 
     fn frame(position_frame: PositionFrame, tracks: Vec<PersonTrack>) -> PeopleTracks {
-        PeopleTracks { frame_id: 1, captured_camera_ns: 5, width: 1280, height: 720, position_frame, gravity_reaction: None, tracks }
+        PeopleTracks { frame_id: 1, captured_camera_ns: 5, width: 1280, height: 720, position_frame, specific_force: None, tracks }
     }
+
+    /// The odom frame the test correction is for.
+    const ODOM: PositionFrame = PositionFrame::Odom { odom_started: CameraNanos(0) };
 
     /// Odometry turned a quarter turn anticlockwise and shifted against the map.
     fn correction() -> MapToOdom {
         MapToOdom {
             map_version: MapVersion(4),
             valid_from: CameraNanos(0),
-            correction: Pose4 { x_m: 2.0, y_m: 1.0, z_m: -0.5, yaw_rad: std::f32::consts::FRAC_PI_2 },
+            odom_started: CameraNanos(0),
+            correction: Pose4Dof { x_m: 2.0, y_m: 1.0, z_m: -0.5, yaw_rad: std::f32::consts::FRAC_PI_2 },
             sigma_xy_m: 0.02,
             sigma_z_m: 0.01,
             sigma_yaw_rad: 0.01,
@@ -126,9 +140,9 @@ mod tests {
             track(5, TrackState::Lost, Some(point(0.0, 0.0, 1.2))),
             track(6, TrackState::Confirmed, None),
         ];
-        let placed = place_people(&frame(PositionFrame::Odom, tracks), Some(&correction()), UnixNanos(9)).unwrap().unwrap();
-        assert_eq!(placed.len(), 1, "only the confirmed track with a torso position");
-        let person = &placed[0];
+        let in_map = transform_people_to_map(&frame(ODOM, tracks), Some(&correction()), UnixNanos(9)).unwrap().unwrap();
+        assert_eq!(in_map.len(), 1, "only the confirmed track with a torso position");
+        let person = &in_map[0];
         assert_eq!((person.track, person.seen, person.map_version), (TrackId(3), UnixNanos(9), MapVersion(4)));
         assert!(close(person.torso, Position3 { x_m: 2.0, y_m: 2.0, z_m: 0.7 }), "{:?}", person.torso);
         let velocity = person.velocity.unwrap();
@@ -138,17 +152,31 @@ mod tests {
     }
 
     #[test]
-    fn camera_frame_tracks_and_odometry_without_a_correction_are_not_placed() {
+    fn camera_frame_tracks_and_odometry_without_a_correction_are_not_transformed() {
         let tracks = || vec![track(3, TrackState::Confirmed, Some(point(1.0, 0.0, 1.2)))];
-        assert_eq!(place_people(&frame(PositionFrame::Camera, tracks()), Some(&correction()), UnixNanos(9)), Ok(Err(Unplaced::CameraFrame)));
-        assert_eq!(place_people(&frame(PositionFrame::Odom, tracks()), None, UnixNanos(9)), Ok(Err(Unplaced::NoCorrection)));
+        assert_eq!(transform_people_to_map(&frame(PositionFrame::Camera, tracks()), Some(&correction()), UnixNanos(9)), Ok(Err(NotTransformed::CameraFrame)));
+        assert_eq!(transform_people_to_map(&frame(ODOM, tracks()), None, UnixNanos(9)), Ok(Err(NotTransformed::NoCorrection)));
+    }
+
+    #[test]
+    fn after_an_odometry_restart_tracks_wait_for_a_correction_in_their_own_odom_frame() {
+        let tracks = || vec![track(3, TrackState::Confirmed, Some(point(1.0, 0.0, 1.2)))];
+        let restarted = PositionFrame::Odom { odom_started: CameraNanos(500) };
+        assert_eq!(
+            transform_people_to_map(&frame(restarted, tracks()), Some(&correction()), UnixNanos(9)),
+            Ok(Err(NotTransformed::CorrectionFromAnotherOdomFrame { tracks: CameraNanos(500), correction: CameraNanos(0) })),
+            "the old odom frame's correction does not place them"
+        );
+        let in_the_new_frame = MapToOdom { odom_started: CameraNanos(500), valid_from: CameraNanos(600), ..correction() };
+        let in_map = transform_people_to_map(&frame(restarted, tracks()), Some(&in_the_new_frame), UnixNanos(9)).unwrap().unwrap();
+        assert!(close(in_map[0].torso, Position3 { x_m: 2.0, y_m: 2.0, z_m: 0.7 }), "{:?}", in_map[0].torso);
     }
 
     #[test]
     fn a_track_without_every_joint_slot_is_refused() {
         let mut short = track(3, TrackState::Confirmed, Some(point(1.0, 0.0, 1.2)));
         short.skeleton_3d.pop();
-        let refused = place_people(&frame(PositionFrame::Odom, vec![short]), Some(&correction()), UnixNanos(9));
+        let refused = transform_people_to_map(&frame(ODOM, vec![short]), Some(&correction()), UnixNanos(9));
         assert_eq!(refused, Err(WrongJointCount { track: 3, joints: 16 }));
     }
 }

@@ -1,15 +1,15 @@
-//! The spatial agent as a dora node: `space_question` in, `space_answer` and `nav_goal` out; `goal_status`,
-//! `topology`, `free_space`, `object_update`, `keyframe_pose` and `people_tracks` go to the world store the agent
-//! answers from, people placed in the map with `map_to_odom`.
+//! The spatial agent as a dora node: `spatial_query` in, `spatial_answer` and `nav_goal` out; `goal_status`,
+//! `topology`, `occupancy_grid`, `object_update`, `keyframe_pose` and `people_tracks` go to the world store the agent
+//! answers from, people transformed into the map frame with `map_to_odom`.
 
 use std::path::PathBuf;
 
 use dora_node_api::dora_core::config::DataId;
 use dora_node_api::{DoraNode, Event, MetadataParameters};
-use dora_world_agent::node::{SpatialNode, NAV_GOAL_OUTPUT, SPACE_ANSWER_OUTPUT};
+use dora_world_agent::node::{SpatialNode, NAV_GOAL_OUTPUT, SPATIAL_ANSWER_OUTPUT};
 use dora_world_agent::world::SqliteWorld;
 use eyre::{eyre, Result, WrapErr};
-use perception_wire::navigation::{encode_nav_goal, encode_space_answer};
+use perception_wire::navigation::{encode_nav_goal, encode_spatial_answer};
 use world_agent::config::SpatialConfig;
 
 const CONFIG_VARIABLE: &str = "SPATIAL_AGENT_CONFIG";
@@ -27,7 +27,7 @@ async fn main() -> Result<()> {
     let (spatial, mut outputs) = SpatialNode::start(&config, world).await?;
     let (mut node, mut events) = DoraNode::init_from_env()?;
     let nav_goal_output = DataId::from(NAV_GOAL_OUTPUT.to_owned());
-    let answer_output = DataId::from(SPACE_ANSWER_OUTPUT.to_owned());
+    let answer_output = DataId::from(SPATIAL_ANSWER_OUTPUT.to_owned());
     loop {
         tokio::select! {
             event = events.recv_async() => match event {
@@ -44,7 +44,7 @@ async fn main() -> Result<()> {
                 node.send_output(nav_goal_output.clone(), MetadataParameters::default(), encode_nav_goal(&goal))?;
             }
             Some(answer) = outputs.answers.recv() => {
-                node.send_output(answer_output.clone(), MetadataParameters::default(), encode_space_answer(&answer))?;
+                node.send_output(answer_output.clone(), MetadataParameters::default(), encode_spatial_answer(&answer))?;
             }
         }
     }

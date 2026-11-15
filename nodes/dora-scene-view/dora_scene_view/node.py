@@ -1,4 +1,4 @@
-"""The live debug page as a dora node: the latest keyframe in 3D with its segments, planes, room and boxes."""
+"""The live debug page as a dora node: the latest keyframe in 3D with its instance masks, planes, room and boxes."""
 
 import csv
 import json
@@ -10,7 +10,7 @@ from pathlib import Path
 from aiohttp import web
 from dora import Node
 
-from dora_rig_messages.perception import Keyframe, Scene, Segments
+from dora_rig_messages.perception import Keyframe, Scene, InstanceMasks
 
 from .view import page_data
 
@@ -21,7 +21,7 @@ PAGE = Path(__file__).with_name("page.html")
 
 
 class LatestPage:
-    """The page for the newest keyframe whose segments have arrived, so every layer drawn is from one frame.
+    """The page for the newest keyframe whose instance masks have arrived, so every layer drawn is from one frame.
 
     Inputs arrive on dora's thread and requests on aiohttp's.
     """
@@ -32,8 +32,8 @@ class LatestPage:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._keyframes: dict[int, Keyframe] = {}
-        self._segments: Segments | None = None
-        # Per frame, the scene and whether it is the full one (with objects) rather than the structure alone.
+        self._instance_masks: InstanceMasks | None = None
+        # Per frame, the scene and whether it is the full one (with objects) rather than the room_layout alone.
         self._scenes: dict[int, tuple[Scene, bool]] = {}
         self._version = 0
         self._rendered: tuple[int, str] | None = None
@@ -44,12 +44,12 @@ class LatestPage:
             for old in sorted(self._keyframes)[: -self.RECENT_KEYFRAMES]:
                 del self._keyframes[old]
                 self._scenes.pop(old, None)
-            if self._segments is None:
+            if self._instance_masks is None:
                 self._version += 1
 
-    def add_segments(self, segments: Segments) -> None:
+    def add_instance_masks(self, instance_masks: InstanceMasks) -> None:
         with self._lock:
-            self._segments = segments
+            self._instance_masks = instance_masks
             self._version += 1
 
     def add_scene(self, scene: Scene, *, has_objects: bool) -> None:
@@ -71,11 +71,11 @@ class LatestPage:
             version = self._version
             if self._rendered is not None and self._rendered[0] == version:
                 return self._rendered[1]
-            segments = self._segments
-            frame_id = segments.frame_id if segments and segments.frame_id in self._keyframes else max(self._keyframes)
+            instance_masks = self._instance_masks
+            frame_id = instance_masks.frame_id if instance_masks and instance_masks.frame_id in self._keyframes else max(self._keyframes)
             keyframe = self._keyframes[frame_id]
             scene = self._scenes.get(frame_id, (None, False))[0]
-        html = PAGE.read_text().replace("__SCENE_JSON__", json.dumps(page_data(keyframe, segments, scene, str(version))))
+        html = PAGE.read_text().replace("__SCENE_JSON__", json.dumps(page_data(keyframe, instance_masks, scene, str(version))))
         with self._lock:
             self._rendered = (version, html)
         return html
@@ -117,18 +117,18 @@ def main() -> None:
             keyframe = Keyframe.from_arrow(event["value"])
             frame_id, captured_ns = keyframe.frame_id, keyframe.captured_unix_ns
             latest.add_keyframe(keyframe)
-        elif event["id"] == "segments":
-            segments = Segments.from_arrow(event["value"])
-            frame_id = segments.frame_id
-            latest.add_segments(segments)
-        elif event["id"] in ("scene", "structure"):
+        elif event["id"] == "instance_masks":
+            instance_masks = InstanceMasks.from_arrow(event["value"])
+            frame_id = instance_masks.frame_id
+            latest.add_instance_masks(instance_masks)
+        elif event["id"] in ("scene", "room_layout"):
             scene = Scene.from_arrow(event["value"])
             frame_id, captured_ns = scene.frame_id, scene.captured_unix_ns
             latest.add_scene(scene, has_objects=event["id"] == "scene")
         if timings:
             now = time.time()
             age_ms = "" if captured_ns is None else round((now - captured_ns * 1e-9) * 1e3, 1)
-            stages = {k: v for k, v in event["metadata"].items() if k.endswith("_ms") or k == "concepts"}
+            stages = {k: v for k, v in event["metadata"].items() if k.endswith("_ms") or k == "labels"}
             for stage, ms in stages.items() or [("", "")]:
                 timings.writerow([round(now, 3), event["id"], frame_id, age_ms, stage, ms])
             timings_file.flush()

@@ -1,5 +1,5 @@
 //! The messages of lib/dora-rig-messages, as single-row Arrow structs: the perception messages of perception.py
-//! here, and the camera, localization, navigation, objects, odometry, people and space_map modules' messages in the
+//! here, and the camera, localization, navigation, objects, odometry, people, posed_depth and space_map modules' messages in the
 //! modules of the same names.
 //! Field names, types and nullability must match the Python modules exactly; the tests read their golden fixtures.
 
@@ -9,7 +9,8 @@ pub mod navigation;
 pub mod objects;
 pub mod odometry;
 pub mod people;
-pub mod scene_layout;
+pub mod posed_depth;
+pub mod room_layout;
 mod serde_wire;
 pub mod space_map;
 
@@ -27,7 +28,7 @@ use dora_node_api::arrow::datatypes::{
 use eyre::{bail, eyre, Context, Result};
 use glam::Vec3;
 
-pub const NO_SEGMENT: i16 = -1;
+pub const NO_INSTANCE: i16 = -1;
 
 pub struct Keyframe {
     pub frame_id: u64,
@@ -36,7 +37,7 @@ pub struct Keyframe {
     pub height: usize,
     pub intrinsics: CameraIntrinsics,
     /// The accelerometer at rest, in camera coordinates: the reaction to gravity.
-    pub gravity_reaction: Vec3,
+    pub specific_force: Vec3,
     /// Row major, aligned to the colour image, 0 where the sensor has no reading.
     pub depth_mm: ScalarBuffer<u16>,
     pub color_jpeg: Vec<u8>,
@@ -62,20 +63,20 @@ pub struct Imu {
     pub gyro_rad_s: Vec<Vec3>,
 }
 
-pub struct Segments {
+pub struct InstanceMasks {
     pub frame_id: u64,
     pub width: usize,
     pub height: usize,
     pub labels: Vec<String>,
     pub scores: Vec<f32>,
-    /// Per pixel, the index into labels or NO_SEGMENT; where masks overlap the smaller one wins.
-    pub segment_ids: ScalarBuffer<i16>,
+    /// Per pixel, the index into labels or NO_INSTANCE; where masks overlap the smaller one wins.
+    pub instance_ids: ScalarBuffer<i16>,
 }
 
 pub struct SceneObject<'a> {
     pub label: &'a str,
-    /// Index into the labels of the segments message the object came from.
-    pub segment_index: u16,
+    /// Index into the labels of the instance masks message the object came from.
+    pub instance_index: u16,
     pub score: f32,
     pub footprint: &'a ObjectFootprint,
 }
@@ -112,7 +113,7 @@ fn keyframe_fields() -> Fields {
         field("fy", DataType::Float32),
         field("ppx", DataType::Float32),
         field("ppy", DataType::Float32),
-        field("gravity_reaction", items(DataType::Float32)),
+        field("specific_force", items(DataType::Float32)),
         field("depth_mm", items(DataType::UInt16)),
         field("color_jpeg", DataType::Binary),
     ])
@@ -129,14 +130,14 @@ fn imu_fields() -> Fields {
     ])
 }
 
-fn segments_fields() -> Fields {
+fn instance_masks_fields() -> Fields {
     Fields::from(vec![
         field("frame_id", DataType::UInt64),
         field("width", DataType::UInt16),
         field("height", DataType::UInt16),
         field("labels", items(DataType::Utf8)),
         field("scores", items(DataType::Float32)),
-        field("segment_ids", items(DataType::Int16)),
+        field("instance_ids", items(DataType::Int16)),
     ])
 }
 
@@ -162,7 +163,7 @@ fn room_fields() -> Fields {
 fn object_fields() -> Fields {
     Fields::from(vec![
         field("label", DataType::Utf8),
-        field("segment_index", DataType::UInt16),
+        field("instance_index", DataType::UInt16),
         field("score", DataType::Float32),
         field("point_count", DataType::UInt32),
         field("distance_m", DataType::Float32),
@@ -230,9 +231,9 @@ pub fn decode_keyframe(array: &dyn Array) -> Result<Keyframe> {
     if depth_mm.len() != width * height {
         bail!("keyframe depth has {} values for {width}x{height}", depth_mm.len());
     }
-    let gravity = list_values::<Float32Type>(row, "gravity_reaction");
+    let gravity = list_values::<Float32Type>(row, "specific_force");
     let [gx, gy, gz] = gravity[..] else {
-        bail!("keyframe gravity reaction has {} values, not 3", gravity.len());
+        bail!("keyframe specific force has {} values, not 3", gravity.len());
     };
     Ok(Keyframe {
         frame_id: scalar::<UInt64Type>(row, "frame_id"),
@@ -245,7 +246,7 @@ pub fn decode_keyframe(array: &dyn Array) -> Result<Keyframe> {
             ppx: scalar::<Float32Type>(row, "ppx"),
             ppy: scalar::<Float32Type>(row, "ppy"),
         },
-        gravity_reaction: Vec3::new(gx, gy, gz),
+        specific_force: Vec3::new(gx, gy, gz),
         depth_mm,
         color_jpeg: row.column_by_name("color_jpeg").expect("checked wire type").as_binary::<i32>().value(0).to_vec(),
     })
@@ -253,7 +254,7 @@ pub fn decode_keyframe(array: &dyn Array) -> Result<Keyframe> {
 
 pub fn encode_keyframe(keyframe: &Keyframe) -> StructArray {
     let k = keyframe.intrinsics;
-    let g = keyframe.gravity_reaction;
+    let g = keyframe.specific_force;
     let columns: Vec<ArrayRef> = vec![
         Arc::new(UInt64Array::from(vec![keyframe.frame_id])),
         Arc::new(Int64Array::from(vec![keyframe.captured_unix_ns])),
@@ -305,36 +306,36 @@ pub fn encode_imu(imu: &Imu) -> StructArray {
     StructArray::new(imu_fields(), columns, None)
 }
 
-pub fn decode_segments(array: &dyn Array) -> Result<Segments> {
-    let row = checked(array, &segments_fields(), "segments")?;
+pub fn decode_instance_masks(array: &dyn Array) -> Result<InstanceMasks> {
+    let row = checked(array, &instance_masks_fields(), "instance masks")?;
     let (width, height) = (scalar::<UInt16Type>(row, "width") as usize, scalar::<UInt16Type>(row, "height") as usize);
     let labels_list = row.column_by_name("labels").expect("checked wire type").as_list::<i32>();
     let labels_array = labels_list.value(0);
     let labels: Vec<String> = labels_array.as_string::<i32>().iter().map(|l| l.unwrap_or_default().to_owned()).collect();
     let scores = list_values::<Float32Type>(row, "scores").to_vec();
-    let segment_ids = list_values::<Int16Type>(row, "segment_ids");
+    let instance_ids = list_values::<Int16Type>(row, "instance_ids");
     if labels.len() != scores.len() {
-        bail!("segments have {} labels for {} scores", labels.len(), scores.len());
+        bail!("instance masks have {} labels for {} scores", labels.len(), scores.len());
     }
-    if segment_ids.len() != width * height {
-        bail!("segment ids have {} values for {width}x{height}", segment_ids.len());
+    if instance_ids.len() != width * height {
+        bail!("instance ids have {} values for {width}x{height}", instance_ids.len());
     }
-    if let Some(bad) = segment_ids.iter().find(|&&id| id != NO_SEGMENT && (id < 0 || id as usize >= labels.len())) {
-        bail!("segment id {bad} is outside the {} labels", labels.len());
+    if let Some(bad) = instance_ids.iter().find(|&&id| id != NO_INSTANCE && (id < 0 || id as usize >= labels.len())) {
+        bail!("instance id {bad} is outside the {} labels", labels.len());
     }
-    Ok(Segments { frame_id: scalar::<UInt64Type>(row, "frame_id"), width, height, labels, scores, segment_ids })
+    Ok(InstanceMasks { frame_id: scalar::<UInt64Type>(row, "frame_id"), width, height, labels, scores, instance_ids })
 }
 
-pub fn encode_segments(segments: &Segments) -> StructArray {
+pub fn encode_instance_masks(instance_masks: &InstanceMasks) -> StructArray {
     let columns: Vec<ArrayRef> = vec![
-        Arc::new(UInt64Array::from(vec![segments.frame_id])),
-        Arc::new(UInt16Array::from(vec![segments.width as u16])),
-        Arc::new(UInt16Array::from(vec![segments.height as u16])),
-        one_list(Arc::new(StringArray::from_iter_values(&segments.labels))),
-        one_list(floats(segments.scores.iter().copied())),
-        one_list(Arc::new(Int16Array::new(segments.segment_ids.clone(), None))),
+        Arc::new(UInt64Array::from(vec![instance_masks.frame_id])),
+        Arc::new(UInt16Array::from(vec![instance_masks.width as u16])),
+        Arc::new(UInt16Array::from(vec![instance_masks.height as u16])),
+        one_list(Arc::new(StringArray::from_iter_values(&instance_masks.labels))),
+        one_list(floats(instance_masks.scores.iter().copied())),
+        one_list(Arc::new(Int16Array::new(instance_masks.instance_ids.clone(), None))),
     ];
-    StructArray::new(segments_fields(), columns, None)
+    StructArray::new(instance_masks_fields(), columns, None)
 }
 
 fn planes_column(planes: &[Plane]) -> ArrayRef {
@@ -376,7 +377,7 @@ fn objects_column(objects: &[SceneObject]) -> ArrayRef {
     let f = |get: fn(&ObjectFootprint) -> f32| floats(objects.iter().map(|o| get(o.footprint)));
     let columns: Vec<ArrayRef> = vec![
         Arc::new(StringArray::from_iter_values(objects.iter().map(|o| o.label))),
-        Arc::new(UInt16Array::from_iter_values(objects.iter().map(|o| o.segment_index))),
+        Arc::new(UInt16Array::from_iter_values(objects.iter().map(|o| o.instance_index))),
         floats(objects.iter().map(|o| o.score)),
         Arc::new(UInt32Array::from_iter_values(objects.iter().map(|o| o.footprint.point_count as u32))),
         f(|p| p.distance_m),
@@ -469,9 +470,34 @@ mod tests {
         }
         let tracks = people::decode_people_tracks(&fixture("people_tracks")).unwrap();
         assert_eq!(tracks.position_frame, people::PositionFrame::Camera);
+        let in_odom = people::decode_people_tracks(&fixture("people_tracks_in_odom")).unwrap();
+        assert_eq!(in_odom.position_frame, people::PositionFrame::Odom { odom_started: localization::CameraNanos(1_762_559_990_000_000_000) });
         assert_eq!(tracks.tracks[1].state, people::TrackState::Lost);
         assert_eq!(tracks.tracks[0].keypoints_3d[16], None);
         assert_eq!(tracks.tracks[0].position, Some(people::Point { x_m: -0.25, y_m: 0.125, z_m: 2.5 }));
+    }
+
+    /// The people tracks fixture `name` with its odom_started_camera_ns column replaced.
+    fn people_tracks_with_odom_frame(name: &str, odom_started_camera_ns: Option<i64>) -> StructArray {
+        let golden = fixture(name);
+        let column = golden.column_by_name("odom_started_camera_ns").unwrap();
+        let replaced: ArrayRef = Arc::new(dora_node_api::arrow::array::Int64Array::from(vec![odom_started_camera_ns]));
+        assert_eq!(column.data_type(), replaced.data_type());
+        let columns = golden.fields().iter().zip(golden.columns()).map(|(field, column)| match field.name().as_str() {
+            "odom_started_camera_ns" => replaced.clone(),
+            _ => column.clone(),
+        });
+        StructArray::new(golden.fields().clone(), columns.collect(), None)
+    }
+
+    #[test]
+    fn people_tracks_whose_position_frame_and_odom_frame_disagree_are_rejected() {
+        let camera_with_odom_frame = people_tracks_with_odom_frame("people_tracks", Some(5));
+        let error = people::decode_people_tracks(&camera_with_odom_frame).unwrap_err();
+        assert!(format!("{error:#}").contains("camera frame carry an odom_started_camera_ns"), "{error:#}");
+        let odom_without_odom_frame = people_tracks_with_odom_frame("people_tracks_in_odom", None);
+        let error = people::decode_people_tracks(&odom_without_odom_frame).unwrap_err();
+        assert!(format!("{error:#}").contains("odom frame carry no odom_started_camera_ns"), "{error:#}");
     }
 
     #[test]
@@ -488,18 +514,18 @@ mod tests {
         let keyframe = decode_keyframe(&golden).unwrap();
         assert_eq!((keyframe.frame_id, keyframe.width, keyframe.height), (42, 3, 2));
         assert_eq!(&keyframe.depth_mm[..], &[0, 1200, 1210, 2450, 65535, 400]);
-        assert_eq!(keyframe.gravity_reaction, Vec3::new(-0.0625, -9.75, -0.375));
+        assert_eq!(keyframe.specific_force, Vec3::new(-0.0625, -9.75, -0.375));
         assert_eq!(keyframe.color_jpeg, vec![0xFF, 0xD8, 0xFF, 0xD9]);
         assert_eq!(encode_keyframe(&keyframe), golden);
     }
 
     #[test]
-    fn the_segments_fixture_decodes_and_encodes_back_to_itself() {
-        let golden = fixture("segments");
-        let segments = decode_segments(&golden).unwrap();
-        assert_eq!(segments.labels, vec!["sofa", "cushion"]);
-        assert_eq!(&segments.segment_ids[..], &[-1, 0, 0, 1, 0, -1]);
-        assert_eq!(encode_segments(&segments), golden);
+    fn the_instance_masks_fixture_decodes_and_encodes_back_to_itself() {
+        let golden = fixture("instance_masks");
+        let instance_masks = decode_instance_masks(&golden).unwrap();
+        assert_eq!(instance_masks.labels, vec!["sofa", "cushion"]);
+        assert_eq!(&instance_masks.instance_ids[..], &[-1, 0, 0, 1, 0, -1]);
+        assert_eq!(encode_instance_masks(&instance_masks), golden);
     }
 
     #[test]
@@ -534,7 +560,7 @@ mod tests {
             top_above_camera_m: -0.375,
             corners_m: [Vec2::new(0.0, 1.0), Vec2::new(1.75, 1.0), Vec2::new(1.75, 1.5), Vec2::new(0.0, 1.5)],
         };
-        let objects = [SceneObject { label: "sofa", segment_index: 0, score: 0.875, footprint: &sofa }];
+        let objects = [SceneObject { label: "sofa", instance_index: 0, score: 0.875, footprint: &sofa }];
         let scene = Scene {
             frame_id: 42,
             captured_unix_ns: 1_762_560_000_123_456_789,

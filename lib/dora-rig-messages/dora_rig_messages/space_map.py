@@ -5,6 +5,7 @@ Coordinates are the map frame: z up, gravity aligned, metres. Heights are above 
 
 import math
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any, NewType
 
 import numpy as np
@@ -14,8 +15,18 @@ from .navigation import MapVersion, ObjectId, PlaceId, RoomId
 from .wire import one_row, only_row
 
 DoorwayId = NewType("DoorwayId", int)
+# The number of a mesh_blocks message within one run of the dense map.
+MeshSequence = NewType("MeshSequence", int)
 
-# A free_space cell's clearance: 0 is occupied, this is unknown, anything between is millimetres to the nearest
+
+class MeshBlocksKind(Enum):
+    # The blocks whose surface changed since the last message, each with its whole new surface; a mesh block without
+    # triangles says its block has no surface now.
+    CHANGES = "changes"
+    # Every block that has surface, each with its whole surface: it replaces every block the receiver holds.
+    SNAPSHOT = "snapshot"
+
+# A occupancy_grid cell's clearance: 0 is occupied, this is unknown, anything between is millimetres to the nearest
 # occupied cell.
 OCCUPIED_MM = 0
 UNKNOWN_MM = 65535
@@ -27,7 +38,7 @@ def _items(item_type: pa.DataType) -> pa.ListType:
 
 POINT_TYPE = pa.struct([("x_m", pa.float32()), ("y_m", pa.float32())])
 
-FREE_SPACE_TYPE = pa.struct(
+OCCUPANCY_GRID_TYPE = pa.struct(
     [
         ("map_version", pa.uint64()),
         ("built_unix_ns", pa.int64()),
@@ -109,9 +120,9 @@ ZONE_TYPE = pa.struct(
 
 KEEP_OUT_TYPE = pa.struct([("map_version", pa.uint64()), ("zones", _items(ZONE_TYPE))])
 
-SURFACE_PATCH_TYPE = pa.struct(
+MESH_BLOCK_TYPE = pa.struct(
     [
-        # The block of the dense map the patch covers: block (x, y, z) spans [x, x + 1) * block_voxels * voxel_m
+        # The block of the dense map the mesh block covers: block (x, y, z) spans [x, x + 1) * block_voxels * voxel_m
         # along x, and likewise along y and z.
         ("block_x", pa.int32()),
         ("block_y", pa.int32()),
@@ -123,15 +134,26 @@ SURFACE_PATCH_TYPE = pa.struct(
     ]
 )
 
-SURFACE_PATCHES_TYPE = pa.struct(
+MESH_BLOCKS_TYPE = pa.struct(
     [
         ("map_version", pa.uint64()),
         ("built_unix_ns", pa.int64()),
+        # When the dense map that sent the message started: a later value is a new run whose blocks replace every
+        # block of the last.
+        ("run_started_unix_ns", pa.int64()),
+        # Counts the run's messages from 0, one up per message, snapshots included, so a receiver sees when it
+        # missed one.
+        ("sequence", pa.uint64()),
+        # "changes" or "snapshot" (MeshBlocksKind).
+        ("kind", pa.string()),
         ("voxel_m", pa.float32()),
         ("block_voxels", pa.uint32()),
-        ("patches", _items(SURFACE_PATCH_TYPE)),
+        ("blocks", _items(MESH_BLOCK_TYPE)),
     ]
 )
+
+# A receiver of mesh_blocks asking the dense map for a snapshot, because it missed a message or joined late.
+MESH_SNAPSHOT_REQUEST_TYPE = pa.struct([("requested_unix_ns", pa.int64())])
 
 
 @dataclass(frozen=True)
@@ -153,7 +175,7 @@ def _polygon(points: tuple[Point, ...], owner: str) -> None:
 
 
 @dataclass(frozen=True, eq=False)
-class FreeSpace:
+class OccupancyGrid:
     """Which floor cells the robot can occupy, sliced through a height band above the floor."""
 
     map_version: MapVersion
@@ -198,28 +220,28 @@ class FreeSpace:
                 pa.array([0, len(flat)], pa.int32()), flat, type=_items(pa.uint16())
             ),
         }
-        return pa.StructArray.from_arrays(list(columns.values()), fields=list(FREE_SPACE_TYPE))
+        return pa.StructArray.from_arrays(list(columns.values()), fields=list(OCCUPANCY_GRID_TYPE))
 
     def __eq__(self, other: object) -> bool:
         scalars = ("map_version", "built_unix_ns", "origin_x_m", "origin_y_m", "resolution_m", "band_min_m", "band_max_m")
         return (
-            isinstance(other, FreeSpace)
+            isinstance(other, OccupancyGrid)
             and all(getattr(self, name) == getattr(other, name) for name in scalars)
             and np.array_equal(self.clearance_mm, other.clearance_mm)
         )
 
     @classmethod
-    def from_arrow(cls, array: pa.Array) -> "FreeSpace":
-        if array.type != FREE_SPACE_TYPE:
-            raise ValueError(f"expected wire type {FREE_SPACE_TYPE}, received {array.type}")
+    def from_arrow(cls, array: pa.Array) -> "OccupancyGrid":
+        if array.type != OCCUPANCY_GRID_TYPE:
+            raise ValueError(f"expected wire type {OCCUPANCY_GRID_TYPE}, received {array.type}")
         if len(array) != 1:
-            raise ValueError(f"expected one row of {FREE_SPACE_TYPE}, received {len(array)}")
+            raise ValueError(f"expected one row of {OCCUPANCY_GRID_TYPE}, received {len(array)}")
         scalar = lambda name: array.field(name)[0].as_py()  # noqa: E731
         width, height = scalar("width"), scalar("height")
         column = array.field("clearance_mm")
         clearance = column.values[column.offsets[0].as_py() : column.offsets[1].as_py()].to_numpy(zero_copy_only=False)
         if clearance.size != width * height:
-            raise ValueError(f"free space has {clearance.size} cells for {width}x{height}")
+            raise ValueError(f"occupancy grid has {clearance.size} cells for {width}x{height}")
         return cls(
             map_version=MapVersion(scalar("map_version")),
             built_unix_ns=scalar("built_unix_ns"),
@@ -413,8 +435,8 @@ class KeepOut:
 
 
 @dataclass(frozen=True)
-class SurfacePatch:
-    """The dense map's surface inside one block; a patch without triangles says the block has no surface now."""
+class MeshBlock:
+    """The dense map's surface inside one block; a mesh block without triangles says the block has no surface now."""
 
     block: tuple[int, int, int]
     positions_m: tuple[float, ...]
@@ -430,32 +452,47 @@ class SurfacePatch:
 
 
 @dataclass(frozen=True)
-class SurfacePatches:
-    """The blocks of the dense map whose surface changed since the last message, each with its whole new surface."""
+class MeshBlocks:
+    """The dense map's surface, block by block: the blocks whose surface changed since the last message, or, in a
+    snapshot, every block that has surface, replacing every block the receiver holds.
+
+    The messages of one run of the dense map share `run_started_unix_ns` and number from `sequence` 0 up by one,
+    snapshots included, so a receiver that sees a gap in the sequence knows it missed blocks.
+    """
 
     map_version: MapVersion
     built_unix_ns: int
+    run_started_unix_ns: int
+    sequence: MeshSequence
+    kind: MeshBlocksKind
     voxel_m: float
     block_voxels: int
-    patches: tuple[SurfacePatch, ...]
+    blocks: tuple[MeshBlock, ...]
 
     def __post_init__(self) -> None:
         if not (math.isfinite(self.voxel_m) and self.voxel_m > 0.0):
             raise ValueError(f"voxel_m is {self.voxel_m}, expected a finite value above 0")
         if self.block_voxels < 1:
             raise ValueError(f"block_voxels is {self.block_voxels}, expected at least 1")
-        blocks = [patch.block for patch in self.patches]
+        blocks = [mesh_block.block for mesh_block in self.blocks]
         if len(set(blocks)) != len(blocks):
-            raise ValueError("a block has more than one patch")
+            raise ValueError("a block has more than one mesh block")
+        if self.kind is MeshBlocksKind.SNAPSHOT:
+            empty = [mesh_block.block for mesh_block in self.blocks if not mesh_block.triangles]
+            if empty:
+                raise ValueError(f"a snapshot holds only blocks with surface; block {empty[0]} has none")
 
     def to_arrow(self) -> pa.Array:
         return one_row(
             {
                 "map_version": self.map_version,
                 "built_unix_ns": self.built_unix_ns,
+                "run_started_unix_ns": self.run_started_unix_ns,
+                "sequence": self.sequence,
+                "kind": self.kind.value,
                 "voxel_m": self.voxel_m,
                 "block_voxels": self.block_voxels,
-                "patches": [
+                "blocks": [
                     {
                         "block_x": p.block[0],
                         "block_y": p.block[1],
@@ -463,25 +500,42 @@ class SurfacePatches:
                         "positions_m": list(p.positions_m),
                         "triangles": list(p.triangles),
                     }
-                    for p in self.patches
+                    for p in self.blocks
                 ],
             },
-            SURFACE_PATCHES_TYPE,
+            MESH_BLOCKS_TYPE,
         )
 
     @classmethod
-    def from_arrow(cls, array: pa.Array) -> "SurfacePatches":
-        row = only_row(array, SURFACE_PATCHES_TYPE)
+    def from_arrow(cls, array: pa.Array) -> "MeshBlocks":
+        row = only_row(array, MESH_BLOCKS_TYPE)
         return cls(
             map_version=MapVersion(row["map_version"]),
             built_unix_ns=row["built_unix_ns"],
+            run_started_unix_ns=row["run_started_unix_ns"],
+            sequence=MeshSequence(row["sequence"]),
+            kind=MeshBlocksKind(row["kind"]),
             voxel_m=row["voxel_m"],
             block_voxels=row["block_voxels"],
-            patches=tuple(
-                SurfacePatch((p["block_x"], p["block_y"], p["block_z"]), tuple(p["positions_m"]), tuple(p["triangles"]))
-                for p in row["patches"]
+            blocks=tuple(
+                MeshBlock((p["block_x"], p["block_y"], p["block_z"]), tuple(p["positions_m"]), tuple(p["triangles"]))
+                for p in row["blocks"]
             ),
         )
+
+
+@dataclass(frozen=True)
+class MeshSnapshotRequest:
+    """Asks the dense map to send its whole surface as the next mesh_blocks message, a snapshot."""
+
+    requested_unix_ns: int
+
+    def to_arrow(self) -> pa.Array:
+        return one_row({"requested_unix_ns": self.requested_unix_ns}, MESH_SNAPSHOT_REQUEST_TYPE)
+
+    @classmethod
+    def from_arrow(cls, array: pa.Array) -> "MeshSnapshotRequest":
+        return cls(requested_unix_ns=only_row(array, MESH_SNAPSHOT_REQUEST_TYPE)["requested_unix_ns"])
 
 
 def _square(x_m: float, y_m: float, side_m: float) -> tuple[Point, ...]:
@@ -490,7 +544,7 @@ def _square(x_m: float, y_m: float, side_m: float) -> tuple[Point, ...]:
 
 # Golden examples of this module's messages, merged into fixtures.EXAMPLES. Every float is exact in float32.
 FIXTURE_EXAMPLES: dict[str, Any] = {
-    "free_space": FreeSpace(
+    "occupancy_grid": OccupancyGrid(
         map_version=MapVersion(412),
         built_unix_ns=1_762_560_002_000_000_000,
         origin_x_m=-1.25,
@@ -523,20 +577,40 @@ FIXTURE_EXAMPLES: dict[str, Any] = {
         zones=(KeepOutZone(ObjectId(42), "glass door", _square(4.0, 1.0, 1.0), margin_m=0.25),),
     ),
     "keep_out_empty": KeepOut(map_version=MapVersion(413), zones=()),
-    "surface_patches": SurfacePatches(
+    "mesh_blocks": MeshBlocks(
         map_version=MapVersion(412),
         built_unix_ns=1_762_560_003_000_000_000,
+        run_started_unix_ns=1_762_559_990_000_000_000,
+        sequence=MeshSequence(17),
+        kind=MeshBlocksKind.CHANGES,
         voxel_m=0.0625,
         block_voxels=8,
-        patches=(
+        blocks=(
             # A square of floor in block (0, 1, -1), facing up.
-            SurfacePatch(
+            MeshBlock(
                 (0, 1, -1),
                 (0.0, 0.5, -0.125, 0.25, 0.5, -0.125, 0.25, 0.75, -0.125, 0.0, 0.75, -0.125),
                 (0, 1, 2, 0, 2, 3),
             ),
             # Block (2, 0, 0) had surface and has none now.
-            SurfacePatch((2, 0, 0), (), ()),
+            MeshBlock((2, 0, 0), (), ()),
         ),
     ),
+    "mesh_blocks_snapshot": MeshBlocks(
+        map_version=MapVersion(413),
+        built_unix_ns=1_762_560_004_000_000_000,
+        run_started_unix_ns=1_762_559_990_000_000_000,
+        sequence=MeshSequence(18),
+        kind=MeshBlocksKind.SNAPSHOT,
+        voxel_m=0.0625,
+        block_voxels=8,
+        blocks=(
+            MeshBlock(
+                (0, 1, -1),
+                (0.0, 0.5, -0.125, 0.25, 0.5, -0.125, 0.25, 0.75, -0.125, 0.0, 0.75, -0.125),
+                (0, 1, 2, 0, 2, 3),
+            ),
+        ),
+    ),
+    "mesh_snapshot_request": MeshSnapshotRequest(requested_unix_ns=1_762_560_003_500_000_000),
 }

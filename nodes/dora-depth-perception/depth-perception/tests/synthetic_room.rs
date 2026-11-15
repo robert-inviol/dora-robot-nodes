@@ -13,7 +13,7 @@ struct Analysed {
 fn analyse() -> Analysed {
     let scene = SyntheticRoom::living_room();
     let frame = scene.render();
-    let floor = FloorFrame::from_gravity_reaction(frame.accel_camera);
+    let floor = FloorFrame::from_specific_force(frame.accel_camera);
     let depth = DepthImage::new(scene.width, scene.height, &frame.depth_m);
     let cloud = sample_point_cloud(&depth, &scene.intrinsics, &floor, RangeLimits::D455, 2);
     let fit = find_planes(&cloud.points, &PlaneSettings::default());

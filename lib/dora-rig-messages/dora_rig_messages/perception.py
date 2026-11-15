@@ -1,4 +1,4 @@
-"""What a depth camera sees and what perception makes of it: keyframes, IMU samples, object concepts, segments, scenes.
+"""What a depth camera sees and what perception makes of it: keyframes, IMU samples, open-vocabulary labels, instance masks, scenes.
 
 Images travel as one flat list per row, row major. Coordinates in a scene are the gravity-aligned floor
 frame at the camera: x right, y forward, z up, metres.
@@ -57,7 +57,7 @@ KEYFRAME_TYPE = pa.struct(
         ("ppx", pa.float32()),
         ("ppy", pa.float32()),
         # The accelerometer at rest, in camera coordinates (x right, y down, z forward): the reaction to gravity.
-        ("gravity_reaction", _items(pa.float32())),
+        ("specific_force", _items(pa.float32())),
         # Aligned to the colour image; 0 where the sensor has no reading.
         ("depth_mm", _items(pa.uint16())),
         ("color_jpeg", pa.binary()),
@@ -70,7 +70,7 @@ class Keyframe:
     frame_id: int
     captured_unix_ns: int
     intrinsics: CameraIntrinsics
-    gravity_reaction: tuple[float, float, float]
+    specific_force: tuple[float, float, float]
     depth_mm: np.ndarray
     color_jpeg: bytes
 
@@ -93,7 +93,7 @@ class Keyframe:
             "fy": pa.array([k.fy], pa.float32()),
             "ppx": pa.array([k.ppx], pa.float32()),
             "ppy": pa.array([k.ppy], pa.float32()),
-            "gravity_reaction": _one_list(list(self.gravity_reaction), pa.float32()),
+            "specific_force": _one_list(list(self.specific_force), pa.float32()),
             "depth_mm": _one_list(self.depth_mm.astype(np.uint16, copy=False), pa.uint16()),
             "color_jpeg": pa.array([self.color_jpeg], pa.binary()),
         }
@@ -102,8 +102,8 @@ class Keyframe:
     def __eq__(self, other: object) -> bool:
         return (
             isinstance(other, Keyframe)
-            and (self.frame_id, self.captured_unix_ns, self.intrinsics, self.gravity_reaction, self.color_jpeg)
-            == (other.frame_id, other.captured_unix_ns, other.intrinsics, other.gravity_reaction, other.color_jpeg)
+            and (self.frame_id, self.captured_unix_ns, self.intrinsics, self.specific_force, self.color_jpeg)
+            == (other.frame_id, other.captured_unix_ns, other.intrinsics, other.specific_force, other.color_jpeg)
             and np.array_equal(self.depth_mm, other.depth_mm)
         )
 
@@ -114,14 +114,14 @@ class Keyframe:
         depth = _list_values(row, "depth_mm")
         if depth.size != width * height:
             raise ValueError(f"keyframe depth has {depth.size} values for {width}x{height}")
-        gravity = _list_values(row, "gravity_reaction")
+        gravity = _list_values(row, "specific_force")
         if gravity.size != 3:
-            raise ValueError(f"keyframe gravity reaction has {gravity.size} values, not 3")
+            raise ValueError(f"keyframe specific force has {gravity.size} values, not 3")
         return cls(
             frame_id=_scalar(row, "frame_id"),
             captured_unix_ns=_scalar(row, "captured_unix_ns"),
             intrinsics=CameraIntrinsics(*(_scalar(row, f) for f in ("fx", "fy", "ppx", "ppy"))),
-            gravity_reaction=tuple(float(g) for g in gravity),
+            specific_force=tuple(float(g) for g in gravity),
             depth_mm=depth.reshape(height, width),
             color_jpeg=_scalar(row, "color_jpeg"),
         )
@@ -200,13 +200,13 @@ class Imu:
         )
 
 
-CONCEPTS_TYPE = pa.struct(
+LABELS_TYPE = pa.struct(
     [
         ("model", pa.string()),
         # The keyframe the model looked at.
         ("frame_id", pa.uint64()),
         # Short noun phrases, one per object type, in the order the model named them.
-        ("concepts", _items(pa.string())),
+        ("labels", _items(pa.string())),
         # False while the model is still naming more.
         ("complete", pa.bool_()),
     ]
@@ -214,27 +214,27 @@ CONCEPTS_TYPE = pa.struct(
 
 
 @dataclass(frozen=True)
-class Concepts:
+class Labels:
     model: str
     frame_id: int
-    concepts: tuple[str, ...]
+    labels: tuple[str, ...]
     complete: bool
 
     def to_arrow(self) -> pa.Array:
         return pa.array(
-            [{"model": self.model, "frame_id": self.frame_id, "concepts": list(self.concepts), "complete": self.complete}],
-            type=CONCEPTS_TYPE,
+            [{"model": self.model, "frame_id": self.frame_id, "labels": list(self.labels), "complete": self.complete}],
+            type=LABELS_TYPE,
         )
 
     @classmethod
-    def from_arrow(cls, array: pa.Array) -> "Concepts":
-        row = _check(array, CONCEPTS_TYPE)[0].as_py()
-        return cls(row["model"], row["frame_id"], tuple(row["concepts"]), row["complete"])
+    def from_arrow(cls, array: pa.Array) -> "Labels":
+        row = _check(array, LABELS_TYPE)[0].as_py()
+        return cls(row["model"], row["frame_id"], tuple(row["labels"]), row["complete"])
 
 
-NO_SEGMENT = -1
+NO_INSTANCE = -1
 
-SEGMENTS_TYPE = pa.struct(
+INSTANCE_MASKS_TYPE = pa.struct(
     [
         ("frame_id", pa.uint64()),
         ("width", pa.uint16()),
@@ -242,46 +242,46 @@ SEGMENTS_TYPE = pa.struct(
         ("labels", _items(pa.string())),
         ("scores", _items(pa.float32())),
         # Per pixel, the index into labels, or -1; where masks overlap the smaller one wins.
-        ("segment_ids", _items(pa.int16())),
+        ("instance_ids", _items(pa.int16())),
     ]
 )
 
 
 @dataclass(frozen=True, eq=False)
-class Segments:
+class InstanceMasks:
     frame_id: int
     labels: tuple[str, ...]
     scores: tuple[float, ...]
-    segment_ids: np.ndarray
+    instance_ids: np.ndarray
 
     def to_arrow(self) -> pa.Array:
-        height, width = self.segment_ids.shape
+        height, width = self.instance_ids.shape
         columns = [
             pa.array([self.frame_id], pa.uint64()),
             pa.array([width], pa.uint16()),
             pa.array([height], pa.uint16()),
             _one_list(list(self.labels), pa.string()),
             _one_list(list(self.scores), pa.float32()),
-            _one_list(self.segment_ids.astype(np.int16, copy=False), pa.int16()),
+            _one_list(self.instance_ids.astype(np.int16, copy=False), pa.int16()),
         ]
-        return pa.StructArray.from_arrays(columns, fields=list(SEGMENTS_TYPE))
+        return pa.StructArray.from_arrays(columns, fields=list(INSTANCE_MASKS_TYPE))
 
     def __eq__(self, other: object) -> bool:
         return (
-            isinstance(other, Segments)
+            isinstance(other, InstanceMasks)
             and (self.frame_id, self.labels, self.scores) == (other.frame_id, other.labels, other.scores)
-            and np.array_equal(self.segment_ids, other.segment_ids)
+            and np.array_equal(self.instance_ids, other.instance_ids)
         )
 
     @classmethod
-    def from_arrow(cls, array: pa.Array) -> "Segments":
-        row = _check(array, SEGMENTS_TYPE)
+    def from_arrow(cls, array: pa.Array) -> "InstanceMasks":
+        row = _check(array, INSTANCE_MASKS_TYPE)
         width, height = _scalar(row, "width"), _scalar(row, "height")
         labels = tuple(row.field("labels")[0].as_py())
         scores = tuple(float(s) for s in _list_values(row, "scores"))
         if len(labels) != len(scores):
-            raise ValueError(f"segments have {len(labels)} labels for {len(scores)} scores")
-        return cls(_scalar(row, "frame_id"), labels, scores, _list_values(row, "segment_ids").reshape(height, width))
+            raise ValueError(f"instance masks have {len(labels)} labels for {len(scores)} scores")
+        return cls(_scalar(row, "frame_id"), labels, scores, _list_values(row, "instance_ids").reshape(height, width))
 
 
 class SurfaceKind(str, Enum):
@@ -317,8 +317,8 @@ ROOM_TYPE = pa.struct(
 SCENE_OBJECT_TYPE = pa.struct(
     [
         ("label", pa.string()),
-        # Index into the labels of the segments message this object came from.
-        ("segment_index", pa.uint16()),
+        # Index into the labels of the instance masks message this object came from.
+        ("instance_index", pa.uint16()),
         ("score", pa.float32()),
         ("point_count", pa.uint32()),
         # Median depth along the optical axis.
@@ -342,7 +342,7 @@ SCENE_TYPE = pa.struct(
         # Null when the room cannot be bounded; room_problem then says why.
         ("room", ROOM_TYPE),
         ("room_problem", pa.string()),
-        # Only the segments with enough depth for a footprint.
+        # Only the instance masks with enough depth for a footprint.
         ("objects", pa.list_(pa.field("item", SCENE_OBJECT_TYPE, nullable=False))),
     ]
 )
@@ -368,7 +368,7 @@ class Room:
 @dataclass(frozen=True)
 class SceneObject:
     label: str
-    segment_index: int
+    instance_index: int
     score: float
     point_count: int
     distance_m: float
@@ -415,7 +415,7 @@ class Scene:
             },
             "room_problem": self.room_problem,
             "objects": [
-                {"label": o.label, "segment_index": o.segment_index, "score": o.score, "point_count": o.point_count, "distance_m": o.distance_m,
+                {"label": o.label, "instance_index": o.instance_index, "score": o.score, "point_count": o.point_count, "distance_m": o.distance_m,
                  "footprint_long_m": o.footprint_long_m, "footprint_short_m": o.footprint_short_m, "height_m": o.height_m,
                  "top_m": o.top_m, "corners_m": [c for corner in o.corners_m for c in corner]}
                 for o in self.objects
@@ -439,7 +439,7 @@ class Scene:
             room=None if room is None else Room(room["floor_m"], room["ceiling_m"], _pairs(room["footprint_m"], 2), tuple(room["edge_seen"])),
             room_problem=row["room_problem"],
             objects=tuple(
-                SceneObject(o["label"], o["segment_index"], o["score"], o["point_count"], o["distance_m"], o["footprint_long_m"],
+                SceneObject(o["label"], o["instance_index"], o["score"], o["point_count"], o["distance_m"], o["footprint_long_m"],
                             o["footprint_short_m"], o["height_m"], o["top_m"], _pairs(o["corners_m"], 2))
                 for o in row["objects"]
             ),

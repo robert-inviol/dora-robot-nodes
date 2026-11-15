@@ -1,4 +1,5 @@
-//! Keyframes, their poses and object updates in; free space, topology, keep-out zones and surface patches out.
+//! Keyframes, their poses, posed depth frames, the localizer's correction and object updates in; the occupancy grid, topology,
+//! keep-out zones and mesh blocks out.
 
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -16,7 +17,7 @@ fn unix_now() -> Result<UnixNanos> {
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt().with_env_filter(EnvFilter::from_default_env()).with_writer(std::io::stderr).init();
-    let mut dense_map = DenseMapNode::new(settings_from_environment()?)?;
+    let mut dense_map = DenseMapNode::new(settings_from_environment()?, unix_now()?)?;
     let (mut node, mut events) = DoraNode::init_from_env()?;
     while let Some(event) = events.recv() {
         match event {

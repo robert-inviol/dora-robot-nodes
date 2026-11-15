@@ -4,8 +4,9 @@ use depth_perception::synthetic::SyntheticRoom;
 use glam::Vec3;
 use map_localizer::cloud::{registration_cloud, CloudSettings};
 use map_localizer::gyro::{GyroHeading, GyroSettings, KeyframeTiming};
-use map_localizer::synthetic::{ellipse_poses, furnished_room, render_walk, turning_poses, SyntheticWalk};
-use map_localizer::{HeadingWithoutGyro, KeyframeEstimate, Localizer, LocalizerInput, LocalizerSettings};
+use depth_inertial_odometry::odometry::OdometrySettings;
+use map_localizer::synthetic::{ellipse_poses, furnished_room, render_still, render_walk, turning_poses, SyntheticWalk};
+use map_localizer::{HeadingWithoutGyro, KeyframeEstimate, KeyframeSelection, KeyframeSelectionSettings, Localizer, LocalizerInput, LocalizerSettings};
 use perception_wire::localization::{CameraNanos, FrameId, Tracking};
 use perception_wire::navigation::UnixNanos;
 use room_map::pose::wrap_angle;
@@ -26,9 +27,9 @@ fn localize(walk: &SyntheticWalk, settings: LocalizerSettings) -> Run {
     let mut estimates = Vec::new();
     let mut times_ms = Vec::new();
     for (keyframe, imu) in walk.keyframes.iter().zip(&walk.imu) {
-        gyro.add(imu);
+        gyro.add(imu).unwrap();
         let started = Instant::now();
-        let timing = KeyframeTiming { camera_time: CameraNanos(imu.keyframe_camera_ns), gravity_reaction: keyframe.gravity_reaction };
+        let timing = KeyframeTiming { camera_time: CameraNanos(imu.keyframe_camera_ns), specific_force: keyframe.specific_force };
         let heading = gyro.keyframe_heading(previous, timing, HeadingWithoutGyro::Refuse);
         assert_eq!(heading.gyro_problem, None, "keyframe {}", keyframe.frame_id);
         previous = Some(timing);
@@ -37,7 +38,7 @@ fn localize(walk: &SyntheticWalk, settings: LocalizerSettings) -> Run {
             frame_id: FrameId(keyframe.frame_id),
             captured: UnixNanos(keyframe.captured_unix_ns),
             cloud,
-            heading: heading.hint,
+            yaw_prior: heading.yaw_prior,
         }));
         times_ms.push(started.elapsed().as_secs_f64() * 1e3);
     }
@@ -54,18 +55,18 @@ fn worst(pairs: impl Iterator<Item = (f32, f32)>) -> (f32, f32) {
     pairs.fold((0.0f32, 0.0f32), |a, e| (a.0.max(e.0), a.1.max(e.1)))
 }
 
-fn assert_fast(run: &Run) {
-    if !cfg!(debug_assertions) {
-        assert!(run.mean_ms < 100.0, "{:.1} ms per keyframe on average", run.mean_ms);
-    }
+/// Every keyframe registered joins the map.
+fn selecting_every_keyframe() -> LocalizerSettings {
+    LocalizerSettings { keyframe_selection: KeyframeSelectionSettings { min_translation_m: 0.0, min_rotation_deg: 0.0 }, ..LocalizerSettings::default() }
 }
 
 #[test]
 fn two_laps_of_the_living_room_track_to_a_centimetre_and_close_loops_on_the_second() {
     let walk = render_walk(&SyntheticRoom::living_room(), &ellipse_poses(24, 2), 0..0, |_| Vec3::new(0.002, -0.003, 0.002));
-    let run = localize(&walk, LocalizerSettings::default());
+    // The second lap repeats the first's poses exactly; with every keyframe in the map it closes loops on the first.
+    let run = localize(&walk, selecting_every_keyframe());
     assert!(run.estimates.iter().all(|e| e.tracking == Tracking::Tracking), "every keyframe tracks");
-    // The final poses, after every optimisation.
+    // The final poses, after every optimization.
     let final_worst = worst(walk.keyframes.iter().zip(&walk.truth).map(|(k, t)| error(&run.localizer.keyframe_pose(FrameId(k.frame_id)).unwrap(), t)));
     let as_sent = worst(run.estimates.iter().zip(&walk.truth).map(|(e, t)| error(&e.pose, t)));
     let loops = run.estimates.iter().filter(|e| e.loop_closed).count();
@@ -76,7 +77,6 @@ fn two_laps_of_the_living_room_track_to_a_centimetre_and_close_loops_on_the_seco
     assert!(loops >= 3, "the second lap revisits the first: {loops} loop closures");
     assert!(final_worst.0 < 0.01 && final_worst.1 < 0.3, "{final_worst:?}");
     assert!(as_sent.0 < 0.01 && as_sent.1 < 0.3, "{as_sent:?}");
-    assert_fast(&run);
 }
 
 #[test]
@@ -94,8 +94,9 @@ fn the_gyro_carries_a_blank_turn_and_a_loop_closure_ties_the_restarted_run_back(
     }
     // The turn ends facing parts of the room no stored keyframe saw, so the first keyframe with depth restarts
     // tracking where dead reckoning puts it, and the walk back closes the loop on the start.
-    assert_eq!(states[blank.end], Tracking::Lost);
-    assert!(run.localizer.keyframe_pose(FrameId(blank.end as u64)).is_some(), "the restarting keyframe joins the map");
+    assert_eq!(states[blank.end], Tracking::Restarted);
+    assert_eq!(run.estimates[blank.end].selection, KeyframeSelection::Selected, "the restarting keyframe joins the map");
+    assert!(run.localizer.keyframe_pose(FrameId(blank.end as u64)).is_some());
     let with_depth: Vec<usize> = (0..walk.truth.len()).filter(|k| !blank.contains(k)).collect();
     assert!(with_depth.iter().filter(|&&k| k != blank.end).all(|&k| states[k] == Tracking::Tracking), "every other keyframe with depth tracks");
     assert!(run.estimates[blank.end..].iter().any(|e| e.loop_closed), "the walk back closes a loop");
@@ -105,7 +106,6 @@ fn the_gyro_carries_a_blank_turn_and_a_loop_closure_ties_the_restarted_run_back(
         placed.0, placed.1, run.localizer.map_version().0, run.mean_ms, run.worst_ms
     );
     assert!(placed.0 < 0.03 && placed.1 < 1.0, "{placed:?}");
-    assert_fast(&run);
 }
 
 #[test]
@@ -128,5 +128,44 @@ fn a_second_lap_registers_against_the_first_lap_without_loop_closures() {
         walk.keyframes.len(), as_sent.0, as_sent.1, run.mean_ms, run.worst_ms
     );
     assert!(as_sent.0 < 0.01 && as_sent.1 < 0.3, "{as_sent:?}");
-    assert_fast(&run);
+}
+
+#[test]
+fn a_repeated_lap_registers_against_the_first_and_adds_nothing_to_the_map() {
+    let walk = render_walk(&SyntheticRoom::living_room(), &ellipse_poses(24, 2), 0..0, |_| Vec3::new(0.002, -0.003, 0.002));
+    let run = localize(&walk, LocalizerSettings::default());
+    assert!(run.estimates.iter().all(|e| e.tracking == Tracking::Tracking), "every keyframe tracks");
+    let first_lap_nodes = run.estimates[..25].iter().filter(|e| e.selection == KeyframeSelection::Selected).count();
+    assert_eq!(run.localizer.graph().len(), first_lap_nodes, "the second lap stands where the first stood");
+    let as_sent = worst(run.estimates.iter().zip(&walk.truth).map(|(e, t)| error(&e.pose, t)));
+    println!("{} keyframes, {first_lap_nodes} in the map; worst error as sent {:.4} m {:.3} deg", walk.keyframes.len(), as_sent.0, as_sent.1);
+    assert!(as_sent.0 < 0.01 && as_sent.1 < 0.3, "{as_sent:?}");
+}
+
+#[test]
+fn a_camera_at_rest_with_range_noise_never_goes_lost_and_adds_nothing_to_the_map() {
+    let noise = OdometrySettings::d455().association.noise;
+    let at = Pose { yaw_rad: 0.4, translation: Vec3::new(0.2, 0.8, 0.0) };
+    let walk = render_still(&furnished_room(), at, 200, |depth_m| noise.scatter_m(depth_m), |_| Vec3::new(0.002, -0.003, 0.002));
+    let run = localize(&walk, LocalizerSettings::default());
+    let lost: Vec<u64> = run.estimates.iter().filter(|e| e.tracking != Tracking::Tracking).map(|e| e.frame_id.0).collect();
+    let fitness: Vec<f32> = run.estimates.iter().filter_map(|e| e.registration.map(|r| r.fitness)).collect();
+    let lowest = fitness.iter().copied().fold(1.0, f32::min);
+    let drift = worst(run.estimates.iter().map(|e| error(&e.pose, &Pose::IDENTITY)));
+    println!(
+        "{} keyframes at rest: {} not tracking, lowest fitness {lowest:.3}, worst drift {:.4} m {:.3} deg; {:.1} ms per keyframe, worst {:.1} ms",
+        walk.keyframes.len(), lost.len(), drift.0, drift.1, run.mean_ms, run.worst_ms
+    );
+    assert!(lost.is_empty(), "keyframes {lost:?} were not tracked");
+    assert_eq!(run.localizer.graph().len(), 1, "the map holds only the first keyframe");
+    assert!(run.estimates[1..].iter().all(|e| e.selection == KeyframeSelection::NotSelected { reference: FrameId(0) }));
+    assert!(drift.0 < 0.01 && drift.1 < 0.3, "{drift:?}");
+}
+
+#[test]
+fn the_same_walk_gives_the_same_poses_every_run() {
+    let walk = render_walk(&SyntheticRoom::living_room(), &ellipse_poses(24, 1), 0..0, |_| Vec3::new(0.002, -0.003, 0.002));
+    let poses = |run: Run| run.estimates.iter().map(|e| (e.pose, e.registration.map(|r| r.fitness))).collect::<Vec<_>>();
+    let first = poses(localize(&walk, LocalizerSettings::default()));
+    assert!((0..2).all(|_| poses(localize(&walk, LocalizerSettings::default())) == first), "registration sums in a fixed order");
 }

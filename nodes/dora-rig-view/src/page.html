@@ -18,7 +18,10 @@
   .row label { flex: 1; }
   button { background: #1f2630; color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 5px 9px; cursor: pointer; font: inherit; }
   button:hover { border-color: var(--accent); }
-  .stats { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; margin: 4px 0 8px; }
+  .stats { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; margin: 4px 0 8px; white-space: pre-line; }
+  #health { position: fixed; right: 12px; bottom: 12px; background: var(--panel); border: 1px solid var(--line); border-radius: 6px;
+            padding: 4px 8px; color: var(--muted); font: 11px/1.45 ui-monospace, monospace; white-space: pre; pointer-events: none; }
+  #health .late { color: var(--warn); }
   #notices div { color: var(--warn); font-size: 12px; margin: 4px 0; }
   .help { color: var(--muted); font-size: 12px; margin: 8px 0 0; }
   .help kbd { background: #222a33; border: 1px solid var(--line); border-radius: 3px; padding: 0 4px; font-size: 11px; }
@@ -36,6 +39,7 @@
 <body>
 <div id="view"></div>
 <div id="tags"></div>
+<div id="health" title="What this page receives">people -/s</div>
 <div id="panel">
   <button id="toggle">Panel</button>
   <h1><span id="link"></span>Rig view</h1>
@@ -62,8 +66,8 @@
 </div>
 <script type="importmap">
 { "imports": {
-  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
-  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+  "three": "./three/three.module.js",
+  "three/addons/": "./three/addons/"
 } }
 </script>
 <script type="module">
@@ -73,7 +77,7 @@ import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 // The map frame is z up, so the page is too.
 THREE.Object3D.DEFAULT_UP.set(0, 0, 1);
 const CLOUD_MESSAGE = 1;
-const CARVE_MESSAGE = 3;
+const SPACE_CARVING_MESSAGE = 3;
 const SURFACE_MESSAGE = 2;
 const MOVE_SPEED_M_PER_S = 1.5;
 const PATH_POINTS = 4000;
@@ -134,13 +138,13 @@ function dispose(group) {
   }
 }
 
-// Keyframe clouds, each in its own floor frame, placed by its pose. A pose can arrive before its cloud is decoded.
+// Keyframe clouds, each in its own floor frame, at its map pose. A pose can arrive before its cloud is decoded.
 const clouds = new Map();
 const poses = new Map();
-function placeCloud(frameId) {
+function poseCloud(frameId) {
   const cloud = clouds.get(frameId), pose = poses.get(frameId);
   if (!cloud) return;
-  cloud.visible = Boolean(pose && pose.placed);
+  cloud.visible = Boolean(pose && pose.drawn);
   if (pose) {
     cloud.position.set(pose.pose.x_m, pose.pose.y_m, pose.pose.z_m);
     cloud.rotation.set(0, 0, pose.pose.yaw_rad);
@@ -165,10 +169,10 @@ async function addCloud(compressed, generation) {
   removeCloud(frameId);
   clouds.set(frameId, points);
   layers.clouds.add(points);
-  placeCloud(frameId);
+  poseCloud(frameId);
 }
 // A later keyframe saw through these points, so whatever they were has moved away; they are no longer drawn.
-async function carveCloud(compressed, generation) {
+async function spaceCarveCloud(compressed, generation) {
   const stream = new Blob([compressed]).stream().pipeThrough(new DecompressionStream("gzip"));
   const body = new DataView(await new Response(stream).arrayBuffer());
   if (generation !== connection.generation) return;
@@ -228,10 +232,12 @@ function removeBlock(key) {
   mesh.geometry.dispose();
   blocks.delete(key);
 }
-async function addSurface(compressed, generation) {
+// `resets` is how many resets the page had taken when the message came: a surface message that came before a reset
+// is not drawn over what followed it.
+async function addSurface(compressed, generation, resets) {
   const stream = new Blob([compressed]).stream().pipeThrough(new DecompressionStream("gzip"));
   const body = new DataView(await new Response(stream).arrayBuffer());
-  if (generation !== connection.generation) return;
+  if (generation !== connection.generation || resets !== connection.resets) return;
   const voxelM = body.getFloat32(0, true), blockVoxels = body.getUint32(4, true), count = body.getUint32(8, true);
   blockM = voxelM * blockVoxels;
   let at = 12;
@@ -303,24 +309,24 @@ function addPathPoint(p) {
   pathGeometry.computeBoundingSphere();
 }
 // Hidden while the server says why it cannot place the robot; drawn once a pose has arrived.
-let robotHidden = false, robotPlaced = false;
+let robotHidden = false, robotPosed = false;
 const followLast = new THREE.Vector3();
 let followHas = false;
 function setRobot(update) {
   robot.position.fromArray(update.position);
   robot.quaternion.set(...update.orientation);
-  robotPlaced = true;
+  robotPosed = true;
   robot.visible = !robotHidden;
   addPathPoint(update.position);
 }
 
-// People: rebuilt from each frame, coloured by track; lost tracks are faded.
+// People: rebuilt from each frame, coloured by track; lost tracks, and tracks this frame gave no position, are faded.
 function setPeople(update) {
   dispose(layers.people);
   dropTags("person:");
   for (const track of update.tracks) {
     const color = hue(track.track_id);
-    const opacity = track.state === "confirmed" ? 1 : 0.35;
+    const opacity = track.state === "confirmed" && !track.stale ? 1 : 0.35;
     const bones = [];
     for (const [a, b] of BONES) {
       const p = track.joints[a], q = track.joints[b];
@@ -411,14 +417,14 @@ function setTopology(update) {
   }
 }
 
-// The planes and the room of the latest keyframe, in its floor frame, placed with its pose.
+// The planes and the room of the latest keyframe, in its floor frame, at its map pose.
 const PLANE_COLOURS = { "floor": 0xc9a66b, "ceiling": 0xe6e9ee, "wall": 0x7fb2e5, "level surface": 0x9fd38a };
-function setLayout(update) {
+function setRoomLayout(update) {
   dispose(layers.layout);
   const frame = new THREE.Group();
   frame.position.set(update.pose.x_m, update.pose.y_m, update.pose.z_m);
   frame.rotation.set(0, 0, update.pose.yaw_rad);
-  frame.visible = update.placed;
+  frame.visible = update.drawn;
   layers.layout.add(frame);
   const fan = ring => ring.slice(1, -1).flatMap((_, k) => [ring[0], ring[k + 1], ring[k + 2]]);
   for (const plane of update.planes) {
@@ -458,7 +464,7 @@ function setLayout(update) {
 const notices = new Map();
 function setNotice(update) {
   if (update.text) notices.set(update.topic, update.text); else notices.delete(update.topic);
-  if (update.topic === "robot") { robotHidden = Boolean(update.text); robot.visible = robotPlaced && !robotHidden; }
+  if (update.topic === "robot") { robotHidden = Boolean(update.text); robot.visible = robotPosed && !robotHidden; }
   document.getElementById("notices").replaceChildren(...[...notices].map(([topic, text]) => {
     const row = document.createElement("div");
     row.textContent = `${topic}: ${text}`;
@@ -466,12 +472,13 @@ function setNotice(update) {
   }));
 }
 
+// Forgets everything drawn but the keyframe clouds and their poses, which come apart from the scene and are cleared
+// when a connection opens.
 function reset() {
+  connection.resets++;
   for (const key of [...blocks.keys()]) removeBlock(key);
   objectCells.clear();
   objectVoxels.clear();
-  for (const frameId of [...clouds.keys()]) removeCloud(frameId);
-  poses.clear();
   for (const objectId of [...objects.keys()]) removeObject(objectId);
   dispose(layers.people);
   dispose(layers.rooms);
@@ -482,7 +489,7 @@ function reset() {
   pathGeometry.setDrawRange(0, 0);
   robot.visible = false;
   robotHidden = false;
-  robotPlaced = false;
+  robotPosed = false;
   followHas = false;
   notices.clear();
   document.getElementById("notices").replaceChildren();
@@ -491,25 +498,32 @@ function reset() {
 function onUpdate(update) {
   switch (update.type) {
     case "reset": return reset();
-    case "keyframe_pose": poses.set(update.frame_id, update); return placeCloud(update.frame_id);
+    case "keyframe_pose": poses.set(update.frame_id, update); return poseCloud(update.frame_id);
     case "keyframe_dropped": poses.delete(update.frame_id); return removeCloud(update.frame_id);
     case "robot": return setRobot(update);
     case "people": return setPeople(update);
     case "object": return setObject(update);
     case "object_gone": return removeObject(update.object_id);
     case "topology": return setTopology(update);
-    case "layout": return setLayout(update);
+    case "room_layout": return setRoomLayout(update);
     case "notice": return setNotice(update);
+    case "surface_stream": health.gaps = update.gaps; health.snapshots = update.snapshots; return;
     default: console.warn("unknown update", update);
   }
 }
 
 // One connection at a time; a new one starts from the server's snapshot, so the scene is cleared first.
-const connection = { generation: 0, bytes: 0, rateBytes: 0, socket: null, closedBecause: "" };
+const connection = { generation: 0, resets: 0, bytes: 0, rateBytes: 0, socket: null, closedBecause: "", failure: "" };
+// A message that fails leaves the scene wrong: the page says why and reconnects for a fresh scene.
+function fail(socket, reason) {
+  console.error(reason);
+  connection.failure = reason;
+  socket.close(4000);
+}
 // Binary messages decode asynchronously, so they are applied one after another in the order they came: a cloud
-// before its carving, and each surface patch over the one before.
+// before its carving, and each mesh block over the one before.
 let binaryQueue = Promise.resolve();
-const BINARY_HANDLERS = { [CLOUD_MESSAGE]: addCloud, [SURFACE_MESSAGE]: addSurface, [CARVE_MESSAGE]: carveCloud };
+const BINARY_HANDLERS = { [CLOUD_MESSAGE]: addCloud, [SURFACE_MESSAGE]: addSurface, [SPACE_CARVING_MESSAGE]: spaceCarveCloud };
 function showClouds() {
   return document.getElementById("clouds").checked;
 }
@@ -521,24 +535,32 @@ function connect() {
   socket.onopen = () => {
     document.getElementById("link").classList.add("up");
     connection.closedBecause = "";
+    for (const frameId of [...clouds.keys()]) removeCloud(frameId);
+    poses.clear();
     socket.send(JSON.stringify({ clouds: showClouds() }));
   };
   socket.onmessage = event => {
     if (generation !== connection.generation) return;
     if (typeof event.data === "string") {
       connection.bytes += event.data.length;
-      onUpdate(JSON.parse(event.data));
+      const update = JSON.parse(event.data);
+      if (update.type === "people") { health.people++; health.peopleAt = performance.now(); }
+      onUpdate(update);
       return;
     }
     connection.bytes += event.data.byteLength;
     const kind = new Uint8Array(event.data, 0, 1)[0];
     const handler = BINARY_HANDLERS[kind];
-    if (!handler) { console.warn("unknown binary message", kind); return; }
-    binaryQueue = binaryQueue.then(() => handler(event.data.slice(1), generation)).catch(e => console.error("binary message", kind, e));
+    if (!handler) { fail(socket, `a binary message of unknown kind ${kind} came`); return; }
+    if (kind === SURFACE_MESSAGE) health.surface++;
+    const resets = connection.resets;
+    binaryQueue = binaryQueue.then(() => handler(event.data.slice(1), generation, resets))
+      .catch(e => { if (generation === connection.generation) fail(socket, `a binary message of kind ${kind} did not decode: ${e}`); });
   };
   socket.onclose = event => {
     document.getElementById("link").classList.remove("up");
-    connection.closedBecause = event.reason || "disconnected";
+    connection.closedBecause = connection.failure || event.reason || "disconnected";
+    connection.failure = "";
     if (generation === connection.generation) setTimeout(connect, 1000);
   };
 }
@@ -549,10 +571,36 @@ setInterval(() => {
   connection.rateBytes = connection.bytes - lastBytes;
   lastBytes = connection.bytes;
   const status = connection.closedBecause ? `${connection.closedBecause}; retrying` :
-    `${blocks.size} surface blocks, ${clouds.size} keyframes, ${objects.size} objects<br>` +
+    `${blocks.size} surface blocks, ${clouds.size} keyframes, ${objects.size} objects\n` +
     `${(connection.bytes / 1e6).toFixed(1)} MB in, ${(connection.rateBytes * 8 / 1000).toFixed(0)} kbit/s`;
-  document.getElementById("stats").innerHTML = status;
+  document.getElementById("stats").textContent = status;
 }, 1000);
+
+// The page's own health, so a slow link or a slow server shows: people frames and surface messages a second over
+// the last second, bytes a second, how long since the latest people frame came, and the gaps seen in the dense
+// map's surface messages and the snapshots that repaired them.
+const health = { people: 0, surface: 0, peopleAt: null, rates: { people: 0, surface: 0, bytes: 0 }, bytesAt: 0, countedAt: performance.now(), gaps: 0, snapshots: 0 };
+const healthBox = document.getElementById("health");
+setInterval(() => {
+  const now = performance.now();
+  if (now - health.countedAt >= 1000) {
+    const span = (now - health.countedAt) / 1000;
+    health.rates = { people: health.people / span, surface: health.surface / span, bytes: (connection.bytes - health.bytesAt) / span };
+    health.people = 0;
+    health.surface = 0;
+    health.bytesAt = connection.bytes;
+    health.countedAt = now;
+  }
+  const age = health.peopleAt === null ? "none yet" : `${Math.round(now - health.peopleAt)} ms ago`;
+  const late = health.peopleAt !== null && now - health.peopleAt > 200;
+  const people = document.createElement("span");
+  people.textContent = `people ${health.rates.people.toFixed(1)}/s, last ${age}`;
+  if (late) people.className = "late";
+  const surface = document.createElement("span");
+  surface.textContent = `surface ${health.rates.surface.toFixed(1)}/s, ${health.gaps} gaps, ${health.snapshots} snapshots`;
+  if (notices.has("surface")) surface.className = "late";
+  healthBox.replaceChildren(people, "\n", surface, `\nin ${(health.rates.bytes / 1000).toFixed(1)} kB/s`);
+}, 100);
 
 function topDown() {
   const centre = robot.visible ? robot.position.clone() : controls.target.clone();

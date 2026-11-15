@@ -15,4 +15,5 @@ rayon = "1.10"
 thiserror = "2"
 
 [dev-dependencies]
+depth-inertial-odometry = { path = "../depth-inertial-odometry" }
 eyre.workspace = true

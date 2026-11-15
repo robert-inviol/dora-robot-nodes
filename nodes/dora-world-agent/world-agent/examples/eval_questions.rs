@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use perception_wire::navigation::{Asker, QuestionId, SpaceAnswer, SpaceQuestion};
+use perception_wire::navigation::{Asker, QuestionId, SpatialAnswer, SpatialQuery};
 use tokio::sync::mpsc;
 use world_agent::clock;
 use world_agent::config::SpatialConfig;
@@ -47,7 +47,7 @@ async fn main() {
     println!("answerers: {}; reconciler: {}", models.join(", "), config.reconciler.model.0);
 
     let (goal_sender, mut goals) = mpsc::unbounded_channel::<SentGoal>();
-    let (answer_sender, mut answers) = mpsc::unbounded_channel::<SpaceAnswer>();
+    let (answer_sender, mut answers) = mpsc::unbounded_channel::<SpatialAnswer>();
     let service = SpatialService::start(
         &config,
         Arc::new(FakeWorld::house()),
@@ -62,8 +62,8 @@ async fn main() {
         let question_id = QuestionId(index as u64 + 1);
         println!("\n=== Q{}: {text}", question_id.0);
         let asked = Instant::now();
-        service.ask(SpaceQuestion { question_id, asked: clock::now(), asker: Asker("eval".to_owned()), text: (*text).to_owned() });
-        let mut thread: Vec<Timed<SpaceAnswer>> = Vec::new();
+        service.ask(SpatialQuery { question_id, asked: clock::now(), asker: Asker("eval".to_owned()), text: (*text).to_owned() });
+        let mut thread: Vec<Timed<SpatialAnswer>> = Vec::new();
         let finished = tokio::time::timeout(QUESTION_LIMIT, async {
             while let Some(answer) = answers.recv().await {
                 if answer.question_id != question_id {

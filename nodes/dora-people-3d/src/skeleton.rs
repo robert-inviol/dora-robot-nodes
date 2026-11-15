@@ -85,6 +85,9 @@ pub struct SkeletonSettings {
     pub ray_sigma_floor_m: f64,
     /// How far a joint's depth may disagree with the reading before it is outvoted.
     pub depth_sigma_m: f64,
+    /// A bone is measured only when the readings at both its ends lie within this of where the fit put the joints
+    /// behind them, so a reading the fit outvoted never sets the person's bone lengths.
+    pub measured_reading_agreement_m: f64,
     pub bone_sigma_m: f64,
     /// How far a joint may stray from where it was heading in one frame.
     pub motion_sigma_m: f64,
@@ -106,6 +109,7 @@ impl Default for SkeletonSettings {
             ray_sigma_per_m: 0.01,
             ray_sigma_floor_m: 0.01,
             depth_sigma_m: 0.05,
+            measured_reading_agreement_m: 0.10,
             bone_sigma_m: 0.02,
             motion_sigma_m: 0.10,
             forget_heading_after_s: 0.3,
@@ -119,7 +123,7 @@ impl Default for SkeletonSettings {
 
 /// What one frame says about one keypoint, in the frame the fit works in.
 #[derive(Clone, Copy, Debug)]
-pub struct JointSighting {
+pub struct JointObservation {
     /// The camera's centre.
     pub ray_origin: Vec3,
     /// Unit direction from the camera through the keypoint's pixel.
@@ -167,11 +171,19 @@ impl SkeletonFit {
         if measured.len() >= self.settings.measurements_before_trusted { median(measured) } else { STANDARD_LENGTHS_M[bone as usize] }
     }
 
-    /// Takes a measurement of every bone whose two ends both have a depth reading.
-    fn measure(&mut self, sightings: &[Option<JointSighting>]) {
+    /// Takes a measurement of every bone whose two ends both have a depth reading that agrees with the fit.
+    fn measure(&mut self, observations: &[Option<JointObservation>], fitted: &[DVec3; 12]) {
+        let agreement_m = self.settings.measured_reading_agreement_m;
+        let agreeing_surface = |k: usize| {
+            let observation = observations.get(k).copied().flatten()?;
+            let surface = observation.surface?;
+            let (origin, direction) = (d(observation.ray_origin), d(observation.ray_direction));
+            let reading_behind = (d(surface) - origin).dot(direction) + JOINT_DEPTH_M[body_index(k)];
+            let fitted_along = (fitted[body_index(k)] - origin).dot(direction);
+            ((fitted_along - reading_behind).abs() <= agreement_m).then_some(surface)
+        };
         for (a, b, bone) in BONES {
-            let surface = |k: usize| sightings.get(k).copied().flatten().and_then(|s| s.surface);
-            if let (Some(a), Some(b)) = (surface(a), surface(b)) {
+            if let (Some(a), Some(b)) = (agreeing_surface(a), agreeing_surface(b)) {
                 let kept = &mut self.measurements[bone as usize];
                 kept.push_back(f64::from(a.distance(b)));
                 if kept.len() > self.settings.measurements_kept {
@@ -196,19 +208,19 @@ impl SkeletonFit {
         Some(std::array::from_fn(|i| latest[i] + (latest[i] - before[i]) / span_s * ahead_s))
     }
 
-    fn residuals(&self, joints: &[DVec3; 12], sightings: &[Option<JointSighting>], heading: Option<&[DVec3; 12]>, lengths: &[f64; BONE_KINDS]) -> Residuals {
+    fn residuals(&self, joints: &[DVec3; 12], observations: &[Option<JointObservation>], heading: Option<&[DVec3; 12]>, lengths: &[f64; BONE_KINDS]) -> Residuals {
         let s = &self.settings;
         let mut values = Vec::with_capacity(96);
         let mut robust = Vec::new();
         for (i, &keypoint) in BODY.iter().enumerate() {
-            let Some(sighting) = sightings.get(keypoint).copied().flatten() else { continue };
-            let (origin, direction) = (d(sighting.ray_origin), d(sighting.ray_direction));
+            let Some(observation) = observations.get(keypoint).copied().flatten() else { continue };
+            let (origin, direction) = (d(observation.ray_origin), d(observation.ray_direction));
             let offset = joints[i] - origin;
             let along = offset.dot(direction);
             let off_ray = offset - direction * along;
             let ray_sigma = s.ray_sigma_floor_m + s.ray_sigma_per_m * along.abs();
             values.extend((off_ray / ray_sigma).to_array());
-            if let Some(surface) = sighting.surface {
+            if let Some(surface) = observation.surface {
                 let behind = (d(surface) - origin).dot(direction) + JOINT_DEPTH_M[i];
                 robust.push(values.len());
                 values.push((along - behind) / s.depth_sigma_m);
@@ -242,14 +254,14 @@ impl SkeletonFit {
     }
 
     /// Where to start: where the joints were heading, else on each ray at its reading or at the torso's depth.
-    fn start(&self, sightings: &[Option<JointSighting>], heading: Option<&[DVec3; 12]>, torso_depth: f64) -> [DVec3; 12] {
+    fn start(&self, observations: &[Option<JointObservation>], heading: Option<&[DVec3; 12]>, torso_depth: f64) -> [DVec3; 12] {
         if let Some(heading) = heading {
             return *heading;
         }
         let on_ray: [Option<DVec3>; 12] = std::array::from_fn(|i| {
-            let sighting = sightings.get(BODY[i]).copied().flatten()?;
-            let (origin, direction) = (d(sighting.ray_origin), d(sighting.ray_direction));
-            let along = sighting.surface.map_or(torso_depth, |s| (d(s) - origin).dot(direction) + JOINT_DEPTH_M[i]);
+            let observation = observations.get(BODY[i]).copied().flatten()?;
+            let (origin, direction) = (d(observation.ray_origin), d(observation.ray_direction));
+            let along = observation.surface.map_or(torso_depth, |s| (d(s) - origin).dot(direction) + JOINT_DEPTH_M[i]);
             Some(origin + direction * along)
         });
         let seen: Vec<DVec3> = on_ray.iter().flatten().copied().collect();
@@ -257,20 +269,19 @@ impl SkeletonFit {
         on_ray.map(|p| p.unwrap_or(centre))
     }
 
-    /// Fits one frame. `sightings` is in keypoint order; `torso_depth` is the torso's distance along the rays, for
-    /// placing joints with no reading on the first frame. Returns the fitted joints in keypoint order, None for the
-    /// face and for joints not sighted.
-    pub fn fit(&mut self, now_ns: i64, sightings: &[Option<JointSighting>], torso_depth: f64) -> Vec<Option<Vec3>> {
-        self.measure(sightings);
+    /// Fits one frame. `observations` is in keypoint order; `torso_depth` is the torso's distance along the rays, for
+    /// synchronizer joints with no reading on the first frame. Returns the fitted joints in keypoint order, None for the
+    /// face and for joints not observed.
+    pub fn fit(&mut self, now_ns: i64, observations: &[Option<JointObservation>], torso_depth: f64) -> Vec<Option<Vec3>> {
         let lengths: [f64; BONE_KINDS] = std::array::from_fn(|kind| {
             let bone = [Bone::UpperArm, Bone::Forearm, Bone::Thigh, Bone::Shank, Bone::Shoulders, Bone::Hips, Bone::Flank][kind];
             self.bone_length(bone)
         });
         let heading = self.heading(now_ns);
-        let mut joints = self.start(sightings, heading.as_ref(), torso_depth);
+        let mut joints = self.start(observations, heading.as_ref(), torso_depth);
         let mut damping = 1e-3;
         for _ in 0..self.settings.iterations {
-            let current = self.residuals(&joints, sightings, heading.as_ref(), &lengths);
+            let current = self.residuals(&joints, observations, heading.as_ref(), &lengths);
             // Geman-McClure as reweighted least squares: a residual u units out counts 1 / (1 + u^2).
             let weights: Vec<f64> = (0..current.values.len())
                 .map(|r| if current.robust.contains(&r) { (1.0 / (1.0 + current.values[r].powi(2))).sqrt() } else { 1.0 })
@@ -282,7 +293,7 @@ impl SkeletonFit {
             for unknown in 0..36 {
                 let mut nudged = joints;
                 nudged[unknown / 3][unknown % 3] += STEP;
-                let moved = self.residuals(&nudged, sightings, heading.as_ref(), &lengths);
+                let moved = self.residuals(&nudged, observations, heading.as_ref(), &lengths);
                 for r in 0..rows {
                     jacobian[(r, unknown)] = (moved.values[r] - current.values[r]) / STEP * weights[r];
                 }
@@ -301,7 +312,7 @@ impl SkeletonFit {
                     continue;
                 };
                 let tried: [DVec3; 12] = std::array::from_fn(|i| joints[i] + DVec3::new(step[3 * i], step[3 * i + 1], step[3 * i + 2]));
-                let after = self.residuals(&tried, sightings, heading.as_ref(), &lengths);
+                let after = self.residuals(&tried, observations, heading.as_ref(), &lengths);
                 if after.values.len() == rows && cost(&after.values) <= before {
                     joints = tried;
                     damping = (damping * 0.3).max(1e-9);
@@ -313,13 +324,14 @@ impl SkeletonFit {
                 }
             }
         }
+        self.measure(observations, &joints);
         self.history.push_back((now_ns, joints));
         if self.history.len() > 2 {
             self.history.pop_front();
         }
         let mut fitted = vec![None; KEYPOINT_COUNT];
         for (i, &keypoint) in BODY.iter().enumerate() {
-            if sightings.get(keypoint).copied().flatten().is_some() {
+            if observations.get(keypoint).copied().flatten().is_some() {
                 fitted[keypoint] = Some(joints[i].as_vec3());
             }
         }
@@ -350,8 +362,8 @@ mod tests {
         joints
     }
 
-    /// Sightings of a body seen from the origin, its readings on the skin facing the camera.
-    fn sightings(body: &[Vec3; KEYPOINT_COUNT], with_depth: impl Fn(usize) -> bool) -> Vec<Option<JointSighting>> {
+    /// Observations of a body seen from the origin, its readings on the skin facing the camera.
+    fn observations(body: &[Vec3; KEYPOINT_COUNT], with_depth: impl Fn(usize) -> bool) -> Vec<Option<JointObservation>> {
         (0..KEYPOINT_COUNT)
             .map(|k| {
                 if !BODY.contains(&k) {
@@ -359,7 +371,7 @@ mod tests {
                 }
                 let direction = body[k].normalize();
                 let skin = body[k] - direction * JOINT_DEPTH_M[body_index(k)] as f32;
-                Some(JointSighting { ray_origin: Vec3::ZERO, ray_direction: direction, surface: with_depth(k).then_some(skin) })
+                Some(JointObservation { ray_origin: Vec3::ZERO, ray_direction: direction, surface: with_depth(k).then_some(skin) })
             })
             .collect()
     }
@@ -372,7 +384,7 @@ mod tests {
     fn a_body_seen_clearly_is_fitted_where_it_stands() {
         let body = standing_body();
         let mut fit = SkeletonFit::new(SkeletonSettings::default());
-        let fitted = fit.fit(0, &sightings(&body, |_| true), 3.0);
+        let fitted = fit.fit(0, &observations(&body, |_| true), 3.0);
         assert!(worst_error(&fitted, &body) < 0.03, "{}", worst_error(&fitted, &body));
         assert!(fitted[0].is_none(), "the face is not fitted");
     }
@@ -380,7 +392,7 @@ mod tests {
     #[test]
     fn a_wrist_reading_that_hit_the_wall_behind_is_outvoted() {
         let body = standing_body();
-        let mut seen = sightings(&body, |_| true);
+        let mut seen = observations(&body, |_| true);
         let wrist = seen[WRIST_L].as_mut().unwrap();
         wrist.surface = Some(wrist.ray_direction * 5.0);
         let mut fit = SkeletonFit::new(SkeletonSettings::default());
@@ -393,7 +405,7 @@ mod tests {
     fn a_knee_with_no_depth_is_placed_by_its_bones_and_its_pixel() {
         let body = standing_body();
         let mut fit = SkeletonFit::new(SkeletonSettings::default());
-        let fitted = fit.fit(0, &sightings(&body, |k| k != KNEE_R), 3.0);
+        let fitted = fit.fit(0, &observations(&body, |k| k != KNEE_R), 3.0);
         let error = fitted[KNEE_R].unwrap().distance(body[KNEE_R]);
         assert!(error < 0.05, "the knee is {error} m out");
     }
@@ -401,7 +413,7 @@ mod tests {
     #[test]
     fn a_joint_not_sighted_is_not_reported() {
         let body = standing_body();
-        let mut seen = sightings(&body, |_| true);
+        let mut seen = observations(&body, |_| true);
         seen[ANKLE_L] = None;
         let mut fit = SkeletonFit::new(SkeletonSettings::default());
         assert!(fit.fit(0, &seen, 3.0)[ANKLE_L].is_none());
@@ -413,9 +425,27 @@ mod tests {
         let body = standing_body().map(|p| Vec3::new(p.x * 1.1, p.y * 1.1, p.z));
         let mut fit = SkeletonFit::new(SkeletonSettings::default());
         for frame in 0..12 {
-            fit.fit(frame * 33_333_333, &sightings(&body, |_| true), 3.0);
+            fit.fit(frame * 33_333_333, &observations(&body, |_| true), 3.0);
         }
         let thigh = fit.bone_length(Bone::Thigh);
         assert!((thigh - 0.417 * 1.1).abs() < 0.02, "{thigh}");
+    }
+
+    #[test]
+    fn a_knee_hidden_behind_something_in_front_for_a_long_time_does_not_change_the_bone_lengths() {
+        // Seen clearly for 12 frames, then for 60 frames the left knee's reading lands on a box 0.4 m in front.
+        let body = standing_body();
+        let mut fit = SkeletonFit::new(SkeletonSettings::default());
+        for frame in 0..12 {
+            fit.fit(frame * 33_333_333, &observations(&body, |_| true), 3.0);
+        }
+        let mut hidden = observations(&body, |_| true);
+        let knee = hidden[KNEE_L].as_mut().unwrap();
+        knee.surface = knee.surface.map(|skin| skin - knee.ray_direction * 0.4);
+        for frame in 12..72 {
+            fit.fit(frame * 33_333_333, &hidden, 3.0);
+        }
+        let (thigh, shank) = (fit.bone_length(Bone::Thigh), fit.bone_length(Bone::Shank));
+        assert!((thigh - 0.417).abs() < 0.02 && (shank - 0.418).abs() < 0.02, "thigh {thigh}, shank {shank}");
     }
 }

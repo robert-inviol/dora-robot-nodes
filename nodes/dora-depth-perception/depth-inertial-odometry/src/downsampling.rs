@@ -1,4 +1,4 @@
-//! Thins a cloud to one point per voxel: the mean of the voxel's readings, kept only where those
+//! Downsamples a cloud to one point per voxel: the mean of the voxel's readings, kept only where those
 //! readings lie on one flat patch. Averaging takes the depth noise down; the flatness test drops the
 //! voxels that straddle an edge or a corner, whose mean lies on no surface.
 
@@ -11,7 +11,7 @@ use crate::association::{BodyPoint, RangeNoise};
 /// Where the depth sensor sits on the body: turns a sensor-frame point into the body frame. The sensor
 /// frame is the depth stream's optical frame (x right, y down, z forward); the body frame is the IMU's.
 #[derive(Clone, Copy, Debug)]
-pub struct SensorMount {
+pub struct SensorExtrinsics {
     pub rotation: DQuat,
     pub translation_m: DVec3,
 }
@@ -32,15 +32,15 @@ impl std::fmt::Display for NotARotation {
 
 impl std::error::Error for NotARotation {}
 
-impl SensorMount {
-    pub const AT_BODY: SensorMount = SensorMount { rotation: DQuat::IDENTITY, translation_m: DVec3::ZERO };
+impl SensorExtrinsics {
+    pub const AT_BODY: SensorExtrinsics = SensorExtrinsics { rotation: DQuat::IDENTITY, translation_m: DVec3::ZERO };
 
     /// A calibration's values are single precision, so its rotation is orthonormal only this closely.
     const ROTATION_TOLERANCE: f64 = 1e-4;
 
-    /// The mount from a camera's depth-to-IMU transform, `imu = rotation * depth + translation`, with
+    /// The extrinsics from a camera's depth-to-IMU transform, `imu = rotation * depth + translation`, with
     /// the rotation as a 3x3 matrix stored column major.
-    pub fn from_depth_to_imu(rotation_column_major: [f32; 9], translation_m: [f32; 3]) -> Result<SensorMount, NotARotation> {
+    pub fn from_depth_to_imu(rotation_column_major: [f32; 9], translation_m: [f32; 3]) -> Result<SensorExtrinsics, NotARotation> {
         let rotation = DMat3::from_cols_array(&rotation_column_major.map(f64::from));
         let off_orthonormal = (rotation * rotation.transpose() - DMat3::IDENTITY).to_cols_array().into_iter().fold(0.0, |worst: f64, entry| worst.max(entry.abs()));
         let determinant = rotation.determinant();
@@ -48,12 +48,12 @@ impl SensorMount {
         if !(off_orthonormal <= Self::ROTATION_TOLERANCE && (determinant - 1.0).abs() <= Self::ROTATION_TOLERANCE) {
             return Err(NotARotation { off_orthonormal, determinant });
         }
-        Ok(SensorMount { rotation: DQuat::from_mat3(&rotation).normalize(), translation_m: DVec3::from_array(translation_m.map(f64::from)) })
+        Ok(SensorExtrinsics { rotation: DQuat::from_mat3(&rotation).normalize(), translation_m: DVec3::from_array(translation_m.map(f64::from)) })
     }
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct ThinningSettings {
+pub struct DownsamplingSettings {
     pub voxel_m: f32,
     /// Readings nearer or farther than this are dropped.
     pub min_range_m: f32,
@@ -67,7 +67,7 @@ pub struct ThinningSettings {
     /// the step an edge makes inside a voxel, the test cannot tell and the voxel is kept; its mean is
     /// then off the surface by less than the sigma it carries.
     pub flat_noise_sigmas: f32,
-    /// A patch tells which way it faces only when it is thinner than this share of its width.
+    /// A patch tells which way it faces only when it is downsampler than this share of its width.
     pub facing_known_below: f32,
 }
 
@@ -80,22 +80,22 @@ struct Voxel {
     readings: u32,
 }
 
-/// Reusable working memory for thinning.
+/// Reusable working memory for downsampling.
 #[derive(Default)]
-pub struct Thinner {
+pub struct Downsampler {
     voxels: FxHashMap<IVec3, Voxel>,
 }
 
-impl Thinner {
-    /// Fills `thinned` with the flat patches of a sensor-frame cloud, in the body frame.
-    pub fn thin(&mut self, sensor_points: &[Vec3], mount: &SensorMount, settings: &ThinningSettings, noise: &RangeNoise, thinned: &mut Vec<BodyPoint>) {
+impl Downsampler {
+    /// Fills `downsampled` with the flat patches of a sensor-frame cloud, in the body frame.
+    pub fn downsample(&mut self, sensor_points: &[Vec3], extrinsics: &SensorExtrinsics, settings: &DownsamplingSettings, noise: &RangeNoise, downsampled: &mut Vec<BodyPoint>) {
         self.voxels.clear();
         for &point in sensor_points {
             let range_m = point.length();
             if range_m < settings.min_range_m || range_m > settings.max_range_m {
                 continue;
             }
-            let body = (mount.rotation * point.as_dvec3() + mount.translation_m).as_vec3();
+            let body = (extrinsics.rotation * point.as_dvec3() + extrinsics.translation_m).as_vec3();
             let cell = (body / settings.voxel_m).floor().as_ivec3();
             let local = body - cell.as_vec3() * settings.voxel_m;
             let voxel = self.voxels.entry(cell).or_default();
@@ -107,7 +107,7 @@ impl Thinner {
             voxel.range_sum += range_m;
             voxel.readings += 1;
         }
-        thinned.clear();
+        downsampled.clear();
         for (cell, voxel) in &self.voxels {
             if voxel.readings < settings.min_readings {
                 continue;
@@ -127,7 +127,7 @@ impl Thinner {
             if thickness_m <= settings.flat_within_m + settings.flat_noise_sigmas * noise.scatter_m(range_m) {
                 let across = eigen.eigenvectors.column(order[0]);
                 let facing = (thickness_m < settings.facing_known_below * width_m).then(|| Vec3::new(across[0], across[1], across[2]));
-                thinned.push(BodyPoint { position: cell.as_vec3() * settings.voxel_m + mean, sigma_m: noise.sigma_m(range_m, voxel.readings), facing });
+                downsampled.push(BodyPoint { position: cell.as_vec3() * settings.voxel_m + mean, sigma_m: noise.sigma_m(range_m, voxel.readings), facing });
             }
         }
     }
@@ -137,7 +137,7 @@ impl Thinner {
 mod tests {
     use super::*;
 
-    const SETTINGS: ThinningSettings = ThinningSettings { voxel_m: 0.1, min_range_m: 0.4, max_range_m: 6.0, min_readings: 4, flat_within_m: 0.003, flat_noise_sigmas: 1.5, facing_known_below: 0.3 };
+    const SETTINGS: DownsamplingSettings = DownsamplingSettings { voxel_m: 0.1, min_range_m: 0.4, max_range_m: 6.0, min_readings: 4, flat_within_m: 0.003, flat_noise_sigmas: 1.5, facing_known_below: 0.3 };
     const NOISELESS: RangeNoise = RangeNoise { base_m: 0.002, per_square_m: 0.0 };
 
     fn grid(from: Vec3, across: Vec3, up: Vec3) -> Vec<Vec3> {
@@ -148,27 +148,27 @@ mod tests {
     fn a_mount_from_a_column_major_rotation_turns_sensor_points_into_the_body_frame() {
         // An IMU with x forward, y left and z up: the sensor's x (right) is its minus y, the sensor's
         // y (down) its minus z, the sensor's z (forward) its x.
-        let mount = SensorMount::from_depth_to_imu([0.0, -1.0, 0.0, 0.0, 0.0, -1.0, 1.0, 0.0, 0.0], [0.03, 0.01, -0.02]).expect("a rotation");
-        let body = mount.rotation * DVec3::new(0.2, 0.3, 2.0) + mount.translation_m;
+        let extrinsics = SensorExtrinsics::from_depth_to_imu([0.0, -1.0, 0.0, 0.0, 0.0, -1.0, 1.0, 0.0, 0.0], [0.03, 0.01, -0.02]).expect("a rotation");
+        let body = extrinsics.rotation * DVec3::new(0.2, 0.3, 2.0) + extrinsics.translation_m;
         assert!((body - DVec3::new(2.03, -0.19, -0.32)).length() < 1e-6, "{body}");
     }
 
     #[test]
     fn a_mount_whose_rotation_mirrors_or_stretches_is_refused() {
-        let mirrored = SensorMount::from_depth_to_imu([1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, -1.0], [0.0; 3]);
+        let mirrored = SensorExtrinsics::from_depth_to_imu([1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, -1.0], [0.0; 3]);
         assert!(matches!(mirrored, Err(NotARotation { determinant, .. }) if (determinant + 1.0).abs() < 1e-9), "{mirrored:?}");
-        let stretched = SensorMount::from_depth_to_imu([1.1, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0], [0.0; 3]);
+        let stretched = SensorExtrinsics::from_depth_to_imu([1.1, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0], [0.0; 3]);
         assert!(matches!(stretched, Err(NotARotation { off_orthonormal, .. }) if off_orthonormal > 0.2), "{stretched:?}");
-        assert!(SensorMount::from_depth_to_imu([f32::NAN; 9], [0.0; 3]).is_err());
+        assert!(SensorExtrinsics::from_depth_to_imu([f32::NAN; 9], [0.0; 3]).is_err());
     }
 
     #[test]
-    fn a_wall_thins_to_points_on_the_wall() {
+    fn a_wall_downsamples_to_points_on_the_wall() {
         let wall = grid(Vec3::new(2.0, -0.2, -0.2), Vec3::Y, Vec3::Z);
-        let mut thinned = Vec::new();
-        Thinner::default().thin(&wall, &SensorMount::AT_BODY, &SETTINGS, &NOISELESS, &mut thinned);
-        assert!(thinned.len() >= 9 && thinned.iter().all(|p| (p.position.x - 2.0).abs() < 1e-4), "{thinned:?}");
-        assert!(thinned.iter().all(|p| p.facing.is_some_and(|facing| facing.x.abs() > 0.999)), "every patch faces along x: {thinned:?}");
+        let mut downsampled = Vec::new();
+        Downsampler::default().downsample(&wall, &SensorExtrinsics::AT_BODY, &SETTINGS, &NOISELESS, &mut downsampled);
+        assert!(downsampled.len() >= 9 && downsampled.iter().all(|p| (p.position.x - 2.0).abs() < 1e-4), "{downsampled:?}");
+        assert!(downsampled.iter().all(|p| p.facing.is_some_and(|facing| facing.x.abs() > 0.999)), "every patch faces along x: {downsampled:?}");
     }
 
     #[test]
@@ -176,10 +176,10 @@ mod tests {
         // A wall at x = 2.03 meeting a floor at z = -0.47: the voxels along the join hold both.
         let mut corner = grid(Vec3::new(2.03, -0.2, -0.47), Vec3::Y, Vec3::Z);
         corner.extend(grid(Vec3::new(1.65, -0.2, -0.47), Vec3::X, Vec3::Y));
-        let mut thinned = Vec::new();
-        Thinner::default().thin(&corner, &SensorMount::AT_BODY, &SETTINGS, &NOISELESS, &mut thinned);
+        let mut downsampled = Vec::new();
+        Downsampler::default().downsample(&corner, &SensorExtrinsics::AT_BODY, &SETTINGS, &NOISELESS, &mut downsampled);
         let on_a_surface = |p: &BodyPoint| (p.position.x - 2.03).abs() < 1e-3 || (p.position.z + 0.47).abs() < 1e-3;
-        assert!(!thinned.is_empty() && thinned.iter().all(on_a_surface), "{thinned:?}");
+        assert!(!downsampled.is_empty() && downsampled.iter().all(on_a_surface), "{downsampled:?}");
     }
 
     #[test]
@@ -187,9 +187,9 @@ mod tests {
         let mut corner = grid(Vec3::new(2.03, -0.2, -0.47), Vec3::Y, Vec3::Z);
         corner.extend(grid(Vec3::new(1.65, -0.2, -0.47), Vec3::X, Vec3::Y));
         let coarse = RangeNoise { base_m: 0.05, per_square_m: 0.0 };
-        let mut thinned = Vec::new();
-        Thinner::default().thin(&corner, &SensorMount::AT_BODY, &SETTINGS, &coarse, &mut thinned);
+        let mut downsampled = Vec::new();
+        Downsampler::default().downsample(&corner, &SensorExtrinsics::AT_BODY, &SETTINGS, &coarse, &mut downsampled);
         let on_a_surface = |p: &BodyPoint| (p.position.x - 2.03).abs() < 1e-3 || (p.position.z + 0.47).abs() < 1e-3;
-        assert!(!thinned.is_empty() && thinned.iter().all(on_a_surface), "{thinned:?}");
+        assert!(!downsampled.is_empty() && downsampled.iter().all(on_a_surface), "{downsampled:?}");
     }
 }

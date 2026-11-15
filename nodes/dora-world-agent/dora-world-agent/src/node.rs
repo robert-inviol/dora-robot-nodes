@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use dora_node_api::arrow::array::Array;
 use eyre::{Result, WrapErr};
-use perception_wire::navigation::{decode_goal_status, decode_space_question, NavGoal, SpaceAnswer};
+use perception_wire::navigation::{decode_goal_status, decode_spatial_query, NavGoal, SpatialAnswer};
 use tokio::sync::mpsc;
 use world_agent::clock;
 use world_agent::config::{ModelName, SpatialConfig};
@@ -16,8 +16,8 @@ use world_store::{AgentName, IssuedGoal};
 
 use crate::world::{store_input, Ingested, StoreInput, WorldStore};
 
-pub const SPACE_QUESTION_INPUT: &str = "space_question";
-pub const SPACE_ANSWER_OUTPUT: &str = "space_answer";
+pub const SPATIAL_QUERY_INPUT: &str = "spatial_query";
+pub const SPATIAL_ANSWER_OUTPUT: &str = "spatial_answer";
 pub const NAV_GOAL_OUTPUT: &str = "nav_goal";
 
 /// The models behind each goal origin, from the settings.
@@ -44,7 +44,7 @@ impl GoalAuthors {
 
 /// Where the node's outputs come out: every answer and every goal, in the order they were made.
 pub struct Outputs {
-    pub answers: mpsc::UnboundedReceiver<SpaceAnswer>,
+    pub answers: mpsc::UnboundedReceiver<SpatialAnswer>,
     pub goals: mpsc::UnboundedReceiver<SentGoal>,
 }
 
@@ -67,8 +67,8 @@ impl<W: WorldStore + Clone> SpatialNode<W> {
 
     /// Handles one dora input: a question starts answering, everything else goes to the world store.
     pub async fn on_input(&self, id: &str, data: &dyn Array) -> Result<()> {
-        if id == SPACE_QUESTION_INPUT {
-            self.service.ask(decode_space_question(data).wrap_err("decoding a space question")?);
+        if id == SPATIAL_QUERY_INPUT {
+            self.service.ask(decode_spatial_query(data).wrap_err("decoding a spatial query")?);
             return Ok(());
         }
         let input = store_input(id)?;

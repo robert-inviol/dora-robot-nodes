@@ -57,7 +57,8 @@ fn person(track: &PersonTrack, as_of: UnixNanos) -> String {
     let heading = track.heading_deg.map_or(String::new(), |deg| format!(" heading {deg:.0}deg"));
     match track.liveness {
         TrackLiveness::Live => {
-            format!("{} {} {}{heading} {:.1}m/s seen {seen} ago", track.id, track.room, at(track.position), track.speed_m_s)
+            let speed = track.speed_m_s.map_or_else(|| "speed unknown".to_owned(), |m_s| format!("{m_s:.1}m/s"));
+            format!("{} {} {}{heading} {speed} seen {seen} ago", track.id, track.room, at(track.position))
         }
         TrackLiveness::Lost => format!("{} lost {seen} ago, last {} {}{heading}", track.id, track.room, at(track.position)),
     }
@@ -195,6 +196,14 @@ r4 bedroom [doors: p6->hallway] [places: p7 bedroom middle]
   o20 bed 2.0x1.6 h0.50 (6.00,9.00) seen 60m ago
 changes: 5m ago o51 mug appeared in kitchen ; 25m ago o21 laundry basket moved bedroom->hallway";
         assert_eq!(digest.as_str(), expected);
+    }
+
+    #[tokio::test]
+    async fn a_person_whose_speed_was_not_measured_is_said_to_have_an_unknown_speed() {
+        let mut snapshot = FakeWorld::house_at(NOW).snapshot().await.unwrap();
+        snapshot.people.iter_mut().for_each(|track| track.speed_m_s = None);
+        let digest = render(&snapshot, None);
+        assert!(digest.as_str().contains("people: t7 living_room (8.10,2.00) heading 180deg speed unknown seen 0s ago |"), "{}", digest.as_str());
     }
 
     #[tokio::test]

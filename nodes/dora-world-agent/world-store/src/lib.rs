@@ -1,7 +1,7 @@
 //! The world model in SQLite, behind the `WorldModel` trait.
 //!
 //! One writer thread owns the only read-write connection and commits ingest commands in batches; a small pool of
-//! read-only connections and the in-memory map (topology, free-space grid, room names) answer the agents' tools.
+//! read-only connections and the in-memory map (topology, occupancy grid, room names) answer the agents' tools.
 //! Objects are kept as history rows, every change is an append-only event, and goals are recorded with their status.
 
 mod geometry;

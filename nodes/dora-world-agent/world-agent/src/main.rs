@@ -7,7 +7,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use perception_wire::navigation::{Asker, GoalId, GoalReason, GoalState, GoalStatus, QuestionId, SpaceQuestion};
+use perception_wire::navigation::{Asker, GoalId, GoalReason, GoalState, GoalStatus, QuestionId, SpatialQuery};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc;
 use world_agent::clock;
@@ -81,7 +81,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             continue;
         }
-        service.ask(SpaceQuestion {
+        service.ask(SpatialQuery {
             question_id: QuestionId(next_question),
             asked: clock::now(),
             asker: Asker("console".to_owned()),
