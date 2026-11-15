@@ -4,7 +4,7 @@ use dora_map_localizer::{GyroGap, LocalizerNode};
 use glam::Vec3;
 use map_localizer::synthetic::{ellipse_poses, furnished_room, render_walk, turning_poses, SyntheticWalk};
 use map_localizer::{HeadingWithoutGyro, KeyframeEstimate};
-use perception_wire::localization::{decode_keyframe_pose, encode_keyframe_pose, FrameId, KeyframePose, Tracking};
+use perception_wire::localization::{decode_keyframe_pose, decode_keyframe_poses_moved, encode_keyframe_pose, encode_keyframe_poses_moved, FrameId, KeyframePose, Tracking};
 use perception_wire::{decode_imu, decode_keyframe, encode_imu, encode_keyframe, Imu};
 use room_map::heading::HeadingError;
 use room_map::pose::wrap_angle;
@@ -122,4 +122,37 @@ fn keyframes_are_lost_until_a_still_span_has_measured_the_gyro_bias() {
     assert_eq!(gaps.iter().map(|g| g.frame_id.0 as usize).collect::<Vec<_>>(), (0..first_placed).collect::<Vec<_>>());
     assert!(gaps.iter().all(|g| matches!(g.problem, HeadingError::TooLittleStillTime { .. })), "{gaps:?}");
     assert!(estimates[first_placed..].iter().all(|e| e.tracking == Tracking::Tracking));
+}
+
+#[test]
+fn an_optimisation_that_moves_keyframes_already_sent_sends_their_new_poses() {
+    // A turn with no depth restarts tracking where dead reckoning puts it; the walk back closes a loop on the start,
+    // and optimisation moves the keyframes tracked since the restart.
+    let bias = |t: i64| Vec3::new(0.002, -0.003 - 0.010 * t as f32 / 25e9, 0.002);
+    let walk = render_walk(&furnished_room(), &turning_poses(), 11..16, bias);
+    let mut node = LocalizerNode::new(NodeSettings::default());
+    let mut sent: std::collections::HashMap<FrameId, Vec3> = std::collections::HashMap::new();
+    let mut moved_messages = 0;
+    for (keyframe, imu) in walk.keyframes.iter().zip(&walk.imu) {
+        node.on_imu(&decode_imu(&encode_imu(imu)).unwrap());
+        let handled = node.on_keyframe(decode_keyframe(&encode_keyframe(keyframe)).unwrap());
+        if let Some(moved) = handled.moved {
+            let moved = decode_keyframe_poses_moved(&encode_keyframe_poses_moved(&moved)).unwrap();
+            assert_eq!(moved.map_version, node.localizer().map_version());
+            for keyframe in &moved.keyframes {
+                let was = sent.get(&keyframe.frame_id).unwrap_or_else(|| panic!("keyframe {:?} was sent before it moved", keyframe.frame_id));
+                let now = Vec3::new(keyframe.pose.x_m, keyframe.pose.y_m, keyframe.pose.z_m);
+                let current = node.localizer().keyframe_pose(keyframe.frame_id).unwrap();
+                assert!((now - current.translation).length() < 1e-5, "the moved pose is the graph's current one");
+                assert!((now - *was).length() > 0.0099 || wrap_angle(keyframe.pose.yaw_rad - current.yaw_rad).abs() < 1e-6);
+                sent.insert(keyframe.frame_id, now);
+            }
+            moved_messages += 1;
+        }
+        let estimate = handled.estimate.unwrap();
+        if estimate.tracking != Tracking::Lost {
+            sent.insert(estimate.frame_id, estimate.pose.translation);
+        }
+    }
+    assert!(moved_messages > 0, "the loop closure moved keyframes already sent");
 }

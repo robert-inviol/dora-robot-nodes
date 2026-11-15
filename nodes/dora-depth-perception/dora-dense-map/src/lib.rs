@@ -8,7 +8,8 @@ use dense_map::{
 };
 use dora_node_api::arrow::array::{Array, StructArray};
 use eyre::{bail, Context, Result};
-use perception_wire::localization::decode_keyframe_pose;
+use glam::Vec3;
+use perception_wire::localization::{decode_keyframe_pose, decode_keyframe_poses_moved, Tracking};
 use perception_wire::navigation::UnixNanos;
 use perception_wire::objects::decode_object_update;
 use perception_wire::space_map::{encode_free_space, encode_keep_out, encode_topology};
@@ -21,6 +22,8 @@ pub const SETTINGS_VARIABLE: &str = "DENSE_MAP_SETTINGS";
 pub enum Input {
     Keyframe,
     KeyframePose,
+    /// Keyframes already placed that the localizer's optimisation moved.
+    KeyframePosesMoved,
     ObjectUpdate,
     /// A timer: lands background rebuilds and slices the map when it is due.
     Tick,
@@ -31,6 +34,7 @@ impl Input {
         Ok(match id {
             "keyframe" => Input::Keyframe,
             "keyframe_pose" => Input::KeyframePose,
+            "keyframe_poses_moved" => Input::KeyframePosesMoved,
             "object_update" => Input::ObjectUpdate,
             "tick" => Input::Tick,
             other => bail!("the dense map has no input {other:?}"),
@@ -96,6 +100,20 @@ impl DenseMapNode {
             Input::KeyframePose => {
                 let pose = decode_keyframe_pose(data).wrap_err("decoding a keyframe_pose message")?;
                 log_arrival(self.mapper.on_keyframe_pose(KeyframePose::from(&pose)));
+                Ok(Vec::new())
+            }
+            Input::KeyframePosesMoved => {
+                let moved = decode_keyframe_poses_moved(data).wrap_err("decoding a keyframe_poses_moved message")?;
+                for keyframe in &moved.keyframes {
+                    let pose = keyframe.pose;
+                    log_arrival(self.mapper.on_keyframe_pose(KeyframePose {
+                        frame_id: keyframe.frame_id,
+                        map_version: moved.map_version,
+                        translation: Vec3::new(pose.x_m, pose.y_m, pose.z_m),
+                        yaw_rad: pose.yaw_rad,
+                        tracking: Tracking::Tracking,
+                    }));
+                }
                 Ok(Vec::new())
             }
             Input::ObjectUpdate => {

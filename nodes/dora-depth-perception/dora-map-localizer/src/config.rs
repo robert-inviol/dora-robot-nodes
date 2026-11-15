@@ -4,9 +4,8 @@
 use std::path::{Path, PathBuf};
 
 use map_localizer::cloud::CloudSettings;
-use glam::Vec3;
 use map_localizer::gyro::GyroSettings;
-use map_localizer::map_to_odom::{CameraMount, MapToOdomSettings};
+use map_localizer::map_to_odom::MapToOdomSettings;
 use map_localizer::{HeadingWithoutGyro, LocalizerSettings};
 use serde::Deserialize;
 

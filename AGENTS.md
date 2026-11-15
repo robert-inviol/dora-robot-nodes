@@ -63,6 +63,7 @@ link: connects to the camera machine; subscribes rig/keyframe, rig/imu, rig/segm
       rig/odom_pose, rig/calibration, rig/space_question, rig/goal_status
  |- keyframe, imu, odom_pose, calibration -> localizer (dora-map-localizer)
  |     -> keyframe_pose -> dense_map, objects, spatial_agent
+ |     -> keyframe_poses_moved (past keyframes an optimisation moved) -> dense_map
  |     -> map_to_odom -> spatial_agent
  |- keyframe, keyframe_pose, object_update -> dense_map -> free_space -> spatial_agent
  |- keyframe, keyframe_pose, segments -> objects (dora-object-map) -> object_update -> spatial_agent

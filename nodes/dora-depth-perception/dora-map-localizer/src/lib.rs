@@ -20,14 +20,14 @@
 
 pub mod config;
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 use map_localizer::cloud::registration_cloud;
 use map_localizer::gyro::{GyroHeading, KeyframeTiming};
 use glam::Vec3;
 use map_localizer::map_to_odom::{CameraMount, MapToOdomEstimator, OdomError, OdomHistory, OdomPose};
 use map_localizer::{HeadingWithoutGyro, KeyframeEstimate, Localizer, LocalizerInput};
-use perception_wire::localization::{CameraNanos, FrameId, MapToOdom, Tracking};
+use perception_wire::localization::{CameraNanos, FrameId, KeyframePosesMoved, MapToOdom, MovedKeyframe, Pose4, Tracking};
 use perception_wire::camera::CameraCalibration;
 use perception_wire::odometry;
 use perception_wire::navigation::UnixNanos;
@@ -85,6 +85,8 @@ pub struct Handled {
     pub odometry_restarted: Option<OdometryRestart>,
     /// An odometry pose left out because no calibration has said where the colour camera sits on the IMU yet.
     pub odometry_before_calibration: Option<CameraNanos>,
+    /// The keyframes already sent that an optimisation moved, at their new poses.
+    pub moved: Option<KeyframePosesMoved>,
 }
 
 /// Odometry, and the registered keyframes waiting for it to reach their camera time.
@@ -161,8 +163,14 @@ impl OdometryLink {
     }
 }
 
+/// A keyframe counts as moved once optimisation shifts it this far from the pose last sent for it.
+const MOVED_M: f32 = 0.01;
+const MOVED_RAD: f32 = 0.004;
+
 pub struct LocalizerNode {
     settings: NodeSettings,
+    /// The pose last sent for every keyframe sent placed (tracking or relocalised).
+    sent: HashMap<FrameId, room_map::Pose>,
     localizer: Localizer,
     gyro: GyroHeading,
     waiting: Option<Keyframe>,
@@ -177,6 +185,7 @@ impl LocalizerNode {
             gyro: GyroHeading::new(settings.gyro.clone()),
             odometry: settings.odometry.clone().map(OdometryLink::new),
             settings,
+            sent: HashMap::new(),
             waiting: None,
             previous: None,
         }
@@ -274,6 +283,27 @@ impl LocalizerNode {
             link.expire(camera_time, &mut unjoined);
         }
         let map_to_odom = self.map_to_odom();
-        Handled { estimate: Some(estimate), gyro_gap, map_to_odom, unjoined, ..Handled::default() }
+        let moved = estimate.optimisation.as_ref().and_then(|_| self.moved_keyframes());
+        if estimate.tracking != Tracking::Lost {
+            self.sent.insert(frame_id, estimate.pose);
+        }
+        Handled { estimate: Some(estimate), gyro_gap, map_to_odom, unjoined, moved, ..Handled::default() }
+    }
+
+    /// The keyframes already sent placed whose map pose has moved since it was last sent; each is counted as sent
+    /// at its new pose.
+    fn moved_keyframes(&mut self) -> Option<KeyframePosesMoved> {
+        let mut keyframes = Vec::new();
+        for (frame_id, pose) in self.localizer.keyframe_poses() {
+            let Some(sent) = self.sent.get_mut(&frame_id) else { continue };
+            let shifted = sent.translation.distance(pose.translation) > MOVED_M
+                || room_map::pose::wrap_angle(sent.yaw_rad - pose.yaw_rad).abs() > MOVED_RAD;
+            if shifted {
+                *sent = pose;
+                let t = pose.translation;
+                keyframes.push(MovedKeyframe { frame_id, pose: Pose4 { x_m: t.x, y_m: t.y, z_m: t.z, yaw_rad: pose.yaw_rad } });
+            }
+        }
+        (!keyframes.is_empty()).then(|| KeyframePosesMoved { map_version: self.localizer.map_version(), keyframes })
     }
 }

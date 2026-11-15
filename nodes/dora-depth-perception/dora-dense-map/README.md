@@ -6,6 +6,7 @@ dora node around the `dense-map` crate.
 |---|---|
 | `keyframe` | `keyframe` from the camera node |
 | `keyframe_pose` | `keyframe_pose` from the localizer, matched to its keyframe by frame id |
+| `keyframe_poses_moved` | `keyframe_poses_moved` from the localizer: a keyframe already placed at a new pose is moved there and the map rebuilt |
 | `object_update` | `object_update` from the object map |
 | `tick` | a dora timer; lands background rebuilds and slices the map when it is due |
 

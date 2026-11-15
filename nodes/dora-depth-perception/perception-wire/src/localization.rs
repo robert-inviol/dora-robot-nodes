@@ -10,7 +10,10 @@ use std::sync::Arc;
 use dora_node_api::arrow::array::{Array, ArrayRef, AsArray, Float32Array, Int64Array, StringArray, StructArray, UInt64Array};
 use dora_node_api::arrow::datatypes::{DataType, Field, Fields, Float32Type, Int64Type, UInt64Type};
 
+use serde::{Deserialize, Serialize};
+
 use crate::navigation::{MapVersion, UnixNanos, WireError};
+use crate::serde_wire::{decode_row, encode_row, list_of, required};
 
 /// A keyframe's id, as the camera node numbered it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -213,6 +216,72 @@ pub fn encode_map_to_odom(message: &MapToOdom) -> StructArray {
     StructArray::new(map_to_odom_fields(), columns, None)
 }
 
+/// A keyframe already sent that an optimisation moved, at its new pose.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MovedKeyframe {
+    pub frame_id: FrameId,
+    pub pose: Pose4,
+}
+
+/// Every keyframe already sent that one optimisation of the pose graph moved, with its new pose. A keyframe's own
+/// keyframe_pose is never sent again; this is how its later poses arrive.
+#[derive(Clone, Debug, PartialEq)]
+pub struct KeyframePosesMoved {
+    /// The pose graph the poses come from: the optimisation's.
+    pub map_version: MapVersion,
+    pub keyframes: Vec<MovedKeyframe>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct MovedKeyframeRow {
+    frame_id: u64,
+    x_m: f32,
+    y_m: f32,
+    z_m: f32,
+    yaw_rad: f32,
+}
+
+#[derive(Serialize, Deserialize)]
+struct KeyframePosesMovedRow {
+    map_version: u64,
+    keyframes: Vec<MovedKeyframeRow>,
+}
+
+pub fn keyframe_poses_moved_fields() -> Fields {
+    let keyframe = DataType::Struct(Fields::from(vec![
+        required("frame_id", DataType::UInt64),
+        required("x_m", DataType::Float32),
+        required("y_m", DataType::Float32),
+        required("z_m", DataType::Float32),
+        required("yaw_rad", DataType::Float32),
+    ]));
+    Fields::from(vec![required("map_version", DataType::UInt64), required("keyframes", list_of(keyframe, false))])
+}
+
+pub fn decode_keyframe_poses_moved(array: &dyn Array) -> eyre::Result<KeyframePosesMoved> {
+    let row: KeyframePosesMovedRow = decode_row(array, &keyframe_poses_moved_fields(), "keyframe poses moved")?;
+    Ok(KeyframePosesMoved {
+        map_version: MapVersion(row.map_version),
+        keyframes: row
+            .keyframes
+            .into_iter()
+            .map(|k| MovedKeyframe { frame_id: FrameId(k.frame_id), pose: Pose4 { x_m: k.x_m, y_m: k.y_m, z_m: k.z_m, yaw_rad: k.yaw_rad } })
+            .collect(),
+    })
+}
+
+pub fn encode_keyframe_poses_moved(message: &KeyframePosesMoved) -> StructArray {
+    let row = KeyframePosesMovedRow {
+        map_version: message.map_version.0,
+        keyframes: message
+            .keyframes
+            .iter()
+            .map(|k| MovedKeyframeRow { frame_id: k.frame_id.0, x_m: k.pose.x_m, y_m: k.pose.y_m, z_m: k.pose.z_m, yaw_rad: k.pose.yaw_rad })
+            .collect(),
+    };
+    encode_row(&row, keyframe_poses_moved_fields())
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs::File;
@@ -290,5 +359,22 @@ mod tests {
     fn a_map_to_odom_of_another_wire_type_is_rejected() {
         let error = decode_map_to_odom(&fixture("keyframe_pose_tracking")).unwrap_err();
         assert!(matches!(error, WireError::WrongType { message: "map to odom", .. }), "{error}");
+    }
+
+    #[test]
+    fn the_keyframe_poses_moved_fixture_decodes_and_encodes_back_to_itself() {
+        let golden = fixture("keyframe_poses_moved");
+        let message = decode_keyframe_poses_moved(&golden).unwrap();
+        assert_eq!(
+            message,
+            KeyframePosesMoved {
+                map_version: MapVersion(8),
+                keyframes: vec![
+                    MovedKeyframe { frame_id: FrameId(40), pose: Pose4 { x_m: 1.0, y_m: -0.5, z_m: 0.0625, yaw_rad: 0.5 } },
+                    MovedKeyframe { frame_id: FrameId(42), pose: Pose4 { x_m: 1.3125, y_m: -0.4375, z_m: 0.0625, yaw_rad: 0.8125 } },
+                ],
+            }
+        );
+        assert_eq!(encode_keyframe_poses_moved(&message), golden);
     }
 }

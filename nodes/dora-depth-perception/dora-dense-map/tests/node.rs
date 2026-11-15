@@ -9,7 +9,7 @@ use dora_dense_map::{read_settings, DenseMapNode, Input, Output};
 use dora_node_api::arrow::array::StructArray;
 use dora_node_api::arrow::buffer::ScalarBuffer;
 use glam::{Vec2, Vec3};
-use perception_wire::localization::{encode_keyframe_pose, KeyframePose, Pose4, Tracking};
+use perception_wire::localization::{encode_keyframe_pose, encode_keyframe_poses_moved, FrameId, KeyframePose, KeyframePosesMoved, MovedKeyframe, Pose4, Tracking};
 use perception_wire::navigation::{MapVersion, ObjectId, UnixNanos};
 use perception_wire::objects::{encode_object_update, ObjectExtent, ObjectUpdate, ObjectUpdateKind};
 use perception_wire::space_map::{decode_free_space, decode_keep_out, decode_topology};
@@ -95,6 +95,16 @@ fn a_walk_through_two_rooms_comes_out_as_free_space_and_topology_and_a_glass_doo
     assert!(messages(&mut node, Input::ObjectUpdate, encode_object_update(&glass_door(ObjectUpdateKind::Updated)), start).is_empty());
     let out = messages(&mut node, Input::ObjectUpdate, encode_object_update(&glass_door(ObjectUpdateKind::Disappeared)), start);
     assert!(decode_keep_out(&out[0].1).unwrap().zones.is_empty());
+
+    // The first keyframe moves, in the same map version: the move alone has the map rebuilt with it in its new place.
+    assert!(!node.mapper().is_rebuilding());
+    let moved = KeyframePosesMoved {
+        map_version: MapVersion(1),
+        keyframes: vec![MovedKeyframe { frame_id: FrameId(0), pose: Pose4 { x_m: 1.25, y_m: 1.0, z_m: 0.0, yaw_rad: 0.0 } }],
+    };
+    assert!(messages(&mut node, Input::KeyframePosesMoved, encode_keyframe_poses_moved(&moved), start).is_empty());
+    messages(&mut node, Input::Tick, StructArray::new_empty_fields(1, None), start + Duration::from_secs(1));
+    assert!(node.mapper().is_rebuilding(), "a moved keyframe sets off a rebuild");
 }
 
 #[test]

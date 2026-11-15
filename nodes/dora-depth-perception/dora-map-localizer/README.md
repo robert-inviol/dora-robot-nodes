@@ -12,6 +12,7 @@ dora node that places every keyframe in the map with the `map-localizer` library
 | Output | Message |
 |---|---|
 | `keyframe_pose` | `keyframe_pose` (lib/dora-rig-messages localization): one per localised keyframe, with the map version, tracking state, registration RMS and inlier fraction. Metadata `localize_ms` is the time taken |
+| `keyframe_poses_moved` | `keyframe_poses_moved` (lib/dora-rig-messages localization): after an optimisation of the pose graph, every keyframe already sent tracking or relocalised that it moved more than 1 cm or 0.23 degrees from the pose last sent for it, at its new pose. A keyframe's own `keyframe_pose` is never sent again |
 | `map_to_odom` | `map_to_odom` (lib/dora-rig-messages localization): with odometry, the transform taking odometry poses into the map, sent after every keyframe and every odometry pose that joined a keyframe |
 
 ## Odometry

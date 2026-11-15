@@ -54,6 +54,7 @@ nodes:
     outputs:
       - keyframe_pose
       - map_to_odom
+      - keyframe_poses_moved
 
   - id: dense_map
     path: ../target/release/dora-dense-map
@@ -66,6 +67,10 @@ nodes:
         queue_size: 32
       keyframe_pose:
         source: localizer/keyframe_pose
+        queue_size: 32
+      # Keyframes already placed that an optimisation moved.
+      keyframe_poses_moved:
+        source: localizer/keyframe_poses_moved
         queue_size: 32
       object_update:
         source: objects/object_update

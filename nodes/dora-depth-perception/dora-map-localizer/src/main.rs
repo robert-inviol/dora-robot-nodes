@@ -14,7 +14,7 @@ use dora_node_api::dora_core::config::DataId;
 use dora_node_api::{DoraNode, Event, MetadataParameters, Parameter};
 use eyre::{bail, Result};
 use map_localizer::HeadingWithoutGyro;
-use perception_wire::localization::{encode_keyframe_pose, encode_map_to_odom};
+use perception_wire::localization::{encode_keyframe_pose, encode_keyframe_poses_moved, encode_map_to_odom};
 use perception_wire::camera::decode_camera_calibration;
 use perception_wire::odometry::decode_odom_pose;
 use perception_wire::{decode_imu, decode_keyframe, MessageContext};
@@ -27,10 +27,12 @@ const ODOM_POSE_INPUT: &str = "odom_pose";
 const CALIBRATION_INPUT: &str = "calibration";
 const KEYFRAME_POSE_OUTPUT: &str = "keyframe_pose";
 const MAP_TO_ODOM_OUTPUT: &str = "map_to_odom";
+const KEYFRAME_POSES_MOVED_OUTPUT: &str = "keyframe_poses_moved";
 
 struct Outputs {
     keyframe_pose: DataId,
     map_to_odom: DataId,
+    keyframe_poses_moved: DataId,
 }
 
 fn settings() -> Result<NodeSettings> {
@@ -92,6 +94,10 @@ fn send(node: &mut DoraNode, outputs: &Outputs, handled: Handled, started: Insta
         parameters.insert("localize_ms".to_owned(), Parameter::Float(started.elapsed().as_secs_f64() * 1e3));
         node.send_output(outputs.keyframe_pose.clone(), parameters, encode_keyframe_pose(&estimate.to_message()))?;
     }
+    if let Some(moved) = handled.moved {
+        tracing::info!(map_version = moved.map_version.0, keyframes = moved.keyframes.len(), "optimisation moved keyframes already sent");
+        node.send_output(outputs.keyframe_poses_moved.clone(), MetadataParameters::default(), encode_keyframe_poses_moved(&moved))?;
+    }
     if let Some(correction) = handled.map_to_odom {
         node.send_output(outputs.map_to_odom.clone(), MetadataParameters::default(), encode_map_to_odom(&correction))?;
     }
@@ -111,7 +117,9 @@ fn main() -> Result<()> {
     );
     let mut localizer = LocalizerNode::new(settings);
     let (mut node, mut events) = DoraNode::init_from_env()?;
-    let outputs = Outputs { keyframe_pose: DataId::from(KEYFRAME_POSE_OUTPUT.to_owned()), map_to_odom: DataId::from(MAP_TO_ODOM_OUTPUT.to_owned()) };
+    let outputs = Outputs { keyframe_pose: DataId::from(KEYFRAME_POSE_OUTPUT.to_owned()), map_to_odom: DataId::from(MAP_TO_ODOM_OUTPUT.to_owned()),
+        keyframe_poses_moved: DataId::from(KEYFRAME_POSES_MOVED_OUTPUT.to_owned()),
+    };
     while let Some(event) = events.recv() {
         match event {
             Event::Input { id, data, .. } => {

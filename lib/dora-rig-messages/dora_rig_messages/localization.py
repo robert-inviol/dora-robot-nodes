@@ -1,4 +1,5 @@
-"""Where each keyframe is in the map, and the correction from the robot's odometry frame to the map.
+"""Where each keyframe is in the map, where optimisation moved past keyframes to, and the correction from the
+robot's odometry frame to the map.
 
 The map frame is z up, gravity aligned, metres. A keyframe pose (x, y, z, yaw) is applied to that keyframe's
 gravity-aligned floor frame (x right, y forward, z up, at the camera): a floor-frame point p is at
@@ -58,6 +59,26 @@ MAP_TO_ODOM_TYPE = pa.struct(
         ("sigma_xy_m", pa.float32()),
         ("sigma_z_m", pa.float32()),
         ("sigma_yaw_rad", pa.float32()),
+    ]
+)
+
+MOVED_KEYFRAME_TYPE = pa.struct(
+    [
+        pa.field("frame_id", pa.uint64(), nullable=False),
+        pa.field("x_m", pa.float32(), nullable=False),
+        pa.field("y_m", pa.float32(), nullable=False),
+        pa.field("z_m", pa.float32(), nullable=False),
+        pa.field("yaw_rad", pa.float32(), nullable=False),
+    ]
+)
+
+# Sent after an optimisation of the pose graph that moved keyframes already sent: every one that moved, with its new
+# pose. A keyframe's own keyframe_pose is never sent again; this is how its later poses arrive.
+KEYFRAME_POSES_MOVED_TYPE = pa.struct(
+    [
+        # The pose graph the poses come from: the optimisation's.
+        pa.field("map_version", pa.uint64(), nullable=False),
+        pa.field("keyframes", pa.list_(pa.field("item", MOVED_KEYFRAME_TYPE, nullable=False)), nullable=False),
     ]
 )
 
@@ -176,8 +197,45 @@ class MapToOdom:
         )
 
 
+@dataclass(frozen=True)
+class MovedKeyframe:
+    frame_id: FrameId
+    x_m: float
+    y_m: float
+    z_m: float
+    yaw_rad: float
+
+    def __post_init__(self) -> None:
+        for name in ("x_m", "y_m", "z_m", "yaw_rad"):
+            _finite(name, getattr(self, name))
+
+
+@dataclass(frozen=True)
+class KeyframePosesMoved:
+    map_version: MapVersion
+    keyframes: tuple[MovedKeyframe, ...]
+
+    def to_arrow(self) -> pa.Array:
+        return one_row({"map_version": self.map_version, "keyframes": [vars(k) for k in self.keyframes]}, KEYFRAME_POSES_MOVED_TYPE)
+
+    @classmethod
+    def from_arrow(cls, array: pa.Array) -> "KeyframePosesMoved":
+        row = only_row(array, KEYFRAME_POSES_MOVED_TYPE)
+        return cls(
+            map_version=MapVersion(row["map_version"]),
+            keyframes=tuple(MovedKeyframe(**{**k, "frame_id": FrameId(k["frame_id"])}) for k in row["keyframes"]),
+        )
+
+
 # Golden examples of this module's messages, merged into fixtures.EXAMPLES. Every float is exact in float32.
-FIXTURE_EXAMPLES: dict[str, KeyframePose | MapToOdom] = {
+FIXTURE_EXAMPLES: dict[str, KeyframePose | MapToOdom | KeyframePosesMoved] = {
+    "keyframe_poses_moved": KeyframePosesMoved(
+        map_version=MapVersion(8),
+        keyframes=(
+            MovedKeyframe(FrameId(40), x_m=1.0, y_m=-0.5, z_m=0.0625, yaw_rad=0.5),
+            MovedKeyframe(FrameId(42), x_m=1.3125, y_m=-0.4375, z_m=0.0625, yaw_rad=0.8125),
+        ),
+    ),
     "keyframe_pose_tracking": KeyframePose(
         frame_id=FrameId(42),
         captured_unix_ns=1_762_560_000_123_456_789,
