@@ -14,7 +14,7 @@ nodes:
       ZENOH_SUBSCRIBE: rig/keyframe=keyframe,rig/imu=imu,rig/instance_masks=instance_masks,rig/spatial_query=spatial_query,rig/goal_status=goal_status,rig/people_tracks=people_tracks,rig/odom_pose=odom_pose,rig/calibration=calibration,rig/posed_depth=posed_depth
       ZENOH_PUBLISH: keyframe_pose=rig/keyframe_pose,occupancy_grid=rig/occupancy_grid,topology=rig/topology,keep_out=rig/keep_out,object_update=rig/object_update,spatial_answer=rig/spatial_answer,nav_goal=rig/nav_goal
     inputs:
-      tick: dora/timer/millis/5
+      tick: dora/timer/millis/1000
       keyframe_pose: localizer/keyframe_pose
       occupancy_grid: dense_map/occupancy_grid
       topology: dense_map/topology
@@ -138,16 +138,6 @@ nodes:
       - spatial_answer
       - nav_goal
 
-  # Planes and the room from each keyframe on its own (dora-depth-perception), for the rig view.
-  - id: plane_segmentation
-    path: ../target/release/dora-depth-perception
-    inputs:
-      keyframe:
-        source: bridge/keyframe
-        queue_size: 1
-    outputs:
-      - room_layout
-
   - id: rig_view
     path: ../../dora-rig-view/target/release/dora-rig-view
     env:
@@ -179,9 +169,6 @@ nodes:
         source: objects/object_update
         queue_size: 256
       topology: dense_map/topology
-      room_layout:
-        source: plane_segmentation/room_layout
-        queue_size: 1
     outputs:
       # Asks the dense map for its whole surface after a missed mesh blocks message.
       - mesh_snapshot_request

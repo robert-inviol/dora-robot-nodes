@@ -17,3 +17,6 @@ dora-node-api = { version = "=0.3.13", default-features = false }
 eyre = "0.6"
 glam = "0.29"
 jpeg-encoder = "0.6"
+# The odometry node's people mask settings, so that the odometry, posed depth and keyframes cut people out by one rule.
+dora-depth-inertial-odometry = { path = "../../dora-depth-perception/dora-depth-inertial-odometry" }
+thiserror = "2"

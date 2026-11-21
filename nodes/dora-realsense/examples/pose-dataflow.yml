@@ -75,7 +75,8 @@ nodes:
     outputs:
       - people_tracks
 
-  # A keyframe at least once a second, sooner on a turn, each led by every IMU sample since the last.
+  # A keyframe at least once a second, sooner on a turn, people cut out of its depth, each led by every IMU sample
+  # since the last.
   - id: keyframes
     path: ../target/release/dora-keyframe-selector
     inputs:
@@ -92,12 +93,17 @@ nodes:
       calibration:
         source: camera/calibration
         queue_size: 1
+      # People cut out of each keyframe's depth, from the poses nearest its time: a second of them may wait.
+      person_poses:
+        source: pose/person_poses
+        queue_size: 30
     outputs:
       - request_color
       - imu
       - keyframe
 
-  # Every third depth frame, halved each way, at the odometry's pose of the depth camera for exactly that frame.
+  # Every third depth frame, people cut out, halved each way, at the odometry's pose of the depth camera for exactly
+  # that frame.
   - id: posed_depth
     path: ../target/release/dora-posed-depth
     inputs:
@@ -110,6 +116,10 @@ nodes:
         queue_size: 100
       calibration:
         source: camera/calibration
+        queue_size: 1
+      # The people to cut out of the depth, by the odometry's rule; only the newest matters.
+      person_poses:
+        source: pose/person_poses
         queue_size: 1
     outputs:
       - posed_depth

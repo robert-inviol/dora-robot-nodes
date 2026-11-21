@@ -8,6 +8,7 @@ license.workspace = true
 
 [dependencies]
 depth-perception = { path = "../depth-perception" }
+wire-schemas = { path = "../wire-schemas" }
 dora-node-api.workspace = true
 eyre.workspace = true
 glam = "0.29"

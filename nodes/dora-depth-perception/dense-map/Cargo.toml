@@ -17,3 +17,4 @@ thiserror = "2"
 
 [dev-dependencies]
 dora-node-api.workspace = true
+toml = "0.9"

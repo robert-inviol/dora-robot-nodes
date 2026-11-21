@@ -1,5 +1,6 @@
 //! dora node: sends every third depth frame of dora-realsense, downsampled for mapping, at the odometry's pose of
-//! the depth camera for exactly that frame, as `posed_depth`.
+//! the depth camera for exactly that frame, as `posed_depth`, with the people of the pose model's `person_poses` cut
+//! out.
 
 use std::time::{Duration, Instant};
 
@@ -11,12 +12,14 @@ use dora_posed_depth::{PosedDepthJoiner, PosedDepthSettings};
 use eyre::{bail, eyre, Context, Result};
 use perception_wire::camera::decode_camera_calibration;
 use perception_wire::odometry::decode_odom_pose;
+use perception_wire::people::decode_person_poses;
 use perception_wire::posed_depth::{encode_posed_depth_frame, PosedDepthFrame};
 use shared_memory_outputs::SharedMemoryOutputs;
 
 const DEPTH_INPUT: &str = "depth";
 const ODOM_INPUT: &str = "odom_pose";
 const CALIBRATION_INPUT: &str = "calibration";
+const PERSON_POSES_INPUT: &str = "person_poses";
 const POSED_DEPTH_OUTPUT: &str = "posed_depth";
 /// The most shared-memory samples of the output its receivers may hold unreleased: three seconds of frames.
 const UNRELEASED_SAMPLES_LIMIT: usize = 30;
@@ -61,6 +64,10 @@ fn main() -> Result<()> {
                             depth_mm.values(),
                         )?
                     }
+                    PERSON_POSES_INPUT => {
+                        joiner.on_person_poses(&decode_person_poses(data.as_ref()).wrap_err("reading person poses")?)?;
+                        Vec::new()
+                    }
                     ODOM_INPUT => joiner.on_odom_pose(decode_odom_pose(data.as_ref()).wrap_err("reading an odom pose")?)?,
                     other => bail!("unexpected input {other}"),
                 };
@@ -68,8 +75,9 @@ fn main() -> Result<()> {
                 if logged_at.elapsed() >= LOG_EVERY {
                     let t = joiner.take_tally();
                     eprintln!(
-                        "[posed-depth] {:.1} frames/s sent; {} without their pose, {} dropped waiting, {} before the calibration, {} odometry restarts",
+                        "[posed-depth] {:.1} frames/s sent; {} with people cut out, {} without their pose, {} dropped waiting, {} before the calibration, {} odometry restarts",
                         t.sent as f64 / logged_at.elapsed().as_secs_f64(),
+                        t.with_people,
                         t.without_pose,
                         t.dropped_waiting,
                         t.before_calibration,

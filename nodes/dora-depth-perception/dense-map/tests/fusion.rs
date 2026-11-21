@@ -136,6 +136,48 @@ fn posed_depth_frames_wait_for_a_correction_of_their_own_odom_frame() {
 }
 
 #[test]
+fn a_posed_depth_frame_is_fused_with_the_correction_valid_when_it_was_captured() {
+    let house = two_rooms();
+    let odom = CameraNanos(5_000);
+    let at_capture = correction(odom);
+    // A later correction, valid after the frame was captured, that moves the odom frame 30 cm along x.
+    let later = MapToOdom { valid_from: CameraNanos(odom.0 + 2_000), correction: Pose4Dof { x_m: at_capture.correction.x_m + 0.3, ..at_capture.correction }, ..at_capture };
+    let frame = posed_frame(&house, Vec3::new(2.0, 1.0, 0.0), 0.0, &at_capture, odom);
+
+    let mut fused_late = mapper(DenseMapSettings::default());
+    fused_late.on_map_to_odom(at_capture);
+    fused_late.on_map_to_odom(later);
+    assert_eq!(fused_late.on_posed_depth(&frame), PosedDepthArrival::Fused);
+    let mut fused_at_once = mapper(DenseMapSettings::default());
+    fused_at_once.on_map_to_odom(at_capture);
+    fused_at_once.on_posed_depth(&frame);
+    assert_same_field(fused_late.field(), fused_at_once.field());
+
+    let too_old = PosedDepthFrame { camera_ns: CameraNanos(odom.0 + 100), ..frame.clone() };
+    assert_eq!(
+        fused_late.on_posed_depth(&too_old),
+        PosedDepthArrival::Unfused(Unfused::BeforeCorrections { captured: CameraNanos(odom.0 + 100), oldest_valid_from: at_capture.valid_from })
+    );
+}
+
+#[test]
+fn corrections_held_are_capped_and_a_new_odom_frame_lets_go_of_the_old_ones() {
+    let house = two_rooms();
+    let odom = CameraNanos(5_000);
+    let settings = DenseMapSettings { buffers: dense_map::settings::BufferSettings { max_corrections: 2, ..Default::default() }, ..Default::default() };
+    let mut mapper = mapper(settings);
+    for valid_from in [500, 600, 700] {
+        mapper.on_map_to_odom(MapToOdom { valid_from: CameraNanos(odom.0 + valid_from), ..correction(odom) });
+    }
+    let frame = posed_frame(&house, Vec3::new(2.0, 1.0, 0.0), 0.0, &correction(odom), odom);
+    let at_550 = PosedDepthFrame { camera_ns: CameraNanos(odom.0 + 550), ..frame.clone() };
+    assert!(matches!(mapper.on_posed_depth(&at_550), PosedDepthArrival::Unfused(Unfused::BeforeCorrections { .. })), "the correction valid from 500 was let go");
+    let next_odom = CameraNanos(9_000);
+    mapper.on_map_to_odom(correction(next_odom));
+    assert!(matches!(mapper.on_posed_depth(&frame), PosedDepthArrival::Unfused(Unfused::OtherOdomFrame { .. })));
+}
+
+#[test]
 fn a_moved_keyframe_rebuilds_only_its_blocks_and_the_map_matches_the_kept_keyframes_fused_from_scratch() {
     let house = two_rooms();
     let settings = DenseMapSettings::default();

@@ -5,7 +5,7 @@ use std::time::Duration;
 use glam::{DQuat, DVec3, Vec3};
 
 use crate::association::{measure, AssociationSettings, BodyPoint, RangeNoise};
-use crate::filter::{MeasurementUpdate, MeasurementUpdateError, MeasurementUpdateSettings, ErrorStateFilter, ImuNoise, InitialUncertainty, PoseInformation, State, DegenerateTranslation};
+use crate::filter::{DepthScaleError, LevelledUncertainty, PositionPerDepthScale, MeasurementUpdate, MeasurementUpdateError, MeasurementUpdateSettings, ErrorStateFilter, ImuNoise, InitialUncertainty, PoseInformation, State, DegenerateTranslation};
 use crate::surfaces::{MapPoint, SurfaceMap};
 use crate::downsampling::{SensorExtrinsics, Downsampler, DownsamplingSettings};
 
@@ -30,6 +30,10 @@ pub struct OdometrySettings {
     pub map_half_extent_m: f32,
     /// The map is trimmed once the body has moved this far since the last trim.
     pub map_trim_after_m: f32,
+    /// One sigma of each part of the depth scale error that a cloud's readings share and the map's readings do not:
+    /// how far the camera's depth may have changed since it laid down the surfaces it sees. It is not estimated;
+    /// [`DepthInertialOdometry::levelled_uncertainty`] adds what it does to the position.
+    pub depth_scale_change_sigma: DepthScaleError,
 }
 
 impl OdometrySettings {
@@ -57,6 +61,9 @@ impl OdometrySettings {
             measurement_update: MeasurementUpdateSettings { max_iterations: 4, settled_m: 1e-4, settled_rad: 1e-4, min_rows: 50 },
             map_half_extent_m: 8.0,
             map_trim_after_m: 1.0,
+            // The D455's depth grows as it warms up after its stream starts, more on the left of the image than on
+            // the right (see the README, "Depth warm-up").
+            depth_scale_change_sigma: DepthScaleError { uniform: 0.0085, across: 0.004, down: 0.0013 },
         }
     }
 }
@@ -209,6 +216,9 @@ pub struct DepthInertialOdometry<M> {
     downsampled: Vec<BodyPoint>,
     world_points: Vec<MapPoint>,
     last_cloud: CloudCounts,
+    /// How far each part of a depth scale error shared by every depth reading moved the position at the last
+    /// measurement update, per unit of that part, in the world frame.
+    position_shift_per_depth_scale: PositionPerDepthScale,
 }
 
 impl<M: SurfaceMap> DepthInertialOdometry<M> {
@@ -226,6 +236,7 @@ impl<M: SurfaceMap> DepthInertialOdometry<M> {
             downsampled: Vec::new(),
             world_points: Vec::new(),
             last_cloud: CloudCounts::default(),
+            position_shift_per_depth_scale: PositionPerDepthScale::zeros(),
         }
     }
 
@@ -242,6 +253,23 @@ impl<M: SurfaceMap> DepthInertialOdometry<M> {
 
     pub fn filter(&self) -> &ErrorStateFilter {
         &self.filter
+    }
+
+    /// One-sigma uncertainty of the levelled pose against the room for a camera at rest: the filter's own, which is
+    /// against the map, with the position shift that a change of the camera's depth scale since it laid down the
+    /// map would cause ([`OdometrySettings::depth_scale_change_sigma`]). The map's drift while the camera travels is
+    /// not in it.
+    pub fn levelled_uncertainty(&self) -> LevelledUncertainty {
+        let against_map = self.filter.levelled_uncertainty();
+        let levelling = self.filter.state().levelling();
+        let sigmas = self.settings.depth_scale_change_sigma.as_vector();
+        let mut variance = DVec3::ZERO;
+        for (part, column) in self.position_shift_per_depth_scale.column_iter().enumerate() {
+            let shift = levelling * DVec3::new(column[0], column[1], column[2]) * sigmas[part];
+            variance += shift * shift;
+        }
+        let position_sigma_m = (against_map.position_sigma_m * against_map.position_sigma_m + variance).map(f64::sqrt);
+        LevelledUncertainty { position_sigma_m, ..against_map }
     }
 
     pub fn map(&self) -> &M {
@@ -289,18 +317,19 @@ impl<M: SurfaceMap> DepthInertialOdometry<M> {
         let outcome = if self.map.is_empty() {
             CloudOutcome::StartedMap
         } else {
-            let (map, downsampled, association) = (&self.map, &self.downsampled, &self.settings.association);
+            let (map, downsampled, association, sensor) = (&self.map, &self.downsampled, &self.settings.association, &self.settings.sensor_extrinsics);
             let predicted_pose_covariance = self.filter.pose_covariance();
             let last_cloud = &mut self.last_cloud;
             let MeasurementUpdate { iterations, information } = self
                 .filter
                 .update(&self.settings.measurement_update, |state| {
-                    let cloud = measure(downsampled, map, state, &predicted_pose_covariance, association);
+                    let cloud = measure(downsampled, sensor, map, state, &predicted_pose_covariance, association);
                     (last_cloud.found_surface, last_cloud.within_gate) = (cloud.found_surface, cloud.information.rows);
                     cloud.information.merge(others(state))
                 })
                 .map_err(OdometryError::NotCorrected)?;
             self.corrected_at = Some(time);
+            self.position_shift_per_depth_scale = information.position_shift_per_depth_scale();
             CloudOutcome::Corrected {
                 iterations,
                 matched: information.rows,

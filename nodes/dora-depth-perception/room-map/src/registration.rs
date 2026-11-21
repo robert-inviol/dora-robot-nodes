@@ -1,9 +1,8 @@
 //! Point-to-plane ICP over the four degrees of freedom gravity leaves free: yaw and translation.
 
 use glam::Vec3;
-use rayon::prelude::*;
 
-use crate::grid::{surface_normals, NeighbourGrid};
+use crate::grid::{surface_normals, CellIndex};
 use crate::pose::Pose;
 
 #[derive(Clone, Debug)]
@@ -40,24 +39,26 @@ impl Default for RegistrationSettings {
 
 /// Points with surface normals, ready to be registered against.
 pub struct Target {
-    grid: NeighbourGrid,
+    points: Vec<Vec3>,
     normals: Vec<Option<Vec3>>,
+    /// Cells as wide as the widest correspondence distance or the normal radius, whichever is wider.
+    index: CellIndex,
 }
 
 impl Target {
     pub fn new(points: Vec<Vec3>, settings: &RegistrationSettings) -> Target {
         let cell = settings.correspondence_schedule_m.iter().copied().fold(settings.normal_radius_m, f32::max);
-        let grid = NeighbourGrid::new(points, cell);
-        let normals = surface_normals(&grid, settings.normal_radius_m, settings.normal_min_neighbours, settings.normal_max_flatness);
-        Target { grid, normals }
+        let index = CellIndex::new(&points, cell);
+        let normals = surface_normals(&points, &index, settings.normal_radius_m, settings.normal_min_neighbours, settings.normal_max_flatness);
+        Target { points, normals, index }
     }
 
     pub fn len(&self) -> usize {
-        self.grid.points.len()
+        self.points.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.grid.points.is_empty()
+        self.points.is_empty()
     }
 }
 
@@ -71,8 +72,9 @@ pub struct Registration {
     pub weakest_constraint: f64,
 }
 
-/// The normal equations are summed over fixed chunks of the source, in parallel, and the chunk sums are added in
-/// source order: the same inputs give the same pose and fitness whatever the thread count.
+/// The normal equations are summed over fixed chunks of the source, and the chunk sums are added in source order.
+/// One registration runs on one thread: its iterations are too short for the work of each to be worth spreading
+/// over threads, and callers that try many seeds run those registrations in parallel instead.
 const SUM_CHUNK_POINTS: usize = 1024;
 
 #[derive(Default, Clone, Copy)]
@@ -161,13 +163,13 @@ fn register_with(source: &[Vec3], target: &Target, seed: Pose, settings: &Regist
     let mut last = Normal4::default();
     for &max_distance in &settings.correspondence_schedule_m {
         for _ in 0..settings.iterations_per_stage {
-            let chunk_sums: Vec<Normal4> = source
-                .par_chunks(SUM_CHUNK_POINTS)
+            last = source
+                .chunks(SUM_CHUNK_POINTS)
                 .map(|chunk| chunk.iter().fold(Normal4::default(), |mut acc, &p| {
                     let moved = pose.apply(p);
-                    let Some((index, _)) = target.grid.nearest(moved, max_distance) else { return acc };
+                    let Some((index, _)) = target.index.nearest(&target.points, moved, max_distance) else { return acc };
                     let Some(normal) = target.normals[index as usize] else { return acc };
-                    let r = normal.dot(moved - target.grid.points[index as usize]) as f64;
+                    let r = normal.dot(moved - target.points[index as usize]) as f64;
                     let around = moved - pose.translation;
                     let j = [normal.dot(Vec3::new(-around.y, around.x, 0.0)) as f64, normal.x as f64, normal.y as f64, normal.z as f64];
                     let weight = if r.abs() <= settings.huber_m as f64 { 1.0 } else { settings.huber_m as f64 / r.abs() };
@@ -183,8 +185,7 @@ fn register_with(source: &[Vec3], target: &Target, seed: Pose, settings: &Regist
                     }
                     acc
                 }))
-                .collect();
-            last = chunk_sums.into_iter().fold(Normal4::default(), Normal4::add);
+                .fold(Normal4::default(), Normal4::add);
             let mut damped = last.h;
             for (k, row) in damped.iter_mut().enumerate() {
                 row[k] += settings.damping;

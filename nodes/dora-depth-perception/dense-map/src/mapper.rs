@@ -1,7 +1,7 @@
 //! The dense map as a node runs it.
 //!
 //! Two kinds of depth are fused. Posed depth frames, about ten a second, are fused as they arrive at their odometry
-//! pose carried into the map by the localizer's latest correction of their odom frame; they are fused once and not
+//! pose carried into the map by the localizer's correction valid at their capture time; they are fused once and not
 //! kept. Keyframes wait for the localizer's pose (or the pose for its keyframe), are fused, and are kept, at most one
 //! per pose cell and at most a set number in all, as the durable record the map is rebuilt from.
 //!
@@ -69,6 +69,8 @@ pub enum Unfused {
     NoCorrection,
     /// The latest correction is for another odom frame.
     OtherOdomFrame { frame: CameraNanos, correction: CameraNanos },
+    /// The frame was captured before the oldest correction held for its odom frame became valid.
+    BeforeCorrections { captured: CameraNanos, oldest_valid_from: CameraNanos },
 }
 
 /// What happened to a posed depth frame on arrival.
@@ -104,6 +106,9 @@ pub struct TickReport {
     pub no_floor: bool,
     pub slice_time: Option<Duration>,
     pub mesh_time: Option<Duration>,
+    /// Blocks meshed in the pass collected whose surface stayed within the resend rule of the one sent, so were not
+    /// sent again.
+    pub mesh_blocks_kept_as_sent: usize,
 }
 
 struct Rebuild<F> {
@@ -134,7 +139,8 @@ pub struct DenseMapper<F: BlockField> {
     awaiting_pose: VecDeque<DepthKeyframe>,
     early_poses: VecDeque<KeyframePose>,
     kept: KeptKeyframes,
-    correction: Option<MapToOdom>,
+    /// The latest corrections of the latest correction's odom frame, oldest valid first.
+    corrections: VecDeque<MapToOdom>,
     /// Blocks to rebuild once the running rebuild lands, and the map version of the moves that asked for them.
     to_rebuild: FxHashSet<IVec3>,
     to_rebuild_version: Option<MapVersion>,
@@ -170,7 +176,7 @@ impl<F: BlockField> DenseMapper<F> {
             map_version: None,
             awaiting_pose: VecDeque::new(),
             early_poses: VecDeque::new(),
-            correction: None,
+            corrections: VecDeque::new(),
             to_rebuild: FxHashSet::default(),
             to_rebuild_version: None,
             rebuild: None,
@@ -296,17 +302,37 @@ impl<F: BlockField> DenseMapper<F> {
             .collect()
     }
 
+    /// Holds a correction from the odom frame to the map, in order of the time it is valid from, replacing one
+    /// valid from the same time; a correction of a new odom frame lets go of the old frame's, and one of an older odom
+    /// frame than those held is let go itself, as no frame of it will be fused again. At most
+    /// `buffers.max_corrections` are held, the oldest let go first.
     pub fn on_map_to_odom(&mut self, correction: MapToOdom) {
-        self.correction = Some(correction);
+        if self.corrections.back().is_some_and(|latest| latest.odom_started != correction.odom_started) {
+            if correction.odom_started.0 < self.corrections.back().expect("checked above").odom_started.0 {
+                return;
+            }
+            self.corrections.clear();
+        }
+        match self.corrections.binary_search_by_key(&correction.valid_from.0, |held| held.valid_from.0) {
+            Ok(at) => self.corrections[at] = correction,
+            Err(at) => self.corrections.insert(at, correction),
+        }
+        while self.corrections.len() > self.settings.buffers.max_corrections {
+            self.corrections.pop_front();
+        }
     }
 
-    /// Fuses a posed depth frame at its odometry pose corrected into the map, when the latest correction is for its
-    /// odom frame.
+    /// Fuses a posed depth frame at its odometry pose corrected into the map by the latest correction valid at its
+    /// capture time, when the corrections held are for its odom frame and one was valid by then.
     pub fn on_posed_depth(&mut self, frame: &PosedDepthFrame) -> PosedDepthArrival {
-        let Some(correction) = self.correction else { return PosedDepthArrival::Unfused(Unfused::NoCorrection) };
-        if correction.odom_started != frame.odom_started {
-            return PosedDepthArrival::Unfused(Unfused::OtherOdomFrame { frame: frame.odom_started, correction: correction.odom_started });
+        let Some(latest) = self.corrections.back() else { return PosedDepthArrival::Unfused(Unfused::NoCorrection) };
+        if latest.odom_started != frame.odom_started {
+            return PosedDepthArrival::Unfused(Unfused::OtherOdomFrame { frame: frame.odom_started, correction: latest.odom_started });
         }
+        let Some(correction) = self.corrections.iter().rev().find(|held| held.valid_from.0 <= frame.camera_ns.0).copied() else {
+            let oldest_valid_from = self.corrections.front().expect("not empty").valid_from;
+            return PosedDepthArrival::Unfused(Unfused::BeforeCorrections { captured: frame.camera_ns, oldest_valid_from });
+        };
         self.field.fuse_into_footprint(&PosedDepth::corrected(frame, &correction));
         self.note_version(correction.map_version);
         self.changed_since_slice = true;
@@ -446,7 +472,7 @@ impl<F: BlockField> DenseMapper<F> {
         let thread = std::thread::spawn(move || {
             let mesh = unmeshed.map(|unmeshed| {
                 let started = Instant::now();
-                (derived.mesh(&field, &unmeshed, now), started.elapsed())
+                (derived.mesh(&field, &unmeshed), started.elapsed())
             });
             let slice = slice.then(|| {
                 let started = Instant::now();
@@ -467,7 +493,7 @@ impl<F: BlockField> DenseMapper<F> {
         self.derived = Some(derived);
         if let Some((pass, time)) = derivation.mesh {
             report.mesh_time = Some(time);
-            self.unmeshed.extend(pass.deferred);
+            report.mesh_blocks_kept_as_sent = pass.kept_as_sent;
             if !pass.blocks.is_empty() {
                 for mesh_block in &pass.blocks {
                     match mesh_block.triangles.is_empty() {

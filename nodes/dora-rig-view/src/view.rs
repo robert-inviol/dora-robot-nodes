@@ -96,25 +96,6 @@ pub struct PlaceView {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
-pub struct PlaneView {
-    /// floor, ceiling, wall or level surface.
-    pub kind: &'static str,
-    pub area_m2: f32,
-    /// In the keyframe's floor frame.
-    pub outline: Vec<[f32; 3]>,
-}
-
-/// The room one keyframe saw, in its floor frame: a prism from the floor to the ceiling over the footprint.
-#[derive(Clone, Debug, PartialEq, Serialize)]
-pub struct RoomBoxView {
-    pub floor_m: f32,
-    pub ceiling_m: f32,
-    pub footprint: Vec<[f32; 2]>,
-    /// For each edge ending at the matching corner, whether a wall was seen along it.
-    pub edge_seen: Vec<bool>,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Update {
     /// The first message on every connection, and the first of the whole scene sent again to every page when the
@@ -147,17 +128,6 @@ pub enum Update {
     ObjectGone { object_id: u64 },
     /// The whole latest topology; it replaces the one before.
     Topology { rooms: Vec<RoomView>, doorways: Vec<DoorwayView>, places: Vec<PlaceView>, edges: Vec<[u64; 2]> },
-    /// The planes and the room of the latest keyframe whose room layout came, in its floor frame, at its map pose; not
-    /// drawn while that pose is not drawn. It replaces the one before.
-    RoomLayout {
-        frame_id: u64,
-        pose: FloorPose,
-        drawn: bool,
-        planes: Vec<PlaneView>,
-        room: Option<RoomBoxView>,
-        /// Why there is no room.
-        room_problem: Option<String>,
-    },
     /// Why a layer is not drawn, or may be out of date, or null once it is drawn again.
     Notice { topic: NoticeTopic, text: Option<String> },
     /// How the dense map's surface messages have come: gaps in their sequence, each one or more missed messages,

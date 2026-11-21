@@ -63,7 +63,10 @@ fn a_tracker_fed_raw_depth_images_and_separate_imu_streams_follows_a_drive_aroun
     assert!(poses.windows(2).all(|pair| pair[0].time < pair[1].time), "pose times strictly increase");
     for pose in &poses[1..] {
         let (sigma, degenerate) = (pose.uncertainty, pose.degenerate().expect("a corrected frame has a degenerate direction"));
-        assert!(sigma.position_sigma_m.min_element() > 0.0 && sigma.position_sigma_m.max_element() < 0.05, "{pose:?}");
+        // Against the map the pose is known to centimetres. The reported sigma adds what a change of the depth scale
+        // would do to the position, which is largest where a cloud ties sliding to turning.
+        assert!(pose.largest_position_sigma_m > 0.0 && pose.largest_position_sigma_m < 0.05, "{pose:?}");
+        assert!(sigma.position_sigma_m.min_element() > 0.0 && sigma.position_sigma_m.max_element() < 0.1, "{pose:?}");
         assert!(sigma.tilt_sigma_rad > 0.0 && sigma.tilt_sigma_rad < 0.02 && sigma.heading_sigma_rad > 0.0 && sigma.heading_sigma_rad < 0.02, "{pose:?}");
         assert!((degenerate.direction.length() - 1.0).abs() < 1e-9 && degenerate.sigma_m > 0.0, "{pose:?}");
         assert!(pose.matched_points() >= 50, "{pose:?}");

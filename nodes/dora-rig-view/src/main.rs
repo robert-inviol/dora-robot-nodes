@@ -1,7 +1,7 @@
 //! dora node serving the rig view page on `RIG_VIEW_ADDRESS`, port `RIG_VIEW_PORT`.
 //!
 //! Inputs `keyframe`, `keyframe_pose`, `pose_graph_update`, `odom_pose`, `map_to_odom`, `people_tracks`,
-//! `mesh_blocks`, `object_update`, `topology` and `room_layout` (a room_layout or scene message of the plane_segmentation node).
+//! `mesh_blocks`, `object_update` and `topology`.
 //! Every input is optional; an input the node does not know, or an error from dora, stops it. Output
 //! `mesh_snapshot_request` asks the dense map for its whole surface when a surface message was missed or the node
 //! joined the dense map's run late.
@@ -21,7 +21,6 @@ use perception_wire::localization::{decode_keyframe_pose, decode_pose_graph_upda
 use perception_wire::objects::decode_object_update;
 use perception_wire::odometry::decode_odom_pose;
 use perception_wire::people::decode_people_tracks;
-use perception_wire::room_layout::decode_room_layout;
 use perception_wire::navigation::UnixNanos;
 use perception_wire::space_map::{decode_mesh_blocks, decode_topology, encode_mesh_snapshot_request, MeshSnapshotRequest};
 use perception_wire::{decode_keyframe, MessageContext};
@@ -77,7 +76,6 @@ fn decode(input: &str, data: &dyn Array) -> Result<RigInput> {
             RigInput::MeshBlocks(decode_mesh_blocks(data).wrap_err("decoding a mesh_blocks message")?)
         }
         "object_update" => RigInput::ObjectUpdate(decode_object_update(data).for_message(input)?),
-        "room_layout" => RigInput::RoomLayout(decode_room_layout(data).for_message(input)?),
         "topology" => RigInput::Topology(decode_topology(data).wrap_err("decoding a topology message")?),
         other => bail!("unknown input {other}"),
     })

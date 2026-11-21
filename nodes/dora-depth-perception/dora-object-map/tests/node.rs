@@ -7,7 +7,7 @@ use glam::{Vec2, Vec3};
 use object_map::synthetic::{LabelledBox, SyntheticScene};
 use object_map::ObservedFrame;
 use object_map::ObjectMapSettings;
-use perception_wire::localization::{encode_keyframe_pose, FrameId, KeyframePose, Pose4Dof, Tracking};
+use perception_wire::localization::{encode_keyframe_pose, FrameId, KeyframePose, KeyframeSelection, Pose4Dof, Tracking};
 use perception_wire::navigation::{MapVersion, UnixNanos};
 use perception_wire::objects::{decode_object_update, ObjectUpdate, ObjectUpdateKind};
 use perception_wire::{encode_keyframe, encode_instance_masks};
@@ -40,6 +40,10 @@ fn keyframe_pose(frame: &ObservedFrame, tracking: Tracking) -> KeyframePose {
         map_version: frame.map_version,
         pose: Pose4Dof { x_m: t.x, y_m: t.y, z_m: t.z, yaw_rad: frame.pose.yaw_rad },
         tracking,
+        selection: match tracking {
+            Tracking::Lost => KeyframeSelection::NotLocalized,
+            _ => KeyframeSelection::Selected,
+        },
         residual_m: 0.01,
         inlier_fraction: 0.9,
     }

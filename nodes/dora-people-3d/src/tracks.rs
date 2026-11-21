@@ -1,9 +1,10 @@
-//! People tracks in 3D: each tracked person's keypoints lifted to 3D with depth, their torso as their position, smoothed
-//! over time, and held for a while as lost once the pose model's tracker stops reporting them.
+//! People tracks in 3D: each tracked person's keypoints lifted to 3D with depth, their torso as their position, their
+//! joints fitted to a skeleton, both smoothed over time, and held for a while as lost once the pose model's tracker
+//! stops reporting them.
 //!
 //! A person keeps the id this tracker gave them while the pose model's tracker renumbers them: a new pose-tracker id
-//! that turns up where a person it stopped reporting was heading, nearer to them than to anyone it still reports,
-//! takes over that person.
+//! that turns up on the way from where a person it stopped reporting was last seen to where they were heading, nearer
+//! to them than to anyone it still reports, takes over that person.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -17,6 +18,7 @@ use perception_wire::people::{
 };
 
 use crate::depth::DepthImage;
+use crate::joint_smoothing::{JointSmoothing, JointSmoothingSettings};
 use crate::one_euro::{OneEuro, OneEuroSettings};
 use crate::skeleton::{JointObservation, SkeletonFit, SkeletonSettings};
 
@@ -36,10 +38,14 @@ pub struct TrackSettings {
     /// How long a person the pose tracker has dropped is still reported, as lost, and can be taken over by a new
     /// pose-tracker id.
     pub keep_lost: Duration,
-    /// How far from where a dropped person was heading a new pose-tracker id may turn up and still take them over.
+    /// How far from the way between where a dropped person was last seen and where they were heading a new
+    /// pose-tracker id may turn up and still take them over.
     pub rejoin_radius_m: f32,
+    /// The torso position's filter.
     pub smoothing: OneEuroSettings,
     pub skeleton: SkeletonSettings,
+    /// Each fitted joint's filter.
+    pub joint_smoothing: JointSmoothingSettings,
 }
 
 impl Default for TrackSettings {
@@ -53,11 +59,13 @@ impl Default for TrackSettings {
             rejoin_radius_m: 0.5,
             smoothing: OneEuroSettings::default(),
             skeleton: SkeletonSettings::default(),
+            joint_smoothing: JointSmoothingSettings::DEFAULT,
         }
     }
 }
 
 /// One tracked person of a pose frame, lifted to 3D in the colour camera's frame.
+#[derive(Clone)]
 pub struct LiftedPerson {
     pose: PersonPose,
     pose_track_id: TrackId,
@@ -77,6 +85,7 @@ struct PersonInTrackFrame {
 }
 
 /// A pose frame's tracked people lifted to 3D in the colour camera's frame, before tracking.
+#[derive(Clone)]
 pub struct LiftedFrame {
     pub frame_id: u64,
     pub captured_camera_ns: i64,
@@ -120,16 +129,34 @@ struct Followed {
     filter: OneEuro,
     filtered_at_ns: Option<i64>,
     skeleton: SkeletonFit,
+    joint_smoothing: JointSmoothing,
     last: PersonTrack,
     last_position: Option<LastPosition>,
 }
 
+/// The way a dropped person may have gone: from where they were last seen to where their last velocity carries them
+/// by now. The velocity of someone standing still is noise, so a person who turns up again where they stood is on
+/// it as surely as one who walked on.
+#[derive(Clone, Copy, Debug)]
+struct WayAhead {
+    from: Vec3,
+    to: Vec3,
+}
+
+impl WayAhead {
+    fn distance(&self, point: Vec3) -> f32 {
+        let along = self.to - self.from;
+        let t = if along.length_squared() > 0.0 { ((point - self.from).dot(along) / along.length_squared()).clamp(0.0, 1.0) } else { 0.0 };
+        point.distance(self.from + along * t)
+    }
+}
+
 impl Followed {
-    /// Where this person would be at `now_ns`, carried on at their last velocity.
-    fn heading_to(&self, now_ns: i64) -> Option<Vec3> {
+    /// The way this person may have gone by `now_ns`, carried on at their last velocity.
+    fn way_ahead(&self, now_ns: i64) -> Option<WayAhead> {
         let last = self.last_position.as_ref()?;
         let gap_s = (now_ns - last.seen_ns) as f32 * 1e-9;
-        Some(last.position + last.velocity * gap_s)
+        Some(WayAhead { from: last.position, to: last.position + last.velocity * gap_s })
     }
 }
 
@@ -196,18 +223,18 @@ impl PeopleTracker {
     }
 
     /// The person id each pose-tracker id in this frame belongs to: the person it already follows, else a dropped
-    /// person it turns up close to where they were heading, else a new person. A dropped person is one whose
+    /// person it turns up close to the way they were going, else a new person. A dropped person is one whose
     /// pose-tracker id is not in this frame. A newcomer takes over a dropped person only when it is nearer to where
-    /// they were heading than to anyone the pose tracker still reports, since otherwise it may be one of them seen
+    /// they were going than to anyone the pose tracker still reports, since otherwise it may be one of them seen
     /// twice, or someone beside them.
     fn assign_people(&mut self, seen: &[(TrackId, Option<Vec3>)], now_ns: i64) -> Vec<TrackId> {
         let following: HashMap<TrackId, TrackId> = self.followed.iter().map(|(&id, f)| (f.pose_track_id, id)).collect();
         let mut assigned: Vec<Option<TrackId>> = seen.iter().map(|(pose_id, _)| following.get(pose_id).copied()).collect();
-        let dropped: Vec<(TrackId, Vec3)> = self
+        let dropped: Vec<(TrackId, WayAhead)> = self
             .followed
             .iter()
             .filter(|(&id, f)| !assigned.contains(&Some(id)) && !seen.iter().any(|(pose_id, _)| *pose_id == f.pose_track_id))
-            .filter_map(|(&id, f)| Some((id, f.heading_to(now_ns)?)))
+            .filter_map(|(&id, f)| Some((id, f.way_ahead(now_ns)?)))
             .collect();
         let still_reported: Vec<Vec3> =
             seen.iter().zip(&assigned).filter(|(_, person)| person.is_some()).filter_map(|((_, centre), _)| *centre).collect();
@@ -217,7 +244,7 @@ impl PeopleTracker {
             .enumerate()
             .filter(|&(i, _)| assigned[i].is_none())
             .filter_map(|(i, (_, centre))| Some((i, (*centre)?)))
-            .flat_map(|(i, centre)| dropped.iter().map(move |&(id, heading)| (centre, i, id, centre.distance(heading))))
+            .flat_map(|(i, centre)| dropped.iter().map(move |&(id, way)| (centre, i, id, way.distance(centre))))
             .filter(|&(centre, _, _, distance)| distance <= self.settings.rejoin_radius_m && distance < nearest_reported(centre))
             .map(|(_, i, id, distance)| (distance, i, id))
             .collect();
@@ -322,6 +349,7 @@ impl PeopleTracker {
                 filter: OneEuro::new(self.settings.smoothing),
                 filtered_at_ns: None,
                 skeleton: SkeletonFit::new(self.settings.skeleton),
+                joint_smoothing: JointSmoothing::new(self.settings.joint_smoothing),
                 last: PersonTrack {
                     track_id,
                     state: TrackState::Tentative,
@@ -354,7 +382,7 @@ impl PeopleTracker {
                     let fitted = followed.skeleton.fit(now_ns, &observations, f64::from(centre.distance(camera_centre)));
                     self.fitting.0 += started.elapsed();
                     self.fitting.1 += 1;
-                    fitted.into_iter().map(|p| p.map(point)).collect()
+                    followed.joint_smoothing.smooth(now_ns, &fitted).into_iter().map(|p| p.map(point)).collect()
                 }
                 None => vec![None; person.keypoints.len()],
             };
@@ -414,6 +442,7 @@ impl PeopleTracker {
 
 #[cfg(test)]
 mod tests {
+    use glam::Vec3A;
     use perception_wire::camera::{RigidTransform, StreamIntrinsics};
     use perception_wire::people::{Keypoint, PixelBox};
 
@@ -660,6 +689,184 @@ mod tests {
         let position = lost.tracks[0].position.expect("lost where last positioned");
         assert!((position.z_m - 2.5).abs() < 1e-3, "{position:?}");
         assert!(lost.tracks[0].skeleton_3d.iter().any(Option::is_some), "with the skeleton last fitted");
+    }
+
+    /// A repeatable stream of normally distributed numbers (xorshift64* with Box-Muller).
+    struct Noise(u64);
+
+    impl Noise {
+        fn uniform(&mut self) -> f32 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            ((self.0.wrapping_mul(0x2545_f491_4f6c_dd1d) >> 40) as f32 + 0.5) / (1u64 << 24) as f32
+        }
+
+        fn normal(&mut self, sigma: f32) -> f32 {
+            sigma * (-2.0 * self.uniform().ln()).sqrt() * (std::f32::consts::TAU * self.uniform()).cos()
+        }
+    }
+
+    /// The D455's colour camera at 1280x720.
+    const FOCAL_PX: f32 = 640.0;
+    const CENTRE_PX: (f32, f32) = (640.0, 360.0);
+
+    /// What the camera sees of a person, and how noisy it is.
+    struct Sighting {
+        /// Each keypoint's pixel is off by this much each way.
+        pixel_sigma_px: f32,
+        /// Each depth reading is off by this much along the ray.
+        depth_sigma_m: f32,
+    }
+
+    /// The joint centres of a 1.7 m body standing facing the camera with its hips' midpoint `at`, camera
+    /// coordinates (x right, y down, z forward); the face at the head.
+    fn body_at(at: Vec3) -> [Vec3; 17] {
+        let mut joints = [at + Vec3::new(0.0, -0.62, 0.0); 17];
+        let offsets = [
+            (5, 0.183, -0.48), (6, -0.183, -0.48), (7, 0.20, -0.164), (8, -0.20, -0.164), (9, 0.21, 0.084), (10, -0.21, 0.084),
+            (11, 0.10, 0.0), (12, -0.10, 0.0), (13, 0.10, 0.417), (14, -0.10, 0.417), (15, 0.10, 0.835), (16, -0.10, 0.835),
+        ];
+        for (k, x, y) in offsets {
+            joints[k] = at + Vec3::new(x, y, 0.0);
+        }
+        joints
+    }
+
+    /// One pose frame of a person, as `lift_frame` would make it from noisy keypoints and depth readings.
+    fn sighted(frame_id: u64, pose_track_id: TrackId, body: &[Vec3; 17], sighting: &Sighting, noise: &mut Noise) -> LiftedFrame {
+        let mut keypoints = Vec::new();
+        let mut keypoints_3d = Vec::new();
+        let mut rays = Vec::new();
+        for joint in body {
+            let x_px = FOCAL_PX * joint.x / joint.z + CENTRE_PX.0 + noise.normal(sighting.pixel_sigma_px);
+            let y_px = FOCAL_PX * joint.y / joint.z + CENTRE_PX.1 + noise.normal(sighting.pixel_sigma_px);
+            let ray = Vec3::new((x_px - CENTRE_PX.0) / FOCAL_PX, (y_px - CENTRE_PX.1) / FOCAL_PX, 1.0);
+            // The reading is on the skin facing the camera, 5 cm in front of the joint's centre.
+            let skin_z = joint.z - 0.05 + noise.normal(sighting.depth_sigma_m);
+            keypoints.push(Keypoint { x_px, y_px, score: 0.9 });
+            keypoints_3d.push(Some(ray * skin_z));
+            rays.push(Some(ray.normalize()));
+        }
+        let torso: Vec<Vec3> = TORSO_KEYPOINTS.iter().map(|&k| keypoints_3d[k].unwrap()).collect();
+        let centre = torso.iter().copied().sum::<Vec3>() / torso.len() as f32;
+        let pose = PersonPose { track_id: Some(pose_track_id), score: 0.9, bbox: PixelBox { x_px: 0.0, y_px: 0.0, w_px: 1.0, h_px: 1.0 }, keypoints };
+        LiftedFrame {
+            frame_id,
+            captured_camera_ns: frame_id as i64 * 33_333_333,
+            depth_found: true,
+            width: 1280,
+            height: 720,
+            specific_force: None,
+            people: vec![LiftedPerson { pose, pose_track_id, centre: Some(centre), keypoints_3d, rays }],
+        }
+    }
+
+    /// A still camera 1 m above the odom origin looking along odom y.
+    fn still_camera() -> TrackFrame {
+        let camera_to_odom = Affine3A::from_cols(Vec3A::X, -Vec3A::Z, Vec3A::Y, Vec3A::new(0.0, 0.0, 1.0));
+        TrackFrame::Odom { camera_to_odom, odom_started: CameraNanos(0) }
+    }
+
+    /// A tracker whose joints are the fit's own, unsmoothed: a cutoff far above the frame rate passes every sample.
+    fn unsmoothed() -> TrackSettings {
+        let pass_through = OneEuroSettings { min_cutoff_hz: 1e9, ..JointSmoothingSettings::DEFAULT.filter };
+        TrackSettings { joint_smoothing: JointSmoothingSettings { filter: pass_through, ..JointSmoothingSettings::DEFAULT }, ..TrackSettings::default() }
+    }
+
+    fn joint_in_odom(track_frame: TrackFrame, camera_point: Vec3) -> Vec3 {
+        let TrackFrame::Odom { camera_to_odom, .. } = track_frame else { unreachable!("tests track in odom") };
+        camera_to_odom.transform_point3(camera_point)
+    }
+
+    fn fitted(track: &PersonTrack, joint: usize) -> Vec3 {
+        let p = track.skeleton_3d[joint].expect("the body joints are fitted");
+        Vec3::new(p.x_m, p.y_m, p.z_m)
+    }
+
+    /// The body joints, shoulders to ankles.
+    const BODY_JOINTS: std::ops::Range<usize> = 5..17;
+
+    /// Root mean square distance of each body joint from its own mean over the frames, averaged over the joints.
+    fn joint_jitter_m(frames: &[PersonTrack]) -> f32 {
+        let per_joint: Vec<f32> = BODY_JOINTS
+            .map(|joint| {
+                let mean = frames.iter().map(|t| fitted(t, joint)).sum::<Vec3>() / frames.len() as f32;
+                (frames.iter().map(|t| fitted(t, joint).distance_squared(mean)).sum::<f32>() / frames.len() as f32).sqrt()
+            })
+            .collect();
+        per_joint.iter().sum::<f32>() / per_joint.len() as f32
+    }
+
+
+    #[test]
+    fn a_still_persons_joints_hold_still_at_three_and_a_half_metres() {
+        // Pixels off by 1.5 px and depth by 3 cm each frame: the D455 at 3.5 m after the 5 x 5 median.
+        let sighting = Sighting { pixel_sigma_px: 1.5, depth_sigma_m: 0.03 };
+        let body = body_at(Vec3::new(0.3, 0.2, 3.5));
+        let (mut smoothed, mut raw) = (PeopleTracker::new(TrackSettings::default()), PeopleTracker::new(unsmoothed()));
+        let (mut smoothed_tracks, mut raw_tracks) = (Vec::new(), Vec::new());
+        let mut noise = Noise(7);
+        for frame in 0..300 {
+            let seen = sighted(frame, 4, &body, &sighting, &mut noise);
+            let again = seen.clone();
+            let (a, b) = (smoothed.track(seen, still_camera()), raw.track(again, still_camera()));
+            // The first second settles the bone lengths and the filters.
+            if frame >= 30 {
+                smoothed_tracks.push(a.tracks[0].clone());
+                raw_tracks.push(b.tracks[0].clone());
+            }
+        }
+        let (before, after) = (joint_jitter_m(&raw_tracks), joint_jitter_m(&smoothed_tracks));
+        assert!(before > 0.012, "the fit alone jitters by {before} m");
+        assert!(after < before / 3.0, "smoothing cuts the jitter from {before} m to {after} m");
+        let hip = joint_in_odom(still_camera(), body[11]);
+        let mean_hip = smoothed_tracks.iter().map(|t| fitted(t, 11)).sum::<Vec3>() / smoothed_tracks.len() as f32;
+        assert!(mean_hip.distance(hip) < 0.05, "the smoothed hip stays where the hip is: {mean_hip} for {hip}");
+    }
+
+    #[test]
+    fn a_walking_persons_joints_follow_with_a_lag_of_a_few_centimetres() {
+        // Walking across the view at 1.2 m/s, 3 m away, with the same noise as above.
+        let sighting = Sighting { pixel_sigma_px: 1.5, depth_sigma_m: 0.03 };
+        let walk_m_s = 1.2;
+        let body = |frame: u64| body_at(Vec3::new(-1.0 + walk_m_s * frame as f32 / 30.0, 0.2, 3.0));
+        let (mut smoothed, mut raw) = (PeopleTracker::new(TrackSettings::default()), PeopleTracker::new(unsmoothed()));
+        let mut noise = Noise(11);
+        let (mut smoothed_behind, mut raw_behind) = (Vec::new(), Vec::new());
+        for frame in 0..60 {
+            let seen = sighted(frame, 4, &body(frame), &sighting, &mut noise);
+            let again = seen.clone();
+            let (a, b) = (smoothed.track(seen, still_camera()), raw.track(again, still_camera()));
+            if frame >= 30 {
+                // Camera x is odom x, the way the person walks.
+                for joint in BODY_JOINTS {
+                    let truth = joint_in_odom(still_camera(), body(frame)[joint]);
+                    smoothed_behind.push(truth.x - fitted(&a.tracks[0], joint).x);
+                    raw_behind.push(truth.x - fitted(&b.tracks[0], joint).x);
+                }
+            }
+        }
+        let mean = |values: &[f32]| values.iter().sum::<f32>() / values.len() as f32;
+        let lag_m = mean(&smoothed_behind) - mean(&raw_behind);
+        assert!(lag_m < 0.05, "the smoothed joints trail the fit's by {lag_m} m, {} ms at 1.2 m/s", lag_m / walk_m_s * 1e3);
+    }
+
+    #[test]
+    fn a_still_person_the_pose_tracker_drops_for_almost_two_seconds_keeps_their_id() {
+        // Sitting 4.5 m away, depth off by 6 cm a reading: the velocity of the noisy torso is noise of up to a few
+        // tenths of a metre a second, which carried on over a 1.8 s gap points well away from where they sit.
+        let sighting = Sighting { pixel_sigma_px: 2.0, depth_sigma_m: 0.06 };
+        let body = body_at(Vec3::new(-0.8, 0.0, 4.5));
+        for seed in 1..=20 {
+            let mut tracker = PeopleTracker::new(TrackSettings::default());
+            let mut noise = Noise(seed);
+            for frame in 0..90 {
+                tracker.track(sighted(frame, 9, &body, &sighting, &mut noise), still_camera());
+            }
+            let back = tracker.track(sighted(144, 11, &body, &sighting, &mut noise), still_camera());
+            assert_eq!(ids(&back), vec![(1, TrackState::Confirmed)], "seed {seed}");
+        }
     }
 
     #[test]

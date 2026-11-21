@@ -5,8 +5,8 @@
 //! where the camera stood, count as free. Doorways are pinch points of the clearance ridge (the middle of the free space)
 //! narrower than a door, where the clearance rises again on both sides; cutting the free space there splits it
 //! into rooms, and rooms too small to be rooms merge into the neighbour they share the widest doorway with. Ids
-//! carry over from the previous cut: a room keeps the id of the room it overlaps most, doorways and places keep
-//! the id of the nearest previous one close enough.
+//! carry over from the latest cut that had any: a room keeps the id of the room it overlaps most, doorways and
+//! places keep the id of the nearest known one close enough.
 
 use std::collections::VecDeque;
 
@@ -45,12 +45,14 @@ impl Segmentation {
     }
 }
 
-/// Cuts free space into a topology, keeping ids stable from one cut to the next.
+/// Cuts free space into a topology, keeping ids stable from one cut to the next. Ids are matched against the latest
+/// cut that had any rooms, doorways or places respectively, so a cut that comes out without them (a floor seen too
+/// little for a moment) does not cost the ones that come back their ids.
 pub struct TopologyBuilder {
     settings: TopologySettings,
-    previous: Option<Segmentation>,
-    previous_doorways: Vec<Doorway>,
-    previous_places: Vec<Place>,
+    known_rooms: Option<Segmentation>,
+    known_doorways: Vec<Doorway>,
+    known_places: Vec<Place>,
     next_room: u64,
     next_doorway: u64,
     next_place: u64,
@@ -104,18 +106,18 @@ impl TopologyBuilder {
     pub fn new(settings: TopologySettings) -> TopologyBuilder {
         TopologyBuilder {
             settings,
-            previous: None,
-            previous_doorways: Vec::new(),
-            previous_places: Vec::new(),
+            known_rooms: None,
+            known_doorways: Vec::new(),
+            known_places: Vec::new(),
             next_room: 1,
             next_doorway: 1,
             next_place: 1,
         }
     }
 
-    /// The most recent cut.
+    /// The most recent cut that had rooms.
     pub fn segmentation(&self) -> Option<&Segmentation> {
-        self.previous.as_ref()
+        self.known_rooms.as_ref()
     }
 
     /// Cuts the grid into rooms at a floor height, with ceiling heights from the ceiling points over each room.
@@ -138,9 +140,15 @@ impl TopologyBuilder {
         let places = self.places(&field, &segmentation, &doorways);
         let edges = self.edges(&field, &places);
 
-        self.previous = Some(segmentation);
-        self.previous_doorways = doorways.clone();
-        self.previous_places = places.clone();
+        if segmentation.rooms.iter().any(Option::is_some) {
+            self.known_rooms = Some(segmentation);
+        }
+        if !doorways.is_empty() {
+            self.known_doorways = doorways.clone();
+        }
+        if !places.is_empty() {
+            self.known_places = places.clone();
+        }
         TopologyPlan { rooms, doorways, places, edges }
     }
 
@@ -233,11 +241,11 @@ impl TopologyBuilder {
         (kept, doors)
     }
 
-    /// Each kept region takes the id of the previous room it overlaps most, largest overlaps first; the rest get
+    /// Each kept region takes the id of the known room it overlaps most, largest overlaps first; the rest get
     /// new ids.
     fn match_room_ids(&mut self, geometry: &GridGeometry, regions: &[u32], kept: &FxHashSet<u32>) -> FxHashMap<u32, RoomId> {
         let mut overlaps: FxHashMap<(u32, RoomId), usize> = FxHashMap::default();
-        if let Some(previous) = &self.previous {
+        if let Some(previous) = &self.known_rooms {
             for (i, &region) in regions.iter().enumerate() {
                 if region == NO_REGION {
                     continue;
@@ -315,7 +323,7 @@ impl TopologyBuilder {
                 })
             })
             .collect();
-        let previous: Vec<(u64, Vec2)> = self.previous_doorways.iter().map(|d| (d.doorway_id.0, d.position)).collect();
+        let previous: Vec<(u64, Vec2)> = self.known_doorways.iter().map(|d| (d.doorway_id.0, d.position)).collect();
         let positions: Vec<Vec2> = doorways.iter().map(|d| d.position).collect();
         let ids = carry_ids(&positions, &previous, 0.5 * self.settings.door_width_m, &mut self.next_doorway);
         for (doorway, id) in doorways.iter_mut().zip(ids) {
@@ -355,7 +363,7 @@ impl TopologyBuilder {
                 places.push(candidate);
             }
         }
-        let previous: Vec<(u64, Vec2)> = self.previous_places.iter().map(|p| (p.place_id.0, p.position)).collect();
+        let previous: Vec<(u64, Vec2)> = self.known_places.iter().map(|p| (p.place_id.0, p.position)).collect();
         let positions: Vec<Vec2> = places.iter().map(|p| p.position).collect();
         let ids = carry_ids(&positions, &previous, 0.5 * spacing, &mut self.next_place);
         for (place, id) in places.iter_mut().zip(ids) {
@@ -747,6 +755,23 @@ mod tests {
         let third = cut(&mut topology_builder, &grown);
         assert_eq!(third.rooms.iter().map(|r| r.room_id).collect::<Vec<_>>(), second.rooms.iter().map(|r| r.room_id).collect::<Vec<_>>());
         assert_eq!(third.places.iter().map(|p| p.place_id).collect::<Vec<_>>(), second.places.iter().map(|p| p.place_id).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn rooms_doorways_and_places_back_after_an_empty_cut_keep_their_ids() {
+        let mut topology_builder = TopologyBuilder::new(TopologySettings::default());
+        let first = cut(&mut topology_builder, &two_rooms());
+        let nothing_seen = cut(&mut topology_builder, &Plan::new(8.1, 4.0));
+        assert!(nothing_seen.rooms.is_empty() && nothing_seen.doorways.is_empty() && nothing_seen.places.is_empty());
+        let back = cut(&mut topology_builder, &two_rooms());
+        let ids = |plan: &TopologyPlan| {
+            (
+                plan.rooms.iter().map(|r| r.room_id).collect::<Vec<_>>(),
+                plan.doorways.iter().map(|d| d.doorway_id).collect::<Vec<_>>(),
+                plan.places.iter().map(|p| p.place_id).collect::<Vec<_>>(),
+            )
+        };
+        assert_eq!(ids(&back), ids(&first));
     }
 
     fn topologist_room(plan: &TopologyPlan, point: Vec2) -> RoomId {

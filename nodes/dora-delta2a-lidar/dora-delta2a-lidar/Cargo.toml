@@ -12,5 +12,7 @@ delta2a = { path = "../delta2a" }
 # The node API has to match the version of the dora CLI that runs the dataflow.
 dora-node-api = { version = "=0.3.13", default-features = false }
 eyre = "0.6"
+# The scan's wire type, the one definition the bridge carries.
+wire-schemas = { path = "../../dora-depth-perception/wire-schemas" }
 # Without the default libudev feature, so the binary links statically.
 serialport = { version = "4.7", default-features = false }

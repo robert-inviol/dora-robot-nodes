@@ -1,0 +1,114 @@
+{
+  "camera_calibration": {
+    "fingerprint": "a34ce1bcc4d85741",
+    "canonical": "struct<color!:struct<width!:u16,height!:u16,fx!:f32,fy!:f32,ppx!:f32,ppy!:f32>,depth!:struct<width!:u16,height!:u16,fx!:f32,fy!:f32,ppx!:f32,ppy!:f32>,depth_to_color!:struct<rotation!:list<item!:f32>,translation_m!:list<item!:f32>>,depth_to_imu!:struct<rotation!:list<item!:f32>,translation_m!:list<item!:f32>>>"
+  },
+  "drive_demand": {
+    "fingerprint": "9c5e7c97afa57952",
+    "canonical": "struct<forward?:f32,turn?:f32>"
+  },
+  "driver_status": {
+    "fingerprint": "e1f4c2c040a38e39",
+    "canonical": "struct<armed?:bool,left_pct?:i8,right_pct?:i8>"
+  },
+  "goal_status": {
+    "fingerprint": "47b17e7e167e0647",
+    "canonical": "struct<goal_id?:u64,state?:utf8,reason?:utf8,updated_unix_ns?:i64>"
+  },
+  "imu": {
+    "fingerprint": "9c1b982921ca358a",
+    "canonical": "struct<frame_id?:u64,keyframe_camera_ns?:i64,accel_camera_ns?:list<item!:i64>,accel_m_s2?:list<item!:f32>,gyro_camera_ns?:list<item!:i64>,gyro_rad_s?:list<item!:f32>>"
+  },
+  "instance_masks": {
+    "fingerprint": "d687ffe8cbb7c644",
+    "canonical": "struct<frame_id?:u64,width?:u16,height?:u16,labels?:list<item!:utf8>,scores?:list<item!:f32>,instance_ids?:list<item!:i16>>"
+  },
+  "keep_out": {
+    "fingerprint": "c5125b016b61f5e3",
+    "canonical": "struct<map_version?:u64,zones?:list<item!:struct<object_id?:u64,label?:utf8,polygon?:list<item!:struct<x_m?:f32,y_m?:f32>>,margin_m?:f32>>>"
+  },
+  "keyframe": {
+    "fingerprint": "e44e8adec3468fc3",
+    "canonical": "struct<frame_id?:u64,captured_unix_ns?:i64,width?:u16,height?:u16,fx?:f32,fy?:f32,ppx?:f32,ppy?:f32,specific_force?:list<item!:f32>,depth_mm?:list<item!:u16>,color_jpeg?:binary>"
+  },
+  "keyframe_pose": {
+    "fingerprint": "56533e2d5648bb30",
+    "canonical": "struct<frame_id?:u64,captured_unix_ns?:i64,map_version?:u64,x_m?:f32,y_m?:f32,z_m?:f32,yaw_rad?:f32,tracking?:utf8,selection?:utf8,reference_frame_id?:u64,residual_m?:f32,inlier_fraction?:f32>"
+  },
+  "labels": {
+    "fingerprint": "1690ac7aaff781ac",
+    "canonical": "struct<model?:utf8,frame_id?:u64,labels?:list<item!:utf8>,complete?:bool>"
+  },
+  "map_to_odom": {
+    "fingerprint": "de44cf2d32d469c5",
+    "canonical": "struct<map_version?:u64,valid_from_camera_ns?:i64,odom_started_camera_ns?:i64,x_m?:f32,y_m?:f32,z_m?:f32,yaw_rad?:f32,sigma_xy_m?:f32,sigma_z_m?:f32,sigma_yaw_rad?:f32>"
+  },
+  "mesh_blocks": {
+    "fingerprint": "793a9eb42be7759a",
+    "canonical": "struct<map_version?:u64,built_unix_ns?:i64,run_started_unix_ns?:i64,sequence?:u64,kind?:utf8,voxel_m?:f32,block_voxels?:u32,blocks?:list<item!:struct<block_x?:i32,block_y?:i32,block_z?:i32,positions_m?:list<item!:f32>,triangles?:list<item!:u32>>>>"
+  },
+  "mesh_snapshot_request": {
+    "fingerprint": "0029ce08f5d4a7f6",
+    "canonical": "struct<requested_unix_ns?:i64>"
+  },
+  "nav_goal": {
+    "fingerprint": "6c1511abc7988b0e",
+    "canonical": "struct<goal_id?:u64,kind?:utf8,target_id?:u64,target_pose?:struct<x_m?:f32,y_m?:f32,yaw_rad?:f32>,standoff_m?:f32,max_speed_m_s?:f32,deadline_unix_ns?:i64,map_version?:u64>"
+  },
+  "object_update": {
+    "fingerprint": "f91a724545361f97",
+    "canonical": "struct<kind?:utf8,object_id?:u64,merged_into?:u64,label?:utf8,score?:f32,confidence?:f32,seen_count?:u32,frame_id?:u64,captured_unix_ns?:i64,map_version?:u64,centre_x_m?:f32,centre_y_m?:f32,centre_z_m?:f32,footprint?:list<item!:struct<x_m?:f32,y_m?:f32>>,long_m?:f32,short_m?:f32,height_m?:f32,top_m?:f32,crop_jpeg?:binary,voxel_m?:f32,voxels?:list<item!:struct<x?:i32,y?:i32,z?:i32>>>"
+  },
+  "occupancy_grid": {
+    "fingerprint": "026dea02e922f3d2",
+    "canonical": "struct<map_version?:u64,built_unix_ns?:i64,origin_x_m?:f32,origin_y_m?:f32,resolution_m?:f32,width?:u32,height?:u32,band_min_m?:f32,band_max_m?:f32,clearance_mm?:list<item!:u16>>"
+  },
+  "odom_pose": {
+    "fingerprint": "8ece86f9e26d591e",
+    "canonical": "struct<camera_ns?:i64,odom_started_camera_ns?:i64,depth_frame_id?:u64,position_m?:list<item!:f32>,orientation_xyzw?:list<item!:f32>,velocity_m_s?:list<item!:f32>,position_sigma_m?:list<item!:f32>,tilt_sigma_rad?:f32,heading_sigma_rad?:f32,corrected?:bool,matched_points?:u32,degenerate_direction?:list<item!:f32>,degenerate_sigma_m?:f32>"
+  },
+  "operator_command": {
+    "fingerprint": "1587af4abd0043e8",
+    "canonical": "struct<mode?:utf8,throttle?:f32,steer?:f32>"
+  },
+  "people_tracks": {
+    "fingerprint": "6fde818c75473e19",
+    "canonical": "struct<frame_id!:u64,captured_camera_ns!:i64,width!:u16,height!:u16,position_frame!:utf8,odom_started_camera_ns?:i64,specific_force?:list<item!:f32>,tracks!:list<item!:struct<track_id!:u64,state!:utf8,score!:f32,box!:struct<x_px!:f32,y_px!:f32,w_px!:f32,h_px!:f32>,keypoints!:list<item!:struct<x_px!:f32,y_px!:f32,score!:f32>>,position?:struct<x_m!:f32,y_m!:f32,z_m!:f32>,velocity?:struct<vx_m_s!:f32,vy_m_s!:f32,vz_m_s!:f32>,keypoints_3d!:list<item?:struct<x_m!:f32,y_m!:f32,z_m!:f32>>,skeleton_3d!:list<item?:struct<x_m!:f32,y_m!:f32,z_m!:f32>>>>>"
+  },
+  "person_poses": {
+    "fingerprint": "bbb8a2eafbbde763",
+    "canonical": "struct<frame_id!:u64,captured_camera_ns!:i64,width!:u16,height!:u16,people!:list<item!:struct<track_id?:u64,score!:f32,box!:struct<x_px!:f32,y_px!:f32,w_px!:f32,h_px!:f32>,keypoints!:list<item!:struct<x_px!:f32,y_px!:f32,score!:f32>>>>>"
+  },
+  "pilot_status": {
+    "fingerprint": "7b73940696ba35fc",
+    "canonical": "struct<mode?:utf8,locked_track_id?:i32>"
+  },
+  "pose_graph_update": {
+    "fingerprint": "a25bfa6b7896e198",
+    "canonical": "struct<map_version!:u64,keyframes!:list<item!:struct<frame_id!:u64,x_m!:f32,y_m!:f32,z_m!:f32,yaw_rad!:f32>>>"
+  },
+  "posed_depth_frame": {
+    "fingerprint": "c7fc9ca3e982a07b",
+    "canonical": "struct<frame_id!:u64,camera_ns!:i64,odom_started_camera_ns!:i64,intrinsics!:struct<width!:u16,height!:u16,fx!:f32,fy!:f32,ppx!:f32,ppy!:f32>,camera_position_m!:list<item!:f32>,camera_orientation_xyzw!:list<item!:f32>,depth_mm!:list<item!:u16>>"
+  },
+  "scan": {
+    "fingerprint": "039cfa54bbbb30f1",
+    "canonical": "struct<spin_rev_per_s?:f32,bearing_deg?:list<item!:f32>,range_m?:list<item?:f32>>"
+  },
+  "scene": {
+    "fingerprint": "276d4cb3e8308722",
+    "canonical": "struct<frame_id?:u64,captured_unix_ns?:i64,camera_forward?:list<item!:f32>,camera_up?:list<item!:f32>,planes?:list<item!:struct<kind?:utf8,normal?:list<item!:f32>,offset_m?:f32,area_m2?:f32,outline_m?:list<item!:f32>>>,room?:struct<floor_m?:f32,ceiling_m?:f32,footprint_m?:list<item!:f32>,edge_seen?:list<item!:bool>>,room_problem?:utf8,objects?:list<item!:struct<label?:utf8,instance_index?:u16,score?:f32,point_count?:u32,distance_m?:f32,footprint_long_m?:f32,footprint_short_m?:f32,height_m?:f32,top_m?:f32,corners_m?:list<item!:f32>>>>"
+  },
+  "spatial_answer": {
+    "fingerprint": "bfe01ab58fbb0e0e",
+    "canonical": "struct<question_id?:u64,revision?:u32,is_final?:bool,model?:utf8,text?:utf8,references?:list<item!:struct<kind?:utf8,id?:u64,x_m?:f32,y_m?:f32>>,goal_id?:u64>"
+  },
+  "spatial_query": {
+    "fingerprint": "feae65fca19b47b2",
+    "canonical": "struct<question_id?:u64,asked_unix_ns?:i64,asker?:utf8,text?:utf8>"
+  },
+  "topology": {
+    "fingerprint": "bb37da54fca3e50a",
+    "canonical": "struct<map_version?:u64,built_unix_ns?:i64,rooms?:list<item!:struct<room_id?:u64,polygon?:list<item!:struct<x_m?:f32,y_m?:f32>>,floor_m?:f32,ceiling_m?:f32>>,doorways?:list<item!:struct<doorway_id?:u64,room_a?:u64,room_b?:u64,x_m?:f32,y_m?:f32,width_m?:f32>>,places?:list<item!:struct<place_id?:u64,room_id?:u64,x_m?:f32,y_m?:f32,clearance_m?:f32>>,edges?:list<item!:struct<place_a?:u64,place_b?:u64,length_m?:f32,min_clearance_m?:f32>>>"
+  }
+}

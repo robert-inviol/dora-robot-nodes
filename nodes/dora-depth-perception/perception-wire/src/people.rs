@@ -3,12 +3,12 @@
 //! body points in COCO order.
 
 use dora_node_api::arrow::array::{Array, StructArray};
-use dora_node_api::arrow::datatypes::{DataType, Fields};
 use eyre::{ensure, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::localization::CameraNanos;
-use crate::serde_wire::{decode_row, encode_row, floats_struct, list_of, optional, required};
+use crate::serde_wire::{decode_row, encode_row};
+pub use wire_schemas::people::{people_tracks_fields, person_poses_fields};
 
 pub const KEYPOINT_COUNT: usize = 17;
 
@@ -187,58 +187,6 @@ impl From<PeopleTracks> for PeopleTracksRow {
             tracks: tracks.tracks,
         }
     }
-}
-
-fn pixel_box_type() -> DataType {
-    floats_struct(&["x_px", "y_px", "w_px", "h_px"])
-}
-
-fn keypoints_type() -> DataType {
-    list_of(floats_struct(&["x_px", "y_px", "score"]), false)
-}
-
-fn point_type() -> DataType {
-    floats_struct(&["x_m", "y_m", "z_m"])
-}
-
-pub fn person_poses_fields() -> Fields {
-    let person = DataType::Struct(Fields::from(vec![
-        optional("track_id", DataType::UInt64),
-        required("score", DataType::Float32),
-        required("box", pixel_box_type()),
-        required("keypoints", keypoints_type()),
-    ]));
-    Fields::from(vec![
-        required("frame_id", DataType::UInt64),
-        required("captured_camera_ns", DataType::Int64),
-        required("width", DataType::UInt16),
-        required("height", DataType::UInt16),
-        required("people", list_of(person, false)),
-    ])
-}
-
-pub fn people_tracks_fields() -> Fields {
-    let track = DataType::Struct(Fields::from(vec![
-        required("track_id", DataType::UInt64),
-        required("state", DataType::Utf8),
-        required("score", DataType::Float32),
-        required("box", pixel_box_type()),
-        required("keypoints", keypoints_type()),
-        optional("position", point_type()),
-        optional("velocity", floats_struct(&["vx_m_s", "vy_m_s", "vz_m_s"])),
-        required("keypoints_3d", list_of(point_type(), true)),
-        required("skeleton_3d", list_of(point_type(), true)),
-    ]));
-    Fields::from(vec![
-        required("frame_id", DataType::UInt64),
-        required("captured_camera_ns", DataType::Int64),
-        required("width", DataType::UInt16),
-        required("height", DataType::UInt16),
-        required("position_frame", DataType::Utf8),
-        optional("odom_started_camera_ns", DataType::Int64),
-        optional("specific_force", list_of(DataType::Float32, false)),
-        required("tracks", list_of(track, false)),
-    ])
 }
 
 pub fn encode_person_poses(poses: &PersonPoses) -> StructArray {

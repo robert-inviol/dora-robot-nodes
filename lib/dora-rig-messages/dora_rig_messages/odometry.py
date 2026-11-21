@@ -10,7 +10,10 @@ interpolates between the two rows nearest to it on `camera_ns`.
 that starts again carries a later one. Poses with different values are in different odom frames and cannot be
 combined.
 
-The sigmas say how well the pose is known against the odometry's own map. They do not include that map's drift.
+The sigmas say how well the pose is known against the odometry's own map, and leave out that map's drift. The position
+sigmas also cover the depth camera's warm-up: they add how far the depth clouds would move the position under a change
+of the depth's scale, at one sigma of half the change a D455's depth goes through over the first minutes of a stream.
+The tilt and heading sigmas are the filter's alone.
 """
 
 from dataclasses import dataclass

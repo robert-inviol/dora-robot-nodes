@@ -16,7 +16,6 @@ use perception_wire::localization::{FrameId, KeyframePose, PoseGraphUpdate, MapT
 use perception_wire::objects::ObjectUpdate;
 use perception_wire::odometry::OdomPose;
 use perception_wire::people::PeopleTracks;
-use perception_wire::room_layout::RoomLayout;
 use perception_wire::space_map::{MeshBlocks, Topology};
 use perception_wire::Keyframe;
 
@@ -39,7 +38,8 @@ pub struct RigViewSettings {
 }
 
 impl RigViewSettings {
-    pub const DEFAULT: RigViewSettings = RigViewSettings { cloud: CloudSettings::DEFAULT, max_keyframes: 600 };
+    pub const DEFAULT: RigViewSettings =
+        RigViewSettings { cloud: CloudSettings::DEFAULT, max_keyframes: 600 };
 }
 
 /// One message for the page, decoded.
@@ -53,7 +53,6 @@ pub enum RigInput {
     MeshBlocks(MeshBlocks),
     ObjectUpdate(ObjectUpdate),
     Topology(Topology),
-    RoomLayout(RoomLayout),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -88,7 +87,7 @@ impl RigView {
     /// The rig view and its background thread, which runs until the rig view is dropped or a keyframe or surface
     /// message cannot be drawn.
     pub fn start(settings: RigViewSettings) -> (RigView, tokio::task::JoinHandle<Result<(), RigViewError>>) {
-        let shared = SharedView::new(Scene::new(settings.max_keyframes), CloudStore::new(settings.cloud, settings.max_keyframes));
+        let shared = SharedView::new(Scene::new(), CloudStore::new(settings.cloud, settings.max_keyframes));
         let (sender, receiver) = mpsc::sync_channel(BACKGROUND_BACKLOG);
         let worker = shared.clone();
         let background = tokio::task::spawn_blocking(move || run_background(receiver, &worker, settings.cloud));
@@ -120,12 +119,10 @@ impl RigView {
                 None
             }
             RigInput::KeyframePose(pose) => {
-                self.shared.apply_scene(|scene| scene.on_keyframe_pose(&pose));
                 self.to_background(BackgroundInput::MapPose(pose.frame_id, KeyframeMapPose::of_keyframe_pose(&pose)))?;
                 None
             }
             RigInput::PoseGraphUpdate(moved) => {
-                self.shared.apply_scene(|scene| scene.on_pose_graph_update(&moved));
                 self.to_background(BackgroundInput::PoseGraphUpdate(moved))?;
                 None
             }
@@ -134,7 +131,6 @@ impl RigView {
             RigInput::PeopleTracks(tracks) => self.apply_scene(|scene| scene.on_people_tracks(&tracks)),
             RigInput::ObjectUpdate(update) => self.apply_scene(|scene| scene.on_object_update(&update)),
             RigInput::Topology(topology) => self.apply_scene(|scene| scene.on_topology(&topology)),
-            RigInput::RoomLayout(layout) => self.apply_scene(|scene| scene.on_room_layout(layout)),
         };
         Ok(request.or(overdue))
     }

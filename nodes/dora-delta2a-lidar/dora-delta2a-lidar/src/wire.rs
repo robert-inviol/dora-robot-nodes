@@ -1,20 +1,16 @@
-//! The `scan` output: one revolution as the single-row message that lib/dora-rig-messages defines as `Scan`.
+//! The `scan` output: one revolution as the single-row message that lib/dora-rig-messages defines as `Scan`, of the
+//! wire type `wire_schemas::robot::scan_fields`.
 
 use std::sync::Arc;
 
 use delta2a::Revolution;
-use dora_node_api::arrow::array::{Array, ArrayRef, Float32Array, ListArray, StructArray};
+use dora_node_api::arrow::array::{ArrayRef, Float32Array, ListArray, StructArray};
 use dora_node_api::arrow::buffer::OffsetBuffer;
 use dora_node_api::arrow::datatypes::{DataType, Field};
+use wire_schemas::robot::scan_fields;
 
-const SPIN_RATE_FIELD: &str = "spin_rev_per_s";
-/// Degrees clockwise from the lidar's zero mark, seen from above.
-const BEARINGS_FIELD: &str = "bearing_deg";
-/// In step with the bearings, null where nothing came back.
-const RANGES_FIELD: &str = "range_m";
 const LIST_ITEM: &str = "item";
 
-/// A reader compares the whole type, so every nullable flag here is part of the contract.
 pub fn scan_message(revolution: &Revolution) -> StructArray {
     let spin_rate = Float32Array::from(vec![revolution.spin_rate.revolutions_per_second()]);
     let bearings: Float32Array = revolution
@@ -27,26 +23,12 @@ pub fn scan_message(revolution: &Revolution) -> StructArray {
         .iter()
         .map(|sample| sample.range.map(|range| range.metres()))
         .collect();
-    let bearings = one_list(bearings, false);
-    let ranges = one_list(ranges, true);
-    StructArray::from(vec![
-        (
-            Arc::new(Field::new(SPIN_RATE_FIELD, DataType::Float32, true)),
-            Arc::new(spin_rate) as ArrayRef,
-        ),
-        (
-            Arc::new(Field::new(
-                BEARINGS_FIELD,
-                bearings.data_type().clone(),
-                true,
-            )),
-            Arc::new(bearings) as ArrayRef,
-        ),
-        (
-            Arc::new(Field::new(RANGES_FIELD, ranges.data_type().clone(), true)),
-            Arc::new(ranges) as ArrayRef,
-        ),
-    ])
+    let columns: Vec<ArrayRef> = vec![
+        Arc::new(spin_rate),
+        Arc::new(one_list(bearings, false)),
+        Arc::new(one_list(ranges, true)),
+    ];
+    StructArray::new(scan_fields(), columns, None)
 }
 
 /// A list column holding the one list of a single-row message.
@@ -63,9 +45,13 @@ mod tests {
     use delta2a::{
         Bearing, Frame, FrameDecoder, Range, RangeSample, RevolutionAssembler, SpinRate,
     };
+    use dora_node_api::arrow::array::Array;
     use dora_node_api::arrow::ipc::reader::FileReader;
 
     use super::*;
+
+    /// In step with the bearings, null where nothing came back.
+    const RANGES_FIELD: &str = "range_m";
 
     const SCAN_FIXTURE: &str = concat!(
         env!("CARGO_MANIFEST_DIR"),

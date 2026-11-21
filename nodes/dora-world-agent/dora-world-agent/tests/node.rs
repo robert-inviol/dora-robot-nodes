@@ -10,7 +10,7 @@ use dora_node_api::arrow::array::StructArray;
 use dora_world_agent::node::{Outputs, SpatialNode, SPATIAL_QUERY_INPUT};
 use dora_world_agent::world::{SqliteWorld, StoreInput};
 use glam::{Vec2, Vec3};
-use perception_wire::localization::{encode_keyframe_pose, encode_map_to_odom, CameraNanos, FrameId, KeyframePose, MapToOdom, Pose4Dof, Tracking};
+use perception_wire::localization::{encode_keyframe_pose, encode_map_to_odom, CameraNanos, FrameId, KeyframePose, KeyframeSelection, MapToOdom, Pose4Dof, Tracking};
 use perception_wire::navigation::{
     encode_goal_status, encode_spatial_query, Asker, GoalState, GoalStatus, MapVersion, NavGoal, NonNegative, ObjectId,
     PlaceId, QuestionId, Reference, Referent, RoomId, SpatialAnswer, SpatialQuery, TrackId, UnixNanos,
@@ -150,6 +150,7 @@ fn keyframe_pose(at: UnixNanos) -> StructArray {
         map_version: VERSION,
         pose: Pose4Dof { x_m: 3.2, y_m: 2.5, z_m: 0.0, yaw_rad: 1.5 },
         tracking: Tracking::Tracking,
+        selection: KeyframeSelection::Selected,
         residual_m: 0.01,
         inlier_fraction: 0.9,
     })

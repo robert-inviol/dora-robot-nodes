@@ -12,18 +12,17 @@ use std::future::IntoFuture;
 use std::time::{Duration, Instant};
 
 use dense_map::{BlockTsdf, DenseMapSettings, DenseMapper, DepthKeyframe, KeyframePose as DenseKeyframePose, MapOutput};
-use depth_perception::{find_planes, infer_room, sample_point_cloud, CameraIntrinsics, DepthImage, FloorFrame, PlaneSettings, RangeLimits, RoomSettings};
+use depth_perception::CameraIntrinsics;
 use dora_rig_view::rig::{RigInput, RigView, RigViewSettings};
 use glam::{IVec3, Quat, Vec2, Vec3};
 use perception_wire::localization::{
-    CameraNanos, FrameId, KeyframePose, PoseGraphUpdate, MapToOdom, UpdatedKeyframePose, Pose4Dof, Tracking,
+    CameraNanos, FrameId, KeyframePose, KeyframeSelection, PoseGraphUpdate, MapToOdom, UpdatedKeyframePose, Pose4Dof, Tracking,
 };
 use perception_wire::navigation::{MapVersion, UnixNanos};
 use perception_wire::objects::{ObjectExtent, ObjectId, ObjectUpdate, ObjectUpdateKind};
 use perception_wire::odometry::OdomPose;
 use perception_wire::people::{Keypoint, PeopleTracks, PersonTrack, PixelBox, Point, PositionFrame, TrackState};
-use perception_wire::room_layout::decode_room_layout;
-use perception_wire::{encode_scene, Keyframe, Scene as WireScene};
+use perception_wire::Keyframe;
 
 const ROOM: Vec3 = Vec3::new(6.0, 5.0, 2.6);
 const CHAIR_MIN: Vec3 = Vec3::new(4.95, 0.55, 0.0);
@@ -220,31 +219,10 @@ fn wire_pose(frame_id: u64, pose: Pose4Dof, map_version: u64) -> KeyframePose {
         map_version: MapVersion(map_version),
         pose,
         tracking: Tracking::Tracking,
+        selection: KeyframeSelection::Selected,
         residual_m: 0.01,
         inlier_fraction: 0.9,
     }
-}
-
-/// The planes and room of one keyframe, found and encoded as the plane_segmentation node does, then read back as the rig
-/// view's room_layout input.
-fn layout_of(keyframe: &Keyframe) -> eyre::Result<perception_wire::room_layout::RoomLayout> {
-    let depth_m = keyframe.depth_m();
-    let floor = FloorFrame::from_specific_force(keyframe.specific_force);
-    let depth = DepthImage::new(keyframe.width, keyframe.height, &depth_m);
-    let cloud = sample_point_cloud(&depth, &keyframe.intrinsics, &floor, RangeLimits::D455, 2);
-    let fit = find_planes(&cloud.points, &PlaneSettings::default());
-    let room = infer_room(&fit.planes, &cloud.points, &RoomSettings::default());
-    let (camera_forward, camera_up) = floor.camera_forward_and_up();
-    let scene = WireScene {
-        frame_id: keyframe.frame_id,
-        captured_unix_ns: keyframe.captured_unix_ns,
-        camera_forward,
-        camera_up,
-        planes: &fit.planes,
-        room: &room,
-        objects: &[],
-    };
-    decode_room_layout(&encode_scene(&scene))
 }
 
 /// The dense map and the rig view joined as a dataflow joins them: surface messages one way, snapshot requests the
@@ -325,9 +303,7 @@ async fn main() -> eyre::Result<()> {
             let pose = wire_pose(frame_id, Pose4Dof { x_m: position.x, y_m: position.y, z_m: position.z, yaw_rad: yaw }, 1);
             demo.mapper.on_keyframe(DepthKeyframe::from_wire(&keyframe));
             demo.mapper.on_keyframe_pose(DenseKeyframePose::from(&pose));
-            let layout = layout_of(&keyframe)?;
             demo.send(RigInput::Keyframe(keyframe), tick)?;
-            demo.send(RigInput::RoomLayout(layout), tick)?;
             demo.send(RigInput::KeyframePose(pose), tick)?;
             keyframes.push((frame_id, pose.pose));
         }

@@ -1,12 +1,13 @@
 //! The camera calibration message of lib/dora-rig-messages/dora_rig_messages/camera.py.
 
 use dora_node_api::arrow::array::{Array, StructArray};
-use dora_node_api::arrow::datatypes::{DataType, Fields};
 use eyre::Result;
 use glam::{Mat3, Vec3};
 use serde::{Deserialize, Serialize};
 
-use crate::serde_wire::{decode_row, encode_row, floats_struct, list_of, required};
+use crate::serde_wire::{decode_row, encode_row};
+pub(crate) use wire_schemas::camera::stream_intrinsics_type;
+pub use wire_schemas::camera::camera_calibration_fields;
 
 /// A pinhole model of one image stream at its streamed size; lens distortion is not carried.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -59,29 +60,6 @@ pub struct CameraCalibration {
     pub depth: StreamIntrinsics,
     pub depth_to_color: RigidTransform,
     pub depth_to_imu: RigidTransform,
-}
-
-pub(crate) fn stream_intrinsics_type() -> DataType {
-    let mut fields = vec![required("width", DataType::UInt16), required("height", DataType::UInt16)];
-    let DataType::Struct(floats) = floats_struct(&["fx", "fy", "ppx", "ppy"]) else { unreachable!() };
-    fields.extend(floats.iter().map(|f| f.as_ref().clone()));
-    DataType::Struct(fields.into())
-}
-
-fn rigid_transform_type() -> DataType {
-    DataType::Struct(Fields::from(vec![
-        required("rotation", list_of(DataType::Float32, false)),
-        required("translation_m", list_of(DataType::Float32, false)),
-    ]))
-}
-
-pub fn camera_calibration_fields() -> Fields {
-    Fields::from(vec![
-        required("color", stream_intrinsics_type()),
-        required("depth", stream_intrinsics_type()),
-        required("depth_to_color", rigid_transform_type()),
-        required("depth_to_imu", rigid_transform_type()),
-    ])
 }
 
 pub fn encode_camera_calibration(calibration: &CameraCalibration) -> StructArray {

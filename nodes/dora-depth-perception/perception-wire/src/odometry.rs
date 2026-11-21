@@ -5,11 +5,12 @@ use std::sync::Arc;
 
 use dora_node_api::arrow::array::{Array, ArrayRef, AsArray, BooleanArray, Float32Array, Int64Array, ListArray, StructArray, UInt32Array, UInt64Array};
 use dora_node_api::arrow::buffer::{NullBuffer, OffsetBuffer};
-use dora_node_api::arrow::datatypes::{DataType, Fields, Float32Type, Int64Type, UInt32Type, UInt64Type};
+use dora_node_api::arrow::datatypes::{DataType, Float32Type, Int64Type, UInt32Type, UInt64Type};
 use eyre::{bail, Result};
 use glam::{Quat, Vec3};
 
-use super::{checked, field, floats, item, items, list_values, one_list, scalar};
+use super::{checked, floats, item, list_values, one_list, scalar};
+use wire_schemas::odometry::{odom_pose_fields, DEGENERATE_DIRECTION, DEGENERATE_SIGMA_M};
 
 /// The direction of travel a depth cloud pinned down least, in the odom frame and either way round, and the one
 /// sigma the cloud alone leaves along it.
@@ -31,7 +32,10 @@ pub struct DegenerateDirection {
 /// odometry that starts again carries a later one. Poses with different values are in different odom frames and
 /// cannot be combined.
 ///
-/// The sigmas say how well the pose is known against the odometry's own map. They do not include that map's drift.
+/// The sigmas say how well the pose is known against the odometry's own map, and leave out that map's drift. The
+/// position sigmas also cover the depth camera's warm-up: they add how far the depth clouds would move the position
+/// under a change of the depth's scale, at one sigma of half the change a D455's depth goes through over the first
+/// minutes of a stream. The tilt and heading sigmas are the filter's alone.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct OdomPose {
     /// The time the pose is for, on the camera's own clock in nanoseconds (not a unix time): its depth frame's.
@@ -57,27 +61,6 @@ pub struct OdomPose {
     pub matched_points: u32,
     /// Absent when the cloud did not correct the pose.
     pub degenerate: Option<DegenerateDirection>,
-}
-
-const DEGENERATE_DIRECTION: &str = "degenerate_direction";
-const DEGENERATE_SIGMA_M: &str = "degenerate_sigma_m";
-
-fn odom_pose_fields() -> Fields {
-    Fields::from(vec![
-        field("camera_ns", DataType::Int64),
-        field("odom_started_camera_ns", DataType::Int64),
-        field("depth_frame_id", DataType::UInt64),
-        field("position_m", items(DataType::Float32)),
-        field("orientation_xyzw", items(DataType::Float32)),
-        field("velocity_m_s", items(DataType::Float32)),
-        field("position_sigma_m", items(DataType::Float32)),
-        field("tilt_sigma_rad", DataType::Float32),
-        field("heading_sigma_rad", DataType::Float32),
-        field("corrected", DataType::Boolean),
-        field("matched_points", DataType::UInt32),
-        field(DEGENERATE_DIRECTION, items(DataType::Float32)),
-        field(DEGENERATE_SIGMA_M, DataType::Float32),
-    ])
 }
 
 fn column<'a>(row: &'a StructArray, name: &str) -> &'a ArrayRef {

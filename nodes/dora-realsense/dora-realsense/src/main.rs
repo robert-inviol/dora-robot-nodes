@@ -1,7 +1,8 @@
 //! A RealSense D400 with an IMU as a dora node that owns the camera and publishes every frame: the detector's
 //! letterboxed `model_input`, raw `depth`, the `imu` samples leading up to the frame, and periodically the
 //! `calibration` that relates them; full-size `color` when a dataflow lists it. Every stamp is on the camera's own
-//! clock. Framesets go out once the accelerometer and gyro have both delivered a sample, and every frameset that goes
+//! clock, its 32-bit counter unwrapped by one `CameraClock` that every stream shares (`rgbd_frames::camera_clock`), so
+//! camera time rises on one 64-bit timeline for as long as the node runs. Framesets go out once the accelerometer and gyro have both delivered a sample, and every frameset that goes
 //! out has its colour and depth captured within `COLOR_DEPTH_GAP_LIMIT` (`rgbd_frames::frameset`); one further apart
 //! stops the node. Outputs a dataflow does not list cost nothing. Video runs on a pipeline, which pairs colour with depth;
 //! motion comes straight from the same device's motion sensor on a thread of its own, since a pipeline that also
@@ -26,11 +27,12 @@ use perception_wire::{encode_imu, Imu};
 use realsense_rust::base::{Rs2Extrinsics, Rs2Intrinsics};
 use realsense_rust::config::Config;
 use realsense_rust::context::Context as RealsenseContext;
-use realsense_rust::frame::{ColorFrame, DepthFrame, FrameEx};
+use realsense_rust::frame::{ColorFrame, CompositeFrame, DepthFrame, FrameEx};
 use realsense_rust::kind::{Rs2Format, Rs2Option, Rs2StreamKind, Rs2TimestampDomain};
 use realsense_rust::pipeline::{ActivePipeline, InactivePipeline};
 use motion_sensor::{MotionSample, MotionStream, MotionStreamRate};
 use realsense_rust::stream_profile::StreamProfile;
+use rgbd_frames::camera_clock::{CameraClock, CameraStream, CounterReading};
 use rgbd_frames::frameset::{frameset_disposition, FramesetDisposition};
 use rgbd_frames::imu_calibration::ImuCalibration;
 use rgbd_frames::letterbox::Letterbox;
@@ -69,8 +71,19 @@ const FRAME_WAIT: Duration = Duration::from_secs(2);
 const UNRELEASED_SAMPLES_LIMIT: usize = 4 * VIDEO_FPS;
 const EVENT_WAIT: Duration = Duration::from_millis(200);
 
-fn camera_ns(frame: &impl FrameEx) -> i64 {
-    (frame.timestamp() * 1e6).round() as i64
+/// The capture time of `frame` from `stream`, in nanoseconds on the unwrapped camera clock.
+fn camera_ns(clock: &Mutex<CameraClock>, stream: CameraStream, frame: &impl FrameEx) -> Result<i64> {
+    let reading = CounterReading::from_librealsense_ms(frame.timestamp())
+        .wrap_err_with(|| format!("{stream} frame {}", frame.frame_number()))?;
+    let time = clock.lock().expect("camera clock lock").unwrap_reading(stream, reading);
+    Ok(time.wrap_err_with(|| format!("{stream} frame {}", frame.frame_number()))?.nanos())
+}
+
+/// The counter reading of the depth frame in `frames`, which has to be on the camera's hardware clock.
+fn first_depth_reading(frames: &CompositeFrame) -> Result<CounterReading> {
+    let depth = frames.frames_of_type::<DepthFrame>().into_iter().next().ok_or_else(|| eyre!("the first frameset has no depth frame"))?;
+    FrameSequence::new("depth").is_new(&depth)?;
+    CounterReading::from_librealsense_ms(depth.timestamp()).wrap_err_with(|| format!("depth frame {}", depth.frame_number()))
 }
 
 /// The pixels of a video frame, which librealsense packs row by row with no padding for these formats.
@@ -136,6 +149,7 @@ impl FrameSequence {
 fn stream_motion(
     mut motion: MotionStream,
     calibration: &ImuCalibration,
+    clock: &Mutex<CameraClock>,
     samples: &Mutex<MotionSamples>,
     stopping: &AtomicBool,
 ) -> Result<()> {
@@ -145,13 +159,15 @@ fn stream_motion(
             MotionSample::Accel(accel) => {
                 if accel_frames.is_new(&accel)? {
                     let sample = calibration.accel.apply(Vec3::from_array(*accel.acceleration()));
-                    samples.lock().expect("motion samples lock").accel.push((camera_ns(&accel), sample));
+                    let t = camera_ns(clock, CameraStream::Accel, &accel)?;
+                    samples.lock().expect("motion samples lock").accel.push((t, sample));
                 }
             }
             MotionSample::Gyro(gyro) => {
                 if gyro_frames.is_new(&gyro)? {
                     let sample = calibration.gyro.apply(Vec3::from_array(*gyro.rotational_velocity()));
-                    samples.lock().expect("motion samples lock").gyro.push((camera_ns(&gyro), sample));
+                    let t = camera_ns(clock, CameraStream::Gyro, &gyro)?;
+                    samples.lock().expect("motion samples lock").gyro.push((t, sample));
                 }
             }
         }
@@ -258,12 +274,15 @@ fn capture(
     let depth_units_mm = read_depth_units_mm(&video)?;
     // The motion sensor is the one of the device the video pipeline opened, which the first frameset names.
     let first_frames = video.wait(Some(FRAME_WAIT)).map_err(|e| eyre!("waiting for the first camera frames: {e}"))?;
+    // The camera clock starts at the first depth frame, before the motion sensor starts, so the samples it can still
+    // hold from an earlier session are placed before this session's start rather than defining the origin.
+    let clock = Mutex::new(CameraClock::starting_at(first_depth_reading(&first_frames)?));
     let motion_rates = [MotionStreamRate::accel(ACCEL_HZ), MotionStreamRate::gyro(GYRO_HZ)];
     let motion = MotionStream::start(first_frames, &motion_rates, MOTION_QUEUE_CAPACITY)?;
     let motion_samples = Mutex::new(MotionSamples::default());
     std::thread::scope(|scope| {
-        let motion = scope.spawn(|| stream_motion(motion, &imu_calibration, &motion_samples, &stopping));
-        let camera = CameraStreams { calibration: &calibration, depth_units_mm, motion_samples: &motion_samples };
+        let motion = scope.spawn(|| stream_motion(motion, &imu_calibration, &clock, &motion_samples, &stopping));
+        let camera = CameraStreams { calibration: &calibration, depth_units_mm, clock: &clock, motion_samples: &motion_samples };
         let sent = stream_video(&mut node, video, &wanted, camera, &stopping, &color_requests, || motion.is_finished());
         stopping.store(true, Ordering::Relaxed);
         let motion = motion.join().map_err(|_| eyre!("the motion thread panicked"))?;
@@ -271,11 +290,12 @@ fn capture(
     })
 }
 
-/// What the video thread reads besides its frames: the calibration and depth units read at start, and the motion
-/// samples the motion thread delivers.
+/// What the video thread reads besides its frames: the calibration and depth units read at start, the camera clock
+/// it shares with the motion thread, and the motion samples the motion thread delivers.
 struct CameraStreams<'a> {
     calibration: &'a CameraCalibration,
     depth_units_mm: f32,
+    clock: &'a Mutex<CameraClock>,
     motion_samples: &'a Mutex<MotionSamples>,
 }
 
@@ -326,8 +346,8 @@ fn stream_video(
             );
             continue;
         }
-        let depth_camera_ns = camera_ns(&depth);
-        let color_camera_ns = camera_ns(&color);
+        let depth_camera_ns = camera_ns(camera.clock, CameraStream::Depth, &depth)?;
+        let color_camera_ns = camera_ns(camera.clock, CameraStream::Color, &color)?;
         let mut motion_samples = camera.motion_samples.lock().expect("motion samples lock");
         let motion_delivering =
             session_start_ns.is_some() || (!motion_samples.accel.is_empty() && !motion_samples.gyro.is_empty());

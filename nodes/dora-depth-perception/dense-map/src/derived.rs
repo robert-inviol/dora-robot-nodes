@@ -1,8 +1,6 @@
 //! What is derived from the distance field: the surface mesh of the blocks that changed, the occupancy grid sliced above the
 //! floor, and the topology cut from the occupancy grid. It runs on a snapshot of the field, off the thread that fuses depth.
 
-use std::time::{Duration, Instant};
-
 use glam::IVec3;
 use perception_wire::navigation::{MapVersion, UnixNanos};
 use perception_wire::space_map::{Clearance, OccupancyGrid, HeightBand, Topology};
@@ -34,9 +32,8 @@ impl DerivedMaps {
     pub fn new(settings: &DenseMapSettings) -> DerivedMaps {
         DerivedMaps {
             mesher: BlockMesher::new(ResendRule {
-                min_vertex_move_m: settings.mesh.min_vertex_move_m,
-                min_changed_cells: settings.mesh.min_changed_cells,
-                min_block_period: Duration::from_secs_f32(settings.mesh.min_block_period_s),
+                surface_tolerance_m: settings.mesh.surface_tolerance_m,
+                min_moved_vertices: settings.mesh.min_moved_vertices,
             }),
             topology_builder: TopologyBuilder::new(settings.topology),
             last_topology: None,
@@ -44,9 +41,9 @@ impl DerivedMaps {
         }
     }
 
-    /// The surface of every block the `changed` blocks reach that differs enough from the one last sent.
-    pub fn mesh(&mut self, field: &dyn Tsdf, changed: &FxHashSet<IVec3>, now: Instant) -> MeshPass {
-        self.mesher.mesh_changed_blocks(field, changed, now)
+    /// The surface of every block the `changed` blocks reach that has moved from the one last sent.
+    pub fn mesh(&mut self, field: &dyn Tsdf, changed: &FxHashSet<IVec3>) -> MeshPass {
+        self.mesher.mesh_changed_blocks(field, changed)
     }
 
     /// The occupancy grid, and the topology when it changed, sliced from the field, or None while no floor is seen.

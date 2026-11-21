@@ -32,23 +32,33 @@ what is open.
 
 Three machines, joined by `dora-zenoh-bridge` (YAML node id `bridge`) on Zenoh keys `rig/*`. A published key waits
 for the Zenoh connection rather than lose a message; only the keys in `ZENOH_LATEST_ONLY` (`rig/posed_depth` and
-`rig/people_tracks` on the camera machine) replace a message still waiting with a newer one.
+`rig/people_tracks` on the camera machine) replace a message still waiting with a newer one. A payload is the
+message's row alone, as an Arrow IPC record batch, the whole of it through zstd, with its wire type named by an
+8-byte fingerprint (`nodes/dora-depth-perception/wire-schemas`): no schema is sent, and only the messages of
+`lib/dora-rig-messages` cross. Bridges built from different message definitions refuse each other's payloads by
+name, so every machine's bridge is deployed together. A received message goes out as soon as Zenoh hands it over,
+merged into the bridge's event stream; the bridge's `tick` (1 s) only writes the traffic log when nothing arrives
+and keeps a subscribe-only bridge's event stream open.
 
 Camera machine (Pi with the D455 and a Hailo-8), `nodes/dora-realsense/examples/pose-dataflow.yml`:
 
 ```
 camera: dora-realsense (the only node that opens the D455; every stamp on the camera clock)
- |- model_input ----------------> pose (YOLOv8 pose + hailotracker on the Hailo-8) -> person_poses -> people, odometry
+ |- model_input ----------------> pose (YOLOv8 pose + hailotracker on the Hailo-8)
+ |                                 -> person_poses -> people, odometry, posed_depth, keyframes
  |- depth, imu, calibration ----> odometry (dora-depth-inertial-odometry) -> odom_pose -> people, posed_depth, bridge
  |                                 (person_poses cut people out of the depth; lost once the position sigma passes 4.2 cm)
  |- depth, calibration, odom_pose -> people (dora-people-3d, POSITION_FRAME=odom)
  |                                 -> people_tracks: 30 a second, in the odom frame named by odom_started_camera_ns,
- |                                    with skeleton_3d -> bridge
+ |                                    with skeleton_3d (each joint smoothed on its own; a person the pose tracker
+ |                                    drops and finds again along their predicted way keeps their id) -> bridge
  |- depth, calibration, odom_pose -> posed_depth (dora-posed-depth): every third depth frame, 2x2 downsampled, depth
- |                                    rounded to 2 mm, at the odometry pose of exactly that frame -> bridge
+ |                                    rounded to 2 mm, people cut out, at the odometry pose of exactly that frame
+ |                                    -> bridge
  '- depth, imu, calibration, color (only the frames it names on request_color)
                                 -> keyframes (dora-keyframe-selector: keyframe selection, at least one a second and
-                                   sooner on a 10 degree turn) -> keyframe, imu (one per keyframe) -> bridge
+                                   sooner on a 10 degree turn; people cut out of the aligned depth, the colour left
+                                   as it is) -> keyframe, imu (one per keyframe) -> bridge
 bridge: listens on :7447; publishes rig/people_tracks, rig/odom_pose, rig/keyframe, rig/imu, rig/calibration and
         rig/posed_depth
 ```
@@ -112,12 +122,12 @@ median per frame.
 `rig/calibration` tells the server's localizer the colour camera's extrinsics on the IMU.
 
 GPU machine, `nodes/dora-depth-perception/examples/live-dataflow.yml`: from `rig/keyframe`, open-vocabulary labels
-(`labels`, dora-scene-concepts), SAM 3 instance masks (`sam3`, dora-sam3-segmenter) and plane segmentation
-(`plane_segmentation`, dora-depth-perception: planes and the room of each keyframe); publishes
-`rig/instance_masks`, `rig/room_layout` and `rig/scene`. It runs on robert's laptop (RTX 4050, 6 GB; the SAM 3
-environment needs Python 3.12, `uv sync --python 3.12`); `live-laptop.yml` is the labels and SAM 3 part alone. Its
-bridge must listen as well as connect: Zenoh on the camera machine does not forward `rig/instance_masks` between the
-laptop and strixen when both only connect to it, so strixen reaches the laptop directly.
+(`labels`, dora-scene-concepts), SAM 3 instance masks (`sam3`, dora-sam3-segmenter) and, for its own debug page
+(dora-scene-view), plane segmentation (`plane_segmentation`, dora-depth-perception: planes, the room and the objects'
+footprints of each keyframe); publishes `rig/instance_masks` and `rig/scene`. It runs on robert's laptop (RTX 4050,
+6 GB; the SAM 3 environment needs Python 3.12, `uv sync --python 3.12`); `live-laptop.yml` is the labels and SAM 3 part
+alone. Its bridge must listen as well as connect: Zenoh on the camera machine does not forward `rig/instance_masks`
+between the laptop and strixen when both only connect to it, so strixen reaches the laptop directly.
 
 Server (strixen), `nodes/dora-depth-perception/examples/spatial-server-dataflow.yml`:
 
@@ -130,22 +140,25 @@ bridge: connects to the camera machine; subscribes rig/keyframe, rig/imu, rig/in
  |     -> map_to_odom -> dense_map, spatial_agent, rig_view
  |- keyframe, keyframe_pose, pose_graph_update, posed_depth, map_to_odom, object_update -> dense_map (dora-dense-map)
  |     (keyframes fused at their map pose and rebuilt when they move; posed depth frames fused at their odometry
- |      pose carried into the map by map_to_odom of their odom frame)
- |     -> occupancy_grid, topology, keep_out -> spatial_agent, bridge
- |     -> mesh_blocks (blocks whose mesh changed, numbered by run and sequence) -> rig_view
+ |      pose carried into the map by the map_to_odom of their odom frame valid at their capture time; space carving
+ |      and the contradiction rule clear what has gone)
+ |     -> occupancy_grid, topology (room, doorway and place ids matched against the last cut that had any),
+ |        keep_out -> spatial_agent, bridge
+ |     -> mesh_blocks (a block is sent when its surface has really moved, with no timer; numbered by run and
+ |        sequence) -> rig_view
  |- keyframe, keyframe_pose, instance_masks -> objects (dora-object-map) -> object_update (with its voxels)
  |                                                                       -> dense_map, spatial_agent, rig_view
  |- spatial_query, goal_status, people_tracks, map_to_odom, ... -> spatial_agent (dora-world-agent: SQLite world
  |     store, MCP tools, spatial agents) -> spatial_answer, nav_goal -> bridge
- |- keyframe -> plane_segmentation (dora-depth-perception) -> room_layout (one keyframe's planes and room) -> rig_view
  '- keyframe, odom_pose, people_tracks, mesh_blocks, topology, ... -> rig_view (dora-rig-view): the 3D page on 8094
        -> mesh_snapshot_request (after a gap in the mesh blocks sequence, or on joining a run late) -> dense_map,
           which answers with a snapshot of every mesh block
 ```
 
 dora-rig-view serves a page for people to watch the map grow: the dense map's mesh with each object's voxels
-painted on it, the robot and its path, people's skeletons, rooms and places, the room layout of the latest keyframe,
-and optionally the keyframe clouds, space carved where later registered keyframes saw through them. A page gets the
+painted on it, the robot and its path, people's skeletons, rooms and places, and optionally the keyframe clouds: one
+cloud per keyframe the localizer selected into the map (the keyframe pose's `selection`), a point of it removed by
+majority vote of the registered views (space carving: once more views saw through it than saw it). A page gets the
 scene once when it connects, then only changes, over one WebSocket. `cargo run --release --example demo -- 8094` in
 nodes/dora-rig-view runs it on a synthetic room fused by the real dense map, without the rig.
 
@@ -190,6 +203,15 @@ Each consumer's rule for a restarted keyframe is in its README: the dense map fu
 like any map keyframe); the object map and the world store skip it (they take no pose graph updates); the rig view
 draws it but does not carve with it.
 
+Each `keyframe_pose` carries keyframe selection's verdict (`selection`): `selected` (a map keyframe; every restarted
+one), `not_selected` with the map keyframe it keeps its offset from (`reference_frame_id`), or `not_localized`
+(exactly the lost ones). The rig view draws a cloud for the selected ones only; the dense map, the object map and the
+world store do not use it (the dense map keeps at most one keyframe per pose cell of its own).
+
+The localizer keeps its tracking target (the map keyframes it registers against, joined, thinned and with normals)
+while those keyframes keep their poses, and builds it again only when they change. One registration runs on one
+thread; the seed trials run in parallel.
+
 ## Odometry
 
 dora-depth-inertial-odometry gives the robot's pose at every depth frame from the D455's depth and IMU: the IMU
@@ -198,17 +220,21 @@ filter's measurement update blends the two. The library is `nodes/dora-depth-per
 README explains the method, the three local maps it can use and how they compare for accuracy and for speed on a Pi
 5, and its limits. The node runs the voxel-plane map, and cuts the pose node's people out of the depth.
 
-- It has run live once, on the Pi in `pose-dataflow.yml` with the camera at rest on a bench for about 70 s, before
+- It first ran live on the Pi in `pose-dataflow.yml` with the camera at rest on a bench for about 70 s, before
   people were cut out of the depth: it started 2 s after the calibration, kept pace at 30 poses/s, and crept about
-  1 cm in y over 30 s (position sigma 1-2 mm). It has not yet run on a moving camera.
+  1 cm in y over 30 s (position sigma 1-2 mm). Nothing has yet run on a moving camera.
 - The node publishes nothing until it has the camera's calibration and static initialization is done (the camera
   stationary for 2 s). It stops, rather than guess, when a calibration changes, time goes back, the IMU is more than
   10 ms behind a depth frame, or a silent stream leaves it holding more than 1 s of samples (see the node's README).
 - The odom frame is z up, with its origin and zero heading where the IMU was during static initialization. The body
   is the IMU.
-- The sigmas on `odom_pose` say how well the pose fits the odometry's own map. They leave out that map's drift and
-  are too small as a measure of where the robot is in the room. `degenerate_direction` is the direction the cloud
-  pinned down least.
+- The odometry cuts the pose node's people out of the depth before matching, as posed depth frames and keyframes do
+  before they are sent.
+- The creep at rest is the D455's depth warming up: on the bench every first start of a stream crept 5.5 to 6 cm,
+  almost all of it in the first five minutes, then flat (2026-11-15; see "Depth warm-up" in the odometry crate's
+  README). The position sigmas on `odom_pose` now cover it: they add how far the clouds would move the position
+  under a depth scale change of half the warm-up's. The sigmas otherwise say how well the pose fits the odometry's
+  own map and leave out that map's drift. `degenerate_direction` is the direction the cloud pinned down least.
 
 ## Next
 
@@ -228,8 +254,20 @@ people tracks went to 30 a second and before posed depth frames were added).
 
 Also open:
 
-- The Zenoh bridge costs a third of a core on the Pi, more than the pose node; on 2026-11-15 its encode (Arrow IPC
-  with zstd) took 0.37 s of every second, 4-6 ms for a 4.5 KB odom pose or a 9.7 KB people frame.
+- Nothing has yet run on a moving camera.
+- The Zenoh bridge cost a third of a core on the Pi on 2026-11-15, more than the pose node: its encode took 0.37 s
+  of every second, 4-6 ms for a 4.5 KB odom pose or a 9.7 KB people frame, each payload then carrying its schema
+  (776 B for the odom pose fixture). Payloads now carry the row and a fingerprint only; the bridge's CPU on
+  the Pi has not been measured since.
+- Planes (walls, floor, ceiling) fitted from the fused map, with stable ids, in place of the per-keyframe room
+  layout, which is removed from the server and the rig view (the GPU machine's debug page still fits one per
+  keyframe for itself): robert's decision, not started.
+- A depth-scale state in the odometry's filter would estimate the depth warm-up instead of covering it in the
+  sigmas: robert's decision.
+- A zero-velocity update while the camera is stationary would let the odometry survive a blocked view for longer
+  than about 1.7 s: robert's decision.
+- A 5 cm change in a surface, under the dense map's contradiction threshold, takes several seconds to show in the
+  mesh.
 - The keyframe selector's alignment leaves out lens distortion.
 - A keyframe is 453 KB after zstd, 3.6 of the Pi's 12.2 Mbit/s uplink (2026-11-15), because the keyframe selector
   upscales depth to the colour image's 1280x720. Sending depth at its native 848x480 needs the depth intrinsics and
@@ -246,13 +284,12 @@ Also open:
 
 Odometry, in order:
 
-1. Find the 1 cm per 30 s creep at rest seen on the Pi's first live run.
-2. Record a walk (`record-odometry-inputs.yml` on the Pi: every depth frame, the imu messages, the calibration
+1. Record a walk (`record-odometry-inputs.yml` on the Pi: every depth frame, the imu messages, the calibration
    and the person poses), starting and ending at the same spot, and replay it through the odometry
    (`replay-odometry-inputs`, see the odometry crate's README). The gap between the first and last pose is the
    first accuracy number from a real camera. The same recording can feed map building. The one recording so far
    (2026-11-15, 2 minutes, camera at rest) is on the Pi in `~/odometry-recordings/1794725183`.
-3. Fix what the walk shows. Known before it starts:
+2. Fix what the walk shows. Known before it starts:
    - height drifts when the floor is out of view; a measurement that holds the robot to the floor is not written,
      and whether to add one is for robert to decide;
    - the lidar is not used: the filter takes point-to-plane rows from any sensor, and none are written for it.
@@ -281,7 +318,8 @@ Odometry, in order:
   mesh snapshot request (`mesh_blocks`, `MeshBlock`, `BlockMesher`).
 - Occupancy grid: free, occupied and unknown cells above the floor, with each free cell's clearance
   (`occupancy_grid`).
-- Room layout: one keyframe's planes and room from plane segmentation (`room_layout`, `plane_segmentation`).
+- Room layout: one keyframe's planes and room from plane segmentation (`room_layout`, `plane_segmentation`), drawn
+  only on the GPU machine's debug page.
 - Space carving: removing cloud points a later view saw through (rig view).
 - Instance masks: SAM 3's per-pixel instance ids with their labels (`instance_masks`, `instance_ids`).
 - Open-vocabulary labels: the object type names Claude lists for a keyframe (`labels`).
@@ -289,5 +327,7 @@ Odometry, in order:
   `JointObservation`).
 - Keypoints are what the pose model detected; the skeleton is what dora-people-3d fitted to them.
 - Bridge: `dora-zenoh-bridge`, the node joining machines over Zenoh.
+- Wire type: a message's Arrow struct type (`wire-schemas`); its fingerprint, the first 8 bytes of the SHA-256 of
+  its canonical encoding, names it in a bridge payload (`Fingerprint`, `wire_fingerprints.json`).
 - Spatial query and spatial answer: a question to the spatial agent and its answers (`spatial_query`,
   `spatial_answer`).

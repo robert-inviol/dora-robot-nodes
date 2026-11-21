@@ -4,10 +4,25 @@
 voxel_m = 0.05
 # Signed distances are clamped to this either side of a surface.
 truncation_m = 0.2
+# The weight a reading adds to a voxel near its surface, or one it sees free.
 observation_weight = 1.0
+# Readings further than this add less weight, (full_weight_range_m / depth)^4: the inverse square of a noise that
+# grows with the square of the range, so a settled surface wanders by the same at any range.
+full_weight_range_m = 3.0
+# The depth camera's noise, one sigma, at 1 m; it grows with the square of the range.
+depth_noise_at_1_m = 0.005
+# A reading contradicts a voxel when it differs from it by more than this many sigmas of its noise and by more than
+# min_contradiction_m: a ray that surely passed a voxel holding surface, or a surface reading that disagrees with the
+# voxel's. A contradicting reading halves the voxel's weight before it is averaged in, so a surface that went or came
+# takes over within a few frames.
+contradiction_sigmas = 3.0
+min_contradiction_m = 0.1
+# A voxel's weight stops growing here, so a settled surface averages about its last max_weight readings.
 max_weight = 64.0
 # Behind a surface a reading's weight falls away; a voxel with less weight than this counts as never seen.
-min_observed_weight = 0.5
+min_observed_weight = 0.1
+# Nearer than the min range a reading says nothing. Within the range it is a surface and carves the voxels in front
+# of it free; beyond the max range it is no surface and carves the voxels within it.
 min_range_m = 0.4
 max_range_m = 5.0
 # Every n-th pixel each way casts a ray that decides which blocks a keyframe touches.
@@ -27,14 +42,13 @@ occupied_below_m = 0.025
 period_s = 1.0
 
 [mesh]
-# The shortest time between two mesh_blocks messages.
+# The shortest time between two mesh_blocks messages, and so between two sends of one block.
 period_s = 0.2
-# A block is sent again when a vertex moved further than this from where it was last sent,
-min_vertex_move_m = 0.02
-# or more than this fraction of its cells holding a vertex appeared or went,
-min_changed_cells = 0.1
-# and no sooner than this after it was last sent.
-min_block_period_s = 0.5
+# A vertex further than this from the other surface has moved: one meshed now from the surface last sent, or one
+# last sent from the surface now.
+surface_tolerance_m = 0.02
+# A block is sent again once at least this many of its vertices moved, or all of them when it has fewer.
+min_moved_vertices = 3
 
 [topology]
 door_width_m = 1.1
@@ -52,6 +66,9 @@ margin_m = 0.15
 
 [buffers]
 max_awaiting_pose = 64
+# Corrections from the odom frame to the map held, so a posed depth frame is fused with the one valid when it was
+# captured; a frame older than the oldest held is not fused.
+max_corrections = 16
 
 [keyframes]
 # Keyframe poses fall in cells this wide along x, y and z, and this wide in yaw; a cell keeps only its newest keyframe.

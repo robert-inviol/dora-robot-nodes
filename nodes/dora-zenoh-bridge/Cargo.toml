@@ -12,11 +12,25 @@ readme = "README.md"
 [dependencies]
 # The node API has to match the version of the dora CLI that runs the dataflow.
 dora-node-api = { version = "=0.3.13", default-features = false }
-# The same arrow-ipc as the node API's arrow, with compression added.
-arrow-ipc = { version = "=54.3.1", features = ["zstd"] }
+# The same arrow-ipc as the node API's arrow.
+arrow-ipc = "=54.3.1"
+# The same zstd as arrow-ipc's; the bridge compresses each whole payload with it.
+zstd = "0.13"
 eyre = "0.6"
+# The wire types the bridge carries, with their fingerprints; arrow-schema only, the node API's own.
+wire-schemas = { path = "../dora-depth-perception/wire-schemas" }
 zenoh = "1.10"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+# For rig-ask: the spatial query and answer messages, its command line and its JSON lines.
+perception-wire = { path = "../dora-depth-perception/perception-wire" }
+clap = { version = "4.5", features = ["derive", "env"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+
+[dev-dependencies]
+# Arrow IPC's own per-buffer compression, which the tests compare payloads with.
+arrow-ipc = { version = "=54.3.1", features = ["zstd"] }
 
 [profile.release]
 strip = true

@@ -1,6 +1,7 @@
-//! What a RealSense node does to each frame that needs no librealsense: which framesets it sends, the detector's
-//! letterboxed input and the IMU correction.
+//! What a RealSense node does to each frame that needs no librealsense: the camera clock unwrapped, which framesets
+//! it sends, the detector's letterboxed input and the IMU correction.
 
+pub mod camera_clock;
 pub mod frameset;
 pub mod imu_calibration;
 pub mod letterbox;

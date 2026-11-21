@@ -89,12 +89,14 @@ pub struct DepthCamera {
     pub max_depth_m: f64,
     /// Depth error sigma per square metre of depth.
     pub noise_per_square_m: f64,
+    /// Every reading is the true depth times this: the bias every view shares, as when a stereo camera warms up.
+    pub depth_scale: f64,
 }
 
 impl DepthCamera {
     /// The D455's field of view and depth error, at a quarter of its 848x480 depth resolution.
     pub fn d455_quarter() -> DepthCamera {
-        DepthCamera { columns: 212, rows: 120, horizontal_view_rad: 87f64.to_radians(), vertical_view_rad: 58f64.to_radians(), min_depth_m: 0.4, max_depth_m: 6.0, noise_per_square_m: 0.005 }
+        DepthCamera { columns: 212, rows: 120, horizontal_view_rad: 87f64.to_radians(), vertical_view_rad: 58f64.to_radians(), min_depth_m: 0.4, max_depth_m: 6.0, noise_per_square_m: 0.005, depth_scale: 1.0 }
     }
 
     /// The cloud the camera sees from a body pose, in the body frame, with depth noise.
@@ -111,7 +113,7 @@ impl DepthCamera {
                 if depth < self.min_depth_m || depth > self.max_depth_m {
                     continue;
                 }
-                let noisy = depth + self.noise_per_square_m * depth * depth * standard_normal(rng);
+                let noisy = depth * self.depth_scale + self.noise_per_square_m * depth * depth * standard_normal(rng);
                 cloud.push((ray * noisy).as_vec3());
             }
         }

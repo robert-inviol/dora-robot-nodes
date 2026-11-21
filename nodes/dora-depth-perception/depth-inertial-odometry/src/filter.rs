@@ -191,11 +191,38 @@ pub struct PoseInformation {
     pub rows: usize,
     /// Sum of squared residuals, each in units of its own sigma.
     pub squared_sigmas: f64,
+    /// How the gradient moves per unit of each part of a depth scale error shared by every depth reading
+    /// ([`DepthScaleError`]): with [`Self::position_shift_per_depth_scale`] it says how far such an error moves the
+    /// position. Zero for measurements that do not come from depth readings.
+    pub gradient_per_depth_scale: DepthScaleGradient,
 }
+
+/// A scale error that every depth reading of a camera shares, as a stereo camera's warming up gives it: a reading
+/// of depth `d` along a ray whose optical-frame direction is `(x, y, 1)` comes out as
+/// `d (1 + uniform + across x + down y)`. `x` grows to the right of the image and `y` downwards.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DepthScaleError {
+    pub uniform: f64,
+    pub across: f64,
+    pub down: f64,
+}
+
+impl DepthScaleError {
+    pub const PARTS: usize = 3;
+
+    pub fn as_vector(&self) -> SVector<f64, { DepthScaleError::PARTS }> {
+        SVector::<f64, { DepthScaleError::PARTS }>::new(self.uniform, self.across, self.down)
+    }
+}
+
+/// How a gradient over position and orientation moves per unit of each part of a [`DepthScaleError`].
+pub type DepthScaleGradient = SMatrix<f64, 6, { DepthScaleError::PARTS }>;
+/// How a position moves per unit of each part of a [`DepthScaleError`]: one column per part.
+pub type PositionPerDepthScale = SMatrix<f64, 3, { DepthScaleError::PARTS }>;
 
 impl Default for PoseInformation {
     fn default() -> Self {
-        PoseInformation { hessian: PoseMatrix::zeros(), gradient: PoseVector::zeros(), rows: 0, squared_sigmas: 0.0 }
+        PoseInformation { hessian: PoseMatrix::zeros(), gradient: PoseVector::zeros(), rows: 0, squared_sigmas: 0.0, gradient_per_depth_scale: DepthScaleGradient::zeros() }
     }
 }
 
@@ -221,9 +248,40 @@ impl PoseInformation {
         self.squared_sigmas += weight * residual_m * residual_m;
     }
 
+    /// A depth reading's measurement: as [`Self::add_row`], with `residual_per_depth_scale`, how far the residual
+    /// moves per unit of each part of a [`DepthScaleError`].
+    #[inline]
+    pub fn add_depth_row(&mut self, jacobian: &PoseVector, residual_m: f64, weight: f64, residual_per_depth_scale: &SVector<f64, { DepthScaleError::PARTS }>) {
+        self.add_row(jacobian, residual_m, weight);
+        self.gradient_per_depth_scale += (jacobian * weight) * residual_per_depth_scale.transpose();
+    }
+
+    /// How far each part of a [`DepthScaleError`] shared by every depth reading moves the position these
+    /// measurements hold the body at, per unit of that part, in the world frame.
+    ///
+    /// It is the measurements' own answer, without the IMU's prediction: a shared error is not noise that averaging
+    /// removes, since every reading of a cloud, and every cloud of a camera at rest, carries it, and over time the
+    /// filter's slower states (the biases and up) give way to it until the pose is where the measurements put it.
+    /// A direction the measurements leave free is held by [`Self::DEPTH_SCALE_SHIFT_PRIOR`].
+    pub fn position_shift_per_depth_scale(&self) -> PositionPerDepthScale {
+        let (position_prior, orientation_prior) = Self::DEPTH_SCALE_SHIFT_PRIOR;
+        let mut held = self.hessian;
+        for axis in 0..3 {
+            held[(axis, axis)] += 1.0 / (position_prior * position_prior);
+            held[(axis + 3, axis + 3)] += 1.0 / (orientation_prior * orientation_prior);
+        }
+        let solved = held.cholesky().expect("the information plus a positive prior is positive definite");
+        -solved.solve(&self.gradient_per_depth_scale).fixed_rows::<3>(0).into_owned()
+    }
+
+    /// One sigma of position, in metres, and of orientation, in radians, that holds the directions the measurements
+    /// leave free in [`Self::position_shift_per_depth_scale`].
+    pub const DEPTH_SCALE_SHIFT_PRIOR: (f64, f64) = (0.1, 1.0);
+
     pub fn merge(mut self, other: PoseInformation) -> PoseInformation {
         self.hessian += other.hessian;
         self.gradient += other.gradient;
+        self.gradient_per_depth_scale += other.gradient_per_depth_scale;
         self.rows += other.rows;
         self.squared_sigmas += other.squared_sigmas;
         self

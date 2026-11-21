@@ -17,11 +17,25 @@ gravity-aligned floor frame from `depth-perception`.
 
 A keyframe that registers (tracking or relocalized) within `keyframe_selection.min_translation_m` and
 `min_rotation_deg` of a map keyframe it registered against is not added to the map
-(`KeyframeSelection::NotSelected`): its pose is reported, and it keeps its offset from that reference keyframe, so
+(`KeyframeSelection::NotSelected`, the wire type perception-wire defines, sent on its `keyframe_pose`): its pose is reported, and it keeps its offset from that reference keyframe, so
 an optimization that moves the reference keyframe moves it too (`Localizer::followers`). Only a selected keyframe
 becomes a pose graph node with a stored cloud, an odometry edge and a loop-closure attempt. A camera at rest
 therefore adds nothing to the map and keeps registering against the same map keyframes; the graph grows with the
 space explored. Each keyframe not selected costs one small record (its frame id and offset).
+
+## Work per keyframe
+
+Tracking registers against a target built from the submap: its keyframes' clouds joined at their current poses,
+thinned to `submap.voxel_m`, indexed and given surface normals. The target is kept while the submap holds the same
+keyframes at the same poses, so a camera at rest builds it once and a pose graph optimization that moves a submap
+keyframe builds it again. A keyframe that is not selected adds no edge, so no loop closure is looked for and no
+optimization runs for it.
+
+One registration runs on one thread (room-map's `registration`); the seed trials of tracking, loop closure and
+relocalization run in parallel, one registration per seed, as do the surface normals of a new target.
+
+`KeyframeEstimate::timings` (`StageTimings`) says how long each stage took: building the tracking target, the seed
+trials, the refinement, loop closure, relocalization and pose graph optimization.
 
 ## Tracking states
 
@@ -59,7 +73,14 @@ version.
 ```
 cargo test --release -p map-localizer
 cargo run --release -p map-localizer --example localize_recording -- <keyframes.arrow> <trajectory.csv> <refuse|search> [<imu.arrow>]
+cargo run --release -p map-localizer --example localize_timing -- [<poses.csv>] [<gap_ms>]
 ```
 
 Without an imu recording no keyframe has a gyro turn, so `localize_recording` needs `search`, which is slower
 than gyro seeding.
+
+`localize_timing` localizes two laps of the synthetic living room (once with every keyframe selected, once with the
+default keyframe selection) and a camera at rest for 200 keyframes, and prints for each the median and worst time
+of every stage, the process CPU time per keyframe over all threads, and the worst pose error. `<poses.csv>` receives
+every keyframe's pose as sent and its final pose, to compare two builds; `<gap_ms>` sleeps between keyframes, as the
+node idles between them.

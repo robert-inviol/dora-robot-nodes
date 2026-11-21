@@ -96,7 +96,9 @@ pub struct FramePose {
     /// Turns a body-frame vector into the level frame.
     pub orientation: DQuat,
     pub velocity_m_s: DVec3,
-    /// How well the pose is known against the odometry's own map; the map's drift is not in it.
+    /// How well the pose is known against the room while the camera rests: its fit to the odometry's own map and
+    /// what a change of the camera's depth scale since it laid down the map does to it
+    /// ([`DepthInertialOdometry::levelled_uncertainty`]). The map's drift while the camera travels is not in it.
     pub uncertainty: LevelledUncertainty,
     /// One-sigma position uncertainty against the map along the direction where it is largest. It grows while the
     /// IMU alone carries the pose.
@@ -345,7 +347,7 @@ impl<M: SurfaceMap> PoseTracker<M> {
             position_m,
             orientation,
             velocity_m_s: state.levelled_velocity(),
-            uncertainty: odometry.filter().levelled_uncertainty(),
+            uncertainty: odometry.levelled_uncertainty(),
             largest_position_sigma_m: odometry.filter().largest_position_sigma_m(),
             cloud,
             counts: odometry.last_cloud(),
@@ -477,8 +479,11 @@ mod tests {
         assert!((degenerate.direction.length() - 1.0).abs() < 1e-9 && degenerate.sigma_m > 0.0 && degenerate.sigma_m < 0.05, "{degenerate:?}");
         assert_eq!((second.time, second.frame_id), (started + 2 * FRAME_PERIOD, DepthFrameId((started + 2 * FRAME_PERIOD).as_micros() as u64)));
         assert!(second.position_m.length() < 0.01 && second.velocity_m_s.length() < 0.05, "{second:?}");
+        // The position sigma holds what a change of the depth scale would do to the position; against the map alone
+        // the pose is known far better.
         let sigma = second.uncertainty;
-        assert!(sigma.position_sigma_m.max_element() < 0.02 && sigma.tilt_sigma_rad < 0.02 && sigma.heading_sigma_rad < 0.02, "{sigma:?}");
+        assert!(sigma.position_sigma_m.max_element() < 0.04 && sigma.tilt_sigma_rad < 0.02 && sigma.heading_sigma_rad < 0.02, "{sigma:?}");
+        assert!(second.largest_position_sigma_m < 0.02, "against the map the pose is known to millimetres: {second:?}");
     }
 
     #[test]

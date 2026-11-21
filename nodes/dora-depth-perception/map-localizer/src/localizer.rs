@@ -2,7 +2,8 @@
 //!
 //! A keyframe is seeded at the previous pose turned by the gyro, then registered (4-DoF point-to-plane ICP)
 //! against a submap of the map: the map keyframes nearest the seed, whenever they were seen, each placed at
-//! its current optimized pose, joined and thinned.
+//! its current optimized pose, joined and thinned. That target is kept while the submap holds the same map keyframes
+//! at the same poses.
 //!
 //! Keyframe selection: a registered keyframe within `keyframe_selection` (translation and yaw) of a map
 //! keyframe it was registered against is not added to the map. It is localized, and keeps its offset from that
@@ -25,8 +26,10 @@
 //! the map, over every heading, until one matches.
 
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use glam::Vec3;
+pub use perception_wire::localization::KeyframeSelection;
 use perception_wire::localization::{FrameId, KeyframePose, Pose4Dof, Tracking};
 use perception_wire::navigation::{MapVersion, UnixNanos};
 use rayon::prelude::*;
@@ -257,17 +260,20 @@ pub struct LocalizerInput {
     pub yaw_prior: RelativeYawPrior,
 }
 
-/// Whether keyframe selection added a keyframe to the map.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum KeyframeSelection {
-    /// The keyframe is a node of the pose graph. A keyframe that restarts tracking after loss is one, reported
-    /// restarted.
-    Selected,
-    /// Localized within `keyframe_selection` of the map keyframe `reference` and not added to the map; its pose
-    /// keeps its offset from the reference keyframe's.
-    NotSelected { reference: FrameId },
-    /// Not localized, and not in the map.
-    NotLocalized,
+/// Where one keyframe's localization spent its time.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct StageTimings {
+    /// Joining, thinning and finding the normals of the map keyframes tracking registers against.
+    pub tracking_target: Duration,
+    /// The short registrations that pick tracking's seed.
+    pub tracking_seed_trials: Duration,
+    /// The full registration from the chosen seed.
+    pub tracking_refinement: Duration,
+    /// Matching a selected keyframe against older map keyframes, target included.
+    pub loop_closure: Duration,
+    /// Matching a keyframe tracking could not place against the stored keyframes, target included.
+    pub relocalization: Duration,
+    pub pose_graph_optimization: Duration,
 }
 
 #[derive(Clone, Debug)]
@@ -285,6 +291,7 @@ pub struct KeyframeEstimate {
     pub submap: Vec<FrameId>,
     pub loop_closed: bool,
     pub optimization: Option<PoseGraphOptimization>,
+    pub timings: StageTimings,
 }
 
 impl KeyframeEstimate {
@@ -299,10 +306,18 @@ impl KeyframeEstimate {
             map_version: self.map_version,
             pose: Pose4Dof { x_m: self.pose.translation.x, y_m: self.pose.translation.y, z_m: self.pose.translation.z, yaw_rad: self.pose.yaw_rad },
             tracking: self.tracking,
+            selection: self.selection,
             residual_m,
             inlier_fraction,
         }
     }
+}
+
+/// A registration target, with the map keyframes it was built from at the poses they had. A map keyframe's cloud
+/// never changes, so the target is the same while they keep those poses.
+struct KeptTarget {
+    built_from: Vec<(NodeIndex, Pose)>,
+    target: Target,
 }
 
 struct StoredKeyframe {
@@ -364,6 +379,8 @@ pub struct Localizer {
     /// Tracking registers only against keyframes from here on: a restart begins a run not yet tied to the map.
     tracking_since: usize,
     tracked_since_loop_attempt: usize,
+    /// The target tracking last registered against.
+    tracking_target: Option<KeptTarget>,
     edges_since_optimized: bool,
     last_optimized: Option<UnixNanos>,
 }
@@ -404,6 +421,7 @@ impl Localizer {
             last_step: None,
             tracking_since: 0,
             tracked_since_loop_attempt: 0,
+            tracking_target: None,
             edges_since_optimized: false,
             last_optimized: None,
         }
@@ -525,6 +543,13 @@ impl Localizer {
     }
 
     pub fn localize(&mut self, input: LocalizerInput) -> KeyframeEstimate {
+        let mut timings = StageTimings::default();
+        let mut estimate = self.place(&input, &mut timings);
+        estimate.timings = timings;
+        estimate
+    }
+
+    fn place(&mut self, input: &LocalizerInput, timings: &mut StageTimings) -> KeyframeEstimate {
         let previous = self.latest_pose();
         let seed = self.seed(input.yaw_prior, previous);
         let dead_reckoned = Pose { yaw_rad: seed.gyro_yaw().unwrap_or(previous.yaw_rad), translation: previous.translation };
@@ -540,6 +565,7 @@ impl Localizer {
             submap,
             loop_closed,
             optimization,
+            timings: StageTimings::default(),
         };
 
         if input.yaw_prior == RelativeYawPrior::Refused {
@@ -554,7 +580,7 @@ impl Localizer {
                 self.latest = Latest::Lost { pose: dead_reckoned, lost_in_a_row: 0 };
                 return estimate(self, dead_reckoned, Tracking::Lost, KeyframeSelection::NotLocalized, None, Vec::new(), false, None);
             }
-            let node = self.add_keyframe(&input, Pose::IDENTITY);
+            let node = self.add_keyframe(input, Pose::IDENTITY);
             self.latest = Latest::InMap { node, offset: Pose::IDENTITY };
             self.last_optimized = Some(input.captured);
             let origin = Registration { pose: Pose::IDENTITY, fitness: 1.0, inlier_rmse_m: 0.0, weakest_constraint: f64::INFINITY };
@@ -564,41 +590,45 @@ impl Localizer {
         let mut attempted = None;
         let mut submap = Vec::new();
         if let (Latest::InMap { node: last, .. }, true) = (self.latest, enough_points) {
-            let tracked = self.track(&input, previous, seed);
+            let tracked = self.track(input, previous, seed, timings);
             attempted = tracked.registration;
             submap = tracked.submap.iter().map(|&node| self.keyframes[node.0].frame_id).collect();
             if let Some(found) = tracked.accepted {
                 self.last_step = Some(found.pose.relative_to(&previous));
                 if let Some(reference) = self.reference_keyframe(&tracked.submap, found.pose) {
-                    let reference = self.follow(&input, reference, found.pose);
+                    let reference = self.follow(input, reference, found.pose);
                     let selection = KeyframeSelection::NotSelected { reference };
                     return estimate(self, found.pose, Tracking::Tracking, selection, Some(found), submap, false, None);
                 }
-                let node = self.add_keyframe(&input, found.pose);
+                let node = self.add_keyframe(input, found.pose);
                 self.add_edge(last, node, EdgeKind::Odometry, self.settings.graph.odometry_sigma);
                 self.latest = Latest::InMap { node, offset: Pose::IDENTITY };
-                let loop_closed = self.close_loop(&input, node, matches!(seed, Seed::Gyro { .. }));
-                let optimization = self.optimize_if_due(input.captured, loop_closed);
+                let started = Instant::now();
+                let loop_closed = self.close_loop(input, node, matches!(seed, Seed::Gyro { .. }));
+                timings.loop_closure = started.elapsed();
+                let optimization = self.optimize_if_due(input.captured, loop_closed, timings);
                 let pose = self.graph.pose(node);
                 return estimate(self, pose, Tracking::Tracking, KeyframeSelection::Selected, Some(found), submap, loop_closed, optimization);
             }
         }
 
         if enough_points {
-            let relocalized = self.relocalize(&input, dead_reckoned, seed);
+            let started = Instant::now();
+            let relocalized = self.relocalize(input, dead_reckoned, seed);
+            timings.relocalization = started.elapsed();
             if let Some(found) = relocalized.accepted {
                 self.last_step = None;
                 self.tracking_since = 0;
                 if let Some(reference) = self.reference_keyframe(&relocalized.candidates, found.pose) {
-                    let reference = self.follow(&input, reference, found.pose);
+                    let reference = self.follow(input, reference, found.pose);
                     let selection = KeyframeSelection::NotSelected { reference };
                     return estimate(self, found.pose, Tracking::Relocalized, selection, Some(found), submap, false, None);
                 }
-                let node = self.add_keyframe(&input, found.pose);
+                let node = self.add_keyframe(input, found.pose);
                 let anchor = relocalized.anchor.expect("a relocalization matches stored keyframes");
                 self.add_edge(anchor, node, EdgeKind::LoopClosure, self.settings.graph.loop_sigma);
                 self.latest = Latest::InMap { node, offset: Pose::IDENTITY };
-                let optimization = self.optimize_if_due(input.captured, true);
+                let optimization = self.optimize_if_due(input.captured, true, timings);
                 let pose = self.graph.pose(node);
                 return estimate(self, pose, Tracking::Relocalized, KeyframeSelection::Selected, Some(found), submap, true, optimization);
             }
@@ -615,14 +645,14 @@ impl Localizer {
         };
         if enough_points && lost_in_a_row > self.settings.relocalize.restart_after_lost {
             let anchor = NodeIndex(self.graph.len() - 1);
-            let node = self.add_keyframe(&input, dead_reckoned);
+            let node = self.add_keyframe(input, dead_reckoned);
             let per_keyframe = self.settings.graph.dead_reckoning_sigma;
             let scale = (lost_in_a_row as f32).sqrt();
             let sigma = EdgeSigma { xy_m: per_keyframe.xy_m * scale, z_m: per_keyframe.z_m * scale, yaw_rad: per_keyframe.yaw_rad * scale };
             self.add_edge(anchor, node, EdgeKind::DeadReckoning, sigma);
             self.latest = Latest::InMap { node, offset: Pose::IDENTITY };
             self.tracking_since = node.0;
-            let optimization = self.optimize_if_due(input.captured, false);
+            let optimization = self.optimize_if_due(input.captured, false, timings);
             let pose = self.graph.pose(node);
             return estimate(self, pose, Tracking::Restarted, KeyframeSelection::Selected, attempted, submap, false, optimization);
         }
@@ -635,8 +665,18 @@ impl Localizer {
         step.translation.length() <= self.settings.tracking.max_step_m && step.yaw_rad.abs().to_degrees() <= self.settings.tracking.max_step_turn_deg
     }
 
+    /// The target of the map keyframes `nodes` at their current poses: the one kept from the last tracking when it
+    /// was built from the same keyframes at the same poses, else a new one.
+    fn tracking_target(&mut self, nodes: &[NodeIndex]) -> KeptTarget {
+        let built_from: Vec<(NodeIndex, Pose)> = nodes.iter().map(|&node| (node, self.graph.pose(node))).collect();
+        match self.tracking_target.take() {
+            Some(kept) if kept.built_from == built_from => kept,
+            _ => KeptTarget { target: self.target(nodes), built_from },
+        }
+    }
+
     /// Registers against the map keyframes nearest the seed from `previous`, the latest keyframe's pose.
-    fn track(&self, input: &LocalizerInput, previous: Pose, seed: Seed) -> Attempt {
+    fn track(&mut self, input: &LocalizerInput, previous: Pose, seed: Seed, timings: &mut StageTimings) -> Attempt {
         let settings = &self.settings;
         let moving_on = self.last_step.map_or(previous, |step| previous.compose(&step));
         let gyro_yaw = seed.gyro_yaw();
@@ -662,15 +702,24 @@ impl Localizer {
         if submap.is_empty() {
             return Attempt::failed(None);
         }
-        let target = self.target(&submap);
+        let started = Instant::now();
+        let kept = self.tracking_target(&submap);
+        timings.tracking_target = started.elapsed();
+        let target = &kept.target;
+        let settings = &self.settings;
         let prior = gyro_yaw.map(|yaw_rad| YawPrior { yaw_rad, weight: settings.tracking.gyro_yaw_weight });
         let trial = trial_settings(&settings.registration);
         let sparse = thinned(&input.cloud, settings.tracking.seed_trial_stride);
-        let trials: Vec<Registration> = seeds.par_iter().map(|&seed| fit(&sparse, &target, seed, &trial, prior)).collect();
+        let started = Instant::now();
+        let trials: Vec<Registration> = seeds.par_iter().map(|&seed| fit(&sparse, target, seed, &trial, prior)).collect();
         let seed = best_of(trials.into_iter()).expect("at least one seed").pose;
-        let found = fit(&input.cloud, &target, seed, &settings.registration, prior);
+        timings.tracking_seed_trials = started.elapsed();
+        let started = Instant::now();
+        let found = fit(&input.cloud, target, seed, &settings.registration, prior);
+        timings.tracking_refinement = started.elapsed();
         let agrees = gyro_yaw.is_none_or(|yaw| wrap_angle(found.pose.yaw_rad - yaw).abs().to_degrees() <= settings.tracking.max_gyro_disagreement_deg);
         let accepted = agrees && self.walking_step(found.pose, previous) && found.fitness >= settings.tracking.accept_fitness;
+        self.tracking_target = Some(kept);
         Attempt { accepted: accepted.then_some(found), registration: Some(found), anchor: None, submap, candidates: Vec::new() }
     }
 
@@ -756,12 +805,15 @@ impl Localizer {
         Attempt { accepted: accepted.then_some(found), registration: Some(found), anchor, submap: Vec::new(), candidates }
     }
 
-    fn optimize_if_due(&mut self, now: UnixNanos, loop_closed: bool) -> Option<PoseGraphOptimization> {
+    fn optimize_if_due(&mut self, now: UnixNanos, loop_closed: bool, timings: &mut StageTimings) -> Option<PoseGraphOptimization> {
         let interval_passed = self.last_optimized.is_none_or(|last| now.0 - last.0 >= self.settings.graph.optimize_interval_ns);
         if !(self.edges_since_optimized && (loop_closed || interval_passed)) {
             return None;
         }
-        Some(self.optimize(now))
+        let started = Instant::now();
+        let optimization = self.optimize(now);
+        timings.pose_graph_optimization = started.elapsed();
+        Some(optimization)
     }
 
     /// Optimizes the graph now, starting a new map version if any keyframe moved past the thresholds.

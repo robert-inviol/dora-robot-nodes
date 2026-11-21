@@ -9,7 +9,7 @@ use dora_dense_map::{read_settings, DenseMapNode, Input, Output};
 use dora_node_api::arrow::array::StructArray;
 use dora_node_api::arrow::buffer::ScalarBuffer;
 use glam::{Vec2, Vec3};
-use perception_wire::localization::{encode_keyframe_pose, encode_pose_graph_update, FrameId, KeyframePose, PoseGraphUpdate, UpdatedKeyframePose, Pose4Dof, Tracking};
+use perception_wire::localization::{encode_keyframe_pose, encode_pose_graph_update, FrameId, KeyframePose, KeyframeSelection, PoseGraphUpdate, UpdatedKeyframePose, Pose4Dof, Tracking};
 use perception_wire::navigation::{MapVersion, ObjectId, UnixNanos};
 use perception_wire::objects::{encode_object_update, ObjectExtent, ObjectUpdate, ObjectUpdateKind};
 use perception_wire::space_map::{
@@ -70,6 +70,7 @@ fn walk_through_two_rooms(node: &mut DenseMapNode, start: Instant) {
             map_version: pose.map_version,
             pose: Pose4Dof { x_m: pose.translation.x, y_m: pose.translation.y, z_m: pose.translation.z, yaw_rad: pose.yaw_rad },
             tracking: Tracking::Tracking,
+            selection: KeyframeSelection::Selected,
             residual_m: 0.01,
             inlier_fraction: 0.9,
         };

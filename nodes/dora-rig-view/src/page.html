@@ -45,20 +45,23 @@
   <h1><span id="link"></span>Rig view</h1>
   <div class="stats" id="stats">connecting</div>
   <div id="notices"></div>
-  <div class="stats" id="layout-summary"></div>
   <div class="row"><button id="top">Top down</button><button id="behind">Behind robot</button></div>
   <div class="row"><label for="follow">Follow robot</label><input type="checkbox" id="follow"></div>
   <div class="section">
-    <div class="row"><label for="surface">Surface</label><input type="checkbox" id="surface" checked></div>
-    <div class="row"><label for="painted">Objects on the surface</label><input type="checkbox" id="painted" checked></div>
-    <div class="row"><label for="clouds">Keyframe clouds</label><input type="checkbox" id="clouds"></div>
-    <div class="row"><label for="robot">Robot</label><input type="checkbox" id="robot" checked></div>
-    <div class="row"><label for="path">Robot path</label><input type="checkbox" id="path" checked></div>
-    <div class="row"><label for="people">People</label><input type="checkbox" id="people" checked></div>
-    <div class="row"><label for="objects">Objects</label><input type="checkbox" id="objects" checked></div>
-    <div class="row"><label for="rooms">Rooms and places</label><input type="checkbox" id="rooms" checked></div>
-    <div class="row"><label for="layout">Room and planes in view</label><input type="checkbox" id="layout" checked></div>
-    <div class="row"><label for="labels">Labels</label><input type="checkbox" id="labels" checked></div>
+    <div class="row" title="The dense map's surface, fused from every depth frame: what the robot knows of the room's shape."><label for="surface">Surface</label><input type="checkbox" id="surface" data-default="on"></div>
+    <div class="row" title="Each object the object map found, painted on the surface in its colour."><label for="painted">Objects on the surface</label><input type="checkbox" id="painted" data-default="on"></div>
+    <div class="row" title="The robot from odometry, carried into the map by the localizer's map_to_odom."><label for="robot">Robot</label><input type="checkbox" id="robot" data-default="on"></div>
+    <div class="row" title="Where the robot has been."><label for="path">Robot path</label><input type="checkbox" id="path" data-default="on"></div>
+    <div class="row" title="Each tracked person's fitted skeleton, as the world store records it."><label for="people">People</label><input type="checkbox" id="people" data-default="on"></div>
+    <div class="row" title="Each object the object map found, as a labelled box; the spatial agent answers questions about them."><label for="objects">Objects</label><input type="checkbox" id="objects" data-default="on"></div>
+    <div class="row" title="Text labels on people, objects and rooms."><label for="labels">Labels</label><input type="checkbox" id="labels" data-default="on"></div>
+  </div>
+  <div class="section">
+    <div class="stats">Diagnostic layers</div>
+    <div class="row" title="Each keyframe's depth as a coloured point cloud at its map pose from the localizer, one per new view; for checking the localizer against the surface."><label for="clouds">Keyframe clouds</label><input type="checkbox" id="clouds" data-default="off"></div>
+    <div class="row" title="Rooms the dense map cut its free space into, as floor outlines. The spatial agent names rooms with them; the ids are renumbered when the cut changes."><label for="rooms">Rooms</label><input type="checkbox" id="rooms" data-default="off"></div>
+    <div class="row" title="Doorways between the dense map's rooms: narrow gaps in the free space. Used by the spatial agent for paths between rooms."><label for="doorways">Doorways</label><input type="checkbox" id="doorways" data-default="off"></div>
+    <div class="row" title="Places: points in free space joined into a graph, which the spatial agent uses for navigation goals and for where things are."><label for="places">Places</label><input type="checkbox" id="places" data-default="off"></div>
     <div class="row"><label for="size">Point size</label><input type="range" id="size" min="1" max="8" value="2"></div>
   </div>
   <div class="help">Drag to orbit, right-drag to pan, scroll to zoom.<br>
@@ -101,11 +104,10 @@ scene.add(new THREE.GridHelper(20, 20, 0x2c333c, 0x1c2128).rotateX(Math.PI / 2))
 scene.add(new THREE.AxesHelper(0.5));
 
 const layers = {};
-for (const name of ["surface", "clouds", "robot", "path", "people", "objects", "rooms", "layout"]) {
+for (const name of ["surface", "clouds", "robot", "path", "people", "objects", "rooms", "doorways", "places"]) {
   layers[name] = new THREE.Group();
   scene.add(layers[name]);
 }
-layers.clouds.visible = false;
 scene.add(new THREE.HemisphereLight(0xffffff, 0x404850, 2.2));
 const sun = new THREE.DirectionalLight(0xffffff, 1.2);
 sun.position.set(3, 2, 6);
@@ -382,9 +384,11 @@ function removeObject(objectId) {
   if (objectVoxels.has(objectId)) setObjectVoxels(objectId, objectVoxelM, []);
 }
 
-// Rooms as floor outlines, places as dots on their room's floor, doorways as gaps marked across.
+// Rooms as floor outlines, places as dots on their room's floor joined by the place graph, doorways as rings.
 function setTopology(update) {
   dispose(layers.rooms);
+  dispose(layers.places);
+  dispose(layers.doorways);
   dropTags("room:");
   const floorOf = new Map(update.rooms.map(r => [r.room_id, r.floor_m]));
   for (const room of update.rooms) {
@@ -401,63 +405,19 @@ function setTopology(update) {
   }
   const placeAt = new Map(update.places.map(p => [p.place_id, new THREE.Vector3(p.position[0], p.position[1], (floorOf.get(p.room_id) ?? 0) + 0.02)]));
   if (placeAt.size) {
-    layers.rooms.add(new THREE.Points(new THREE.BufferGeometry().setFromPoints([...placeAt.values()]),
+    layers.places.add(new THREE.Points(new THREE.BufferGeometry().setFromPoints([...placeAt.values()]),
       new THREE.PointsMaterial({ color: 0xe6e9ee, size: 5, sizeAttenuation: false })));
   }
   const edges = update.edges.flatMap(([a, b]) => (placeAt.has(a) && placeAt.has(b) ? [placeAt.get(a), placeAt.get(b)] : []));
   if (edges.length) {
-    layers.rooms.add(new THREE.LineSegments(new THREE.BufferGeometry().setFromPoints(edges),
+    layers.places.add(new THREE.LineSegments(new THREE.BufferGeometry().setFromPoints(edges),
       new THREE.LineBasicMaterial({ color: 0x9aa3ad, transparent: true, opacity: 0.4 })));
   }
   for (const door of update.doorways) {
     const marker = new THREE.Mesh(new THREE.RingGeometry(door.width_m / 2 - 0.03, door.width_m / 2, 24),
       new THREE.MeshBasicMaterial({ color: 0xf0b35a, side: THREE.DoubleSide }));
     marker.position.set(door.position[0], door.position[1], 0.02);
-    layers.rooms.add(marker);
-  }
-}
-
-// The planes and the room of the latest keyframe, in its floor frame, at its map pose.
-const PLANE_COLOURS = { "floor": 0xc9a66b, "ceiling": 0xe6e9ee, "wall": 0x7fb2e5, "level surface": 0x9fd38a };
-function setRoomLayout(update) {
-  dispose(layers.layout);
-  const frame = new THREE.Group();
-  frame.position.set(update.pose.x_m, update.pose.y_m, update.pose.z_m);
-  frame.rotation.set(0, 0, update.pose.yaw_rad);
-  frame.visible = update.drawn;
-  layers.layout.add(frame);
-  const fan = ring => ring.slice(1, -1).flatMap((_, k) => [ring[0], ring[k + 1], ring[k + 2]]);
-  for (const plane of update.planes) {
-    const color = PLANE_COLOURS[plane.kind] ?? 0xffffff;
-    const corners = plane.outline.map(c => new THREE.Vector3(...c));
-    if (corners.length < 3) continue;
-    frame.add(new THREE.Mesh(new THREE.BufferGeometry().setFromPoints(fan(corners)),
-      new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.22, side: THREE.DoubleSide, depthWrite: false })));
-    frame.add(new THREE.LineLoop(new THREE.BufferGeometry().setFromPoints(corners), new THREE.LineBasicMaterial({ color })));
-  }
-  const summary = document.getElementById("layout-summary");
-  if (update.room) {
-    const room = update.room;
-    const lower = room.footprint.map(([x, y]) => new THREE.Vector3(x, y, room.floor_m));
-    const upper = room.footprint.map(([x, y]) => new THREE.Vector3(x, y, room.ceiling_m));
-    const seenLine = new THREE.LineBasicMaterial({ color: 0xf2f2f2, transparent: true, opacity: 0.8 });
-    const unseenLine = new THREE.LineDashedMaterial({ color: 0xf2f2f2, transparent: true, opacity: 0.5, dashSize: 0.15, gapSize: 0.1 });
-    const wallFill = new THREE.MeshBasicMaterial({ color: 0xf2f2f2, transparent: true, opacity: 0.05, side: THREE.DoubleSide, depthWrite: false });
-    const n = lower.length;
-    for (let k = 0; k < n; k++) {
-      // Edge k ends at corner k, so it runs from corner k - 1.
-      const a = (k + n - 1) % n, b = k;
-      const quad = [lower[a], lower[b], upper[b], upper[a]];
-      if (room.edge_seen[k]) frame.add(new THREE.Mesh(new THREE.BufferGeometry().setFromPoints(fan(quad)), wallFill));
-      const outline = new THREE.LineLoop(new THREE.BufferGeometry().setFromPoints(quad), room.edge_seen[k] ? seenLine : unseenLine);
-      outline.computeLineDistances();
-      frame.add(outline);
-    }
-    const area = Math.abs(THREE.ShapeUtils.area(room.footprint.map(([x, y]) => new THREE.Vector2(x, y))));
-    summary.textContent = `Room in view: ${area.toFixed(1)} m\u00b2, ${(room.ceiling_m - room.floor_m).toFixed(2)} m high; ` +
-      `${update.planes.length} planes (unseen sides dashed)`;
-  } else {
-    summary.textContent = `No room in view: ${update.room_problem}; ${update.planes.length} planes`;
+    layers.doorways.add(marker);
   }
 }
 
@@ -482,8 +442,8 @@ function reset() {
   for (const objectId of [...objects.keys()]) removeObject(objectId);
   dispose(layers.people);
   dispose(layers.rooms);
-  dispose(layers.layout);
-  document.getElementById("layout-summary").textContent = "";
+  dispose(layers.places);
+  dispose(layers.doorways);
   dropTags("");
   pathLength = 0;
   pathGeometry.setDrawRange(0, 0);
@@ -505,7 +465,6 @@ function onUpdate(update) {
     case "object": return setObject(update);
     case "object_gone": return removeObject(update.object_id);
     case "topology": return setTopology(update);
-    case "room_layout": return setRoomLayout(update);
     case "notice": return setNotice(update);
     case "surface_stream": health.gaps = update.gaps; health.snapshots = update.snapshots; return;
     default: console.warn("unknown update", update);
@@ -626,18 +585,42 @@ function followRobot() {
   followHas = true;
 }
 
-document.getElementById("painted").onchange = e => { painted = e.target.checked; blocks.forEach(colourBlock); };
-// The server sends the clouds only while they are shown; turning them on asks for the ones so far.
-document.getElementById("clouds").onchange = e => {
-  layers.clouds.visible = e.target.checked;
-  if (!e.target.checked) { for (const frameId of [...clouds.keys()]) removeCloud(frameId); poses.clear(); }
-  if (connection.socket?.readyState === WebSocket.OPEN) connection.socket.send(JSON.stringify({ clouds: e.target.checked }));
-};
-for (const name of ["surface", "path", "people", "objects", "rooms", "layout"]) {
-  document.getElementById(name).onchange = e => (layers[name].visible = e.target.checked);
+// Each toggle shows its layer; the page remembers the toggles in this browser. Storage that is not there, as in a
+// private window, leaves every toggle at its default.
+const TOGGLES_KEY = "rig-view-toggles";
+function rememberedToggles() {
+  try {
+    return JSON.parse(localStorage.getItem(TOGGLES_KEY) ?? "{}");
+  } catch (e) {
+    console.warn(`the remembered toggles are not read: ${e}`);
+    return {};
+  }
 }
-document.getElementById("robot").onchange = e => (layers.robot.visible = e.target.checked);
-document.getElementById("labels").onchange = e => (tagLayer.style.display = e.target.checked ? "" : "none");
+function rememberToggles() {
+  const states = Object.fromEntries([...document.querySelectorAll("input[data-default]")].map(input => [input.id, input.checked]));
+  try {
+    localStorage.setItem(TOGGLES_KEY, JSON.stringify(states));
+  } catch (e) {
+    console.warn(`the toggles are not remembered: ${e}`);
+  }
+}
+const SHOW_TOGGLE = {
+  painted: on => { painted = on; blocks.forEach(colourBlock); },
+  // The server sends the clouds only while they are shown; turning them on asks for the ones so far.
+  clouds: on => {
+    layers.clouds.visible = on;
+    if (!on) { for (const frameId of [...clouds.keys()]) removeCloud(frameId); poses.clear(); }
+    if (connection.socket?.readyState === WebSocket.OPEN) connection.socket.send(JSON.stringify({ clouds: on }));
+  },
+  labels: on => (tagLayer.style.display = on ? "" : "none"),
+};
+const remembered = rememberedToggles();
+for (const input of document.querySelectorAll("input[data-default]")) {
+  input.checked = typeof remembered[input.id] === "boolean" ? remembered[input.id] : input.dataset.default === "on";
+  const show = SHOW_TOGGLE[input.id] ?? (on => (layers[input.id].visible = on));
+  show(input.checked);
+  input.onchange = () => { show(input.checked); rememberToggles(); };
+}
 document.getElementById("size").oninput = e => (pointMaterial.size = Number(e.target.value));
 document.getElementById("top").onclick = topDown;
 document.getElementById("behind").onclick = behindRobot;

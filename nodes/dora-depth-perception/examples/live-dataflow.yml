@@ -13,12 +13,9 @@ nodes:
       # between two machines that each only connect to it.
       ZENOH_LISTEN: tcp/0.0.0.0:7447
       ZENOH_SUBSCRIBE: rig/keyframe=keyframe
-      ZENOH_PUBLISH: room_layout=rig/room_layout,scene=rig/scene,instance_masks=rig/instance_masks
+      ZENOH_PUBLISH: scene=rig/scene,instance_masks=rig/instance_masks
     inputs:
-      tick: dora/timer/millis/5
-      room_layout:
-        source: plane_segmentation/room_layout
-        queue_size: 1
+      tick: dora/timer/millis/1000
       scene:
         source: plane_segmentation/scene
         queue_size: 1

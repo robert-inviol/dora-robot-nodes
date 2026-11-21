@@ -6,7 +6,7 @@
 //! section stops the node.
 
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use dora_map_localizer::config::{ImuStream, NodeConfig, NodeSettings, CONFIG_VARIABLE};
 use dora_map_localizer::{GyroGap, Handled, LocalizerNode};
@@ -54,6 +54,11 @@ fn log_gyro_gap(gap: &GyroGap) {
     }
 }
 
+/// Milliseconds to a tenth, for the log.
+fn ms(duration: Duration) -> f64 {
+    (duration.as_secs_f64() * 1e4).round() / 10.0
+}
+
 fn send(node: &mut DoraNode, outputs: &Outputs, handled: Handled, started: Instant) -> Result<()> {
     if let Some(dropped) = handled.dropped {
         tracing::warn!(frame_id = dropped.0, "keyframe replaced before its imu message arrived");
@@ -79,6 +84,9 @@ fn send(node: &mut DoraNode, outputs: &Outputs, handled: Handled, started: Insta
     }
     if let Some(estimate) = handled.estimate {
         let (fitness, inlier_rmse_m) = estimate.registration.map_or((None, None), |r| (Some(r.fitness), Some(r.inlier_rmse_m)));
+        let work = handled.keyframe_work.expect("a keyframe estimate comes with the node's work on it");
+        let stages = estimate.timings;
+        let localized = started.elapsed();
         tracing::info!(
             frame_id = estimate.frame_id.0,
             tracking = estimate.tracking.wire_name(),
@@ -89,10 +97,20 @@ fn send(node: &mut DoraNode, outputs: &Outputs, handled: Handled, started: Insta
             y_m = estimate.pose.translation.y,
             yaw_deg = estimate.pose.yaw_rad.to_degrees(),
             submap = estimate.submap.len(),
+            cloud_points = work.cloud_points,
+            cloud_ms = ms(work.cloud),
+            tracking_target_ms = ms(stages.tracking_target),
+            seed_trials_ms = ms(stages.tracking_seed_trials),
+            refinement_ms = ms(stages.tracking_refinement),
+            loop_closure_ms = ms(stages.loop_closure),
+            relocalization_ms = ms(stages.relocalization),
+            optimization_ms = ms(stages.pose_graph_optimization),
+            map_to_odom_ms = ms(work.map_to_odom),
+            localize_ms = ms(localized),
             "keyframe localized"
         );
         let mut parameters = MetadataParameters::default();
-        parameters.insert("localize_ms".to_owned(), Parameter::Float(started.elapsed().as_secs_f64() * 1e3));
+        parameters.insert("localize_ms".to_owned(), Parameter::Float(localized.as_secs_f64() * 1e3));
         node.send_output(outputs.keyframe_pose.clone(), parameters, encode_keyframe_pose(&estimate.to_message()))?;
     }
     if let Some(moved) = handled.moved {

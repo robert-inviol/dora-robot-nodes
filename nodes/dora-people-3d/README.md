@@ -25,12 +25,19 @@ below for the frames it cannot transform into it).
   or landed on the wall or a raised arm, still gets a place. The fit goes in `skeleton_3d` for the joints the model saw
   this frame; `keypoints_3d` keeps the raw readings. A fit takes about 0.7 ms per person on a Raspberry Pi 5.
 - **Smoothing and velocity.** Each track's position goes through a One Euro filter; the velocity is the filtered
-  rate of change of the raw positions.
+  rate of change of the raw positions. Each fitted joint goes through its own One Euro filter after the fit, in the
+  frame tracks are kept in (`JointSmoothingSettings`): a 0.3 Hz cutoff while still, rising by 4 Hz for every metre a
+  second, so a still person's joints hold still while a walking person's follow a few centimetres behind. In the odom
+  frame a person standing still stays still whatever the robot does. The filter runs as each frame is tracked and
+  holds nothing back, so it adds no delay beyond its own smoothing. A joint not fitted for more than 0.3 s starts
+  afresh where it is next fitted. `skeleton_3d` carries the smoothed joints.
 - **Person ids.** The node numbers people itself and keeps the number while the pose model's tracker renumbers them.
   The pose tracker matches people from frame to frame; people it does not track are left out. When it drops someone
-  (their pose-tracker id is not in the frame) and a new id of its turns up within 0.5 m of where that person was
-  heading (last position plus last velocity times the gap) within two seconds, and nearer to there than to anyone the
-  pose tracker still reports, the new id takes over that person. Otherwise it is a new person: a newcomer beside
+  (their pose-tracker id is not in the frame) and a new id of its turns up within two seconds within 0.5 m of the way
+  that person may have gone (from their last position to their last position plus last velocity times the gap), and
+  nearer to it than to anyone the pose tracker still reports, the new id takes over that person. The way includes
+  where they were last seen because the velocity of someone standing still is depth noise: carried on over a gap of a
+  second or two it points tens of centimetres away from where they stand. Otherwise it is a new person: a newcomer beside
   someone still tracked may be them seen twice, or someone else, and a new id is safer than a wrong one.
 - **Track states.** A person is `tentative` until seen in 3 frames, then `confirmed`. A confirmed person the pose
   tracker drops is reported `lost` for two seconds, with the position and skeleton they were last seen with.

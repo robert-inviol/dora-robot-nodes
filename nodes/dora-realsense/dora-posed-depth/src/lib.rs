@@ -11,6 +11,11 @@
 //! sensor noise, which does not compress; rounding them away shrinks the compressed message, and a step of a few
 //! millimetres is far below what a 5 cm voxel map resolves. Rounding never turns a reading into 0 or past `u16::MAX`.
 //!
+//! People are cut out of each chosen frame before it is downsampled, by the odometry's rule (its `people_mask`): the
+//! newest boxes the pose model found, grown by a margin and by how far a person walks in their age, read as no
+//! reading. People are drawn from their skeletons and are not part of the map; a pixel without a reading neither
+//! adds surface to the map nor carves it free.
+//!
 //! A chosen depth frame waits for its pose; a frame whose pose never comes (the odometry skipped it) is dropped, never
 //! sent with another frame's pose. Each frame carries the odom frame of the pose it was joined to, so when odometry
 //! starts again the frames that follow are in the new odom frame. Odometry whose camera time or odom frame start
@@ -23,10 +28,12 @@ use glam::{Mat3, Quat};
 use perception_wire::camera::{CameraCalibration, StreamIntrinsics};
 use perception_wire::localization::{CameraNanos, FrameId};
 use perception_wire::odometry::OdomPose;
+use perception_wire::people::PersonPoses;
+use dora_depth_inertial_odometry::people_mask::{cut_out, MaskSettings, PeopleMask, WrongImageSize};
 use perception_wire::posed_depth::PosedDepthFrame;
 
 /// What to send.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PosedDepthSettings {
     /// Every this-many-th depth frame is sent, by frame id: 3 of the camera's 30 frames a second is 10 a second.
     pub frame_stride: u64,
@@ -37,10 +44,13 @@ pub struct PosedDepthSettings {
     /// Every valid depth reading sent is rounded to the nearest multiple of this; 1 sends readings as the camera made
     /// them.
     pub depth_step: DepthStep,
+    /// How the people the pose model found are cut out of the depth: the odometry's own settings.
+    pub people: MaskSettings,
 }
 
 impl PosedDepthSettings {
-    pub const DEFAULT: PosedDepthSettings = PosedDepthSettings { frame_stride: 3, max_waiting: 8, poses_kept: 8, depth_step: DepthStep::DEFAULT };
+    pub const DEFAULT: PosedDepthSettings =
+        PosedDepthSettings { frame_stride: 3, max_waiting: 8, poses_kept: 8, depth_step: DepthStep::DEFAULT, people: MaskSettings::DEFAULT };
 }
 
 /// The step, in millimetres, that depth readings are rounded to.
@@ -87,6 +97,8 @@ pub enum PosedDepthError {
     OdomStartWentBack { current: i64, received: i64 },
     #[error("the odom pose at camera time {camera_ns} ns is for depth frame {pose_frame}, not depth frame {depth_frame}")]
     PoseOfAnotherFrame { camera_ns: i64, pose_frame: u64, depth_frame: u64 },
+    #[error(transparent)]
+    PersonPoses(#[from] WrongImageSize),
 }
 
 /// Counts of what happened to depth frames and poses, for the node's progress line.
@@ -100,6 +112,8 @@ pub struct Tally {
     /// Chosen frames pushed out of the wait for their pose.
     pub dropped_waiting: u32,
     pub odometry_restarts: u32,
+    /// Chosen frames with people cut out of them.
+    pub with_people: u32,
 }
 
 /// The pinhole model of an image halved each way: a downsampled pixel's centre is the centre of its 2x2 block.
@@ -138,12 +152,30 @@ pub struct PosedDepthJoiner {
     waiting: VecDeque<HeldDepth>,
     /// The latest odom poses, oldest first, all of one odom frame.
     poses: VecDeque<OdomPose>,
+    people: PeopleMask,
+    /// A chosen frame with people cut out of it, before it is downsampled.
+    cut_depth_mm: Vec<u16>,
     tally: Tally,
 }
 
 impl PosedDepthJoiner {
     pub fn new(settings: PosedDepthSettings) -> PosedDepthJoiner {
-        PosedDepthJoiner { settings, calibration: None, waiting: VecDeque::new(), poses: VecDeque::new(), tally: Tally::default() }
+        PosedDepthJoiner {
+            settings,
+            calibration: None,
+            waiting: VecDeque::new(),
+            poses: VecDeque::new(),
+            people: PeopleMask::default(),
+            cut_depth_mm: Vec::new(),
+            tally: Tally::default(),
+        }
+    }
+
+    /// The people the pose model found in a colour frame; before the calibration there is no depth to cut them out
+    /// of, and they are let go, as the odometry does.
+    pub fn on_person_poses(&mut self, poses: &PersonPoses) -> Result<(), PosedDepthError> {
+        let Some(calibration) = &self.calibration else { return Ok(()) };
+        Ok(self.people.update(poses, calibration)?)
     }
 
     /// The counts since the last call.
@@ -178,6 +210,9 @@ impl PosedDepthJoiner {
         if (width, height) != (depth.width as usize, depth.height as usize) {
             return Err(PosedDepthError::NotTheCalibratedSize { frame_id, width, height, calibrated_width: depth.width, calibrated_height: depth.height });
         }
+        let people = self.people.rects_for(CameraNanos(camera_ns), &calibration, &self.settings.people);
+        self.tally.with_people += u32::from(!people.is_empty());
+        let depth_mm = cut_out(depth_mm, width, people, &mut self.cut_depth_mm);
         let mut downsampled = downsample_nearest(width, height, depth_mm)?;
         downsampled.iter_mut().for_each(|mm| *mm = self.settings.depth_step.round(*mm));
         let held = HeldDepth { frame_id, camera_ns, depth_mm: downsampled };
@@ -413,5 +448,36 @@ mod tests {
         joiner.on_odom_pose(pose(3, 0)).unwrap();
         assert!(depth(&mut joiner, 3).is_empty());
         assert_eq!(joiner.take_tally().before_calibration, 1);
+    }
+
+    fn person_in_the_left_half(captured_camera_ns: i64) -> PersonPoses {
+        use perception_wire::people::{Keypoint, PersonPose, PixelBox};
+        let bbox = PixelBox { x_px: 0.0, y_px: 0.0, w_px: 1.0, h_px: 2.0 };
+        let person = PersonPose { track_id: Some(1), score: 0.9, bbox, keypoints: vec![Keypoint { x_px: 0.5, y_px: 1.0, score: 0.9 }; 17] };
+        PersonPoses { frame_id: 3, captured_camera_ns, width: 4, height: 2, people: vec![person] }
+    }
+
+    #[test]
+    fn people_are_cut_out_as_no_reading_and_boxes_too_old_cut_nothing() {
+        let mut joiner = joiner();
+        joiner.on_person_poses(&person_in_the_left_half(3 * FRAME_NS)).unwrap();
+        depth(&mut joiner, 3);
+        let sent = joiner.on_odom_pose(pose(3, 0)).unwrap();
+        // The box, grown by its margin, covers the two left columns: the left 2x2 block has no reading left.
+        assert_eq!(&sent[0].depth_mm[..], &[0, 1500]);
+        assert_eq!(joiner.take_tally().with_people, 1);
+        // Frame 30 is a second after the box: too old to stand for it.
+        depth(&mut joiner, 30);
+        let sent = joiner.on_odom_pose(pose(30, 0)).unwrap();
+        assert_eq!(&sent[0].depth_mm[..], &[1000, 1500]);
+    }
+
+    #[test]
+    fn people_before_the_calibration_are_let_go_and_from_another_image_size_stop_the_node() {
+        let mut joiner = PosedDepthJoiner::new(PosedDepthSettings::DEFAULT);
+        assert_eq!(joiner.on_person_poses(&person_in_the_left_half(0)), Ok(()));
+        joiner.on_calibration(calibration()).unwrap();
+        let wrong = PersonPoses { width: 8, ..person_in_the_left_half(0) };
+        assert!(matches!(joiner.on_person_poses(&wrong), Err(PosedDepthError::PersonPoses(_))));
     }
 }

@@ -10,13 +10,13 @@ use std::sync::Arc;
 
 use dora_node_api::arrow::array::{Array, ArrayRef, AsArray, Float32Array, Int64Array, StructArray, UInt16Array, UInt64Array};
 use dora_node_api::arrow::buffer::ScalarBuffer;
-use dora_node_api::arrow::datatypes::{DataType, Fields, Float32Type, Int64Type, UInt16Type, UInt64Type};
+use dora_node_api::arrow::datatypes::{DataType, Float32Type, Int64Type, UInt16Type, UInt64Type};
 use eyre::{bail, Result};
 use glam::{Quat, Vec3};
 
 use crate::camera::{stream_intrinsics_type, StreamIntrinsics};
 use crate::localization::{CameraNanos, FrameId};
-use crate::serde_wire::{list_of, required};
+pub use wire_schemas::posed_depth::posed_depth_frame_fields;
 use crate::{checked, list_values, one_list, scalar};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -35,18 +35,6 @@ pub struct PosedDepthFrame {
     pub camera_orientation: Quat,
     /// Row major, `intrinsics.width` by `intrinsics.height`, 0 where there is no reading.
     pub depth_mm: ScalarBuffer<u16>,
-}
-
-pub fn posed_depth_frame_fields() -> Fields {
-    Fields::from(vec![
-        required("frame_id", DataType::UInt64),
-        required("camera_ns", DataType::Int64),
-        required("odom_started_camera_ns", DataType::Int64),
-        required("intrinsics", stream_intrinsics_type()),
-        required("camera_position_m", list_of(DataType::Float32, false)),
-        required("camera_orientation_xyzw", list_of(DataType::Float32, false)),
-        required("depth_mm", list_of(DataType::UInt16, false)),
-    ])
 }
 
 fn floats<const N: usize>(row: &StructArray, name: &str) -> Result<[f32; N]> {

@@ -6,11 +6,12 @@ use std::sync::Arc;
 use dora_node_api::arrow::array::{
     Array, ArrayRef, AsArray, BinaryArray, Int32Array, Int64Array, StringArray, StructArray, UInt32Array, UInt64Array,
 };
-use dora_node_api::arrow::datatypes::{DataType, Fields, Float32Type, Int32Type, Int64Type, UInt32Type, UInt64Type};
+use dora_node_api::arrow::datatypes::{Float32Type, Int32Type, Int64Type, UInt32Type, UInt64Type};
 use eyre::{bail, ensure, Result};
 use glam::{IVec3, Vec2, Vec3};
 
-use super::{checked, field, floats, item, list_of, scalar};
+use super::{checked, floats, list_of, scalar};
+use wire_schemas::objects::{map_point_fields, object_update_fields, voxel_fields};
 use crate::localization::FrameId;
 pub use crate::navigation::ObjectId;
 use crate::navigation::{MapVersion, UnixNanos};
@@ -90,40 +91,6 @@ pub struct ObjectUpdate {
     /// Every cube holding a point of the object, sorted by x, then y, then z: cube (x, y, z) spans
     /// `[x, x + 1) * voxel_m` along x, and likewise along y and z.
     pub voxels: Vec<IVec3>,
-}
-
-fn map_point_fields() -> Fields {
-    Fields::from(vec![field("x_m", DataType::Float32), field("y_m", DataType::Float32)])
-}
-
-fn voxel_fields() -> Fields {
-    Fields::from(vec![field("x", DataType::Int32), field("y", DataType::Int32), field("z", DataType::Int32)])
-}
-
-fn object_update_fields() -> Fields {
-    Fields::from(vec![
-        field("kind", DataType::Utf8),
-        field("object_id", DataType::UInt64),
-        field("merged_into", DataType::UInt64),
-        field("label", DataType::Utf8),
-        field("score", DataType::Float32),
-        field("confidence", DataType::Float32),
-        field("seen_count", DataType::UInt32),
-        field("frame_id", DataType::UInt64),
-        field("captured_unix_ns", DataType::Int64),
-        field("map_version", DataType::UInt64),
-        field("centre_x_m", DataType::Float32),
-        field("centre_y_m", DataType::Float32),
-        field("centre_z_m", DataType::Float32),
-        field("footprint", DataType::List(item(DataType::Struct(map_point_fields())))),
-        field("long_m", DataType::Float32),
-        field("short_m", DataType::Float32),
-        field("height_m", DataType::Float32),
-        field("top_m", DataType::Float32),
-        field("crop_jpeg", DataType::Binary),
-        field("voxel_m", DataType::Float32),
-        field("voxels", DataType::List(item(DataType::Struct(voxel_fields())))),
-    ])
 }
 
 fn column<'a>(row: &'a StructArray, name: &str) -> &'a ArrayRef {

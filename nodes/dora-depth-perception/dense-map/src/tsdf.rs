@@ -112,6 +112,26 @@ fn split(voxel: IVec3) -> (IVec3, usize) {
     (voxel.div_euclid(edge), local_index(voxel.rem_euclid(edge)))
 }
 
+/// What one depth pixel says.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Reading {
+    /// No reading, or one nearer than the min range: nothing is known along the pixel's ray.
+    Nothing,
+    /// A surface at this depth, within the range fused.
+    Surface { depth_m: f32 },
+    /// Nothing nearer than this depth, which is at or beyond the max range.
+    Beyond { depth_m: f32 },
+}
+
+/// What a reading says about one voxel.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Observation {
+    /// The ray passed the voxel and ended `margin_m` beyond it, at least the truncation distance.
+    Free { margin_m: f32, depth_m: f32 },
+    /// The voxel is `signed_m` in front of the reading's surface, within the truncation distance either side.
+    Near { signed_m: f32, depth_m: f32 },
+}
+
 /// A TSDF stored in 8x8x8-voxel blocks, allocated where keyframes look.
 #[derive(Clone)]
 pub struct BlockTsdf {
@@ -134,13 +154,31 @@ impl BlockTsdf {
         self.settings.voxel_m * BLOCK_EDGE as f32
     }
 
+    /// The share of the observation weight a reading at `depth_m` adds: its inverse variance relative to a reading at
+    /// the full weight range. Stereo depth noise grows with the square of the range, so its variance with the fourth
+    /// power; nearer readings add the full weight. A voxel at its weight cap then wanders with the same noise at any
+    /// range, and a near view of it outweighs a far one.
     #[inline]
-    fn depth_m(&self, depth: &PosedDepth, pixel: usize) -> Option<f32> {
-        let depth_m = depth.depth_mm[pixel] as f32 * 0.001;
-        (depth_m > self.settings.min_range_m && depth_m < self.settings.max_range_m).then_some(depth_m)
+    fn range_weight(&self, depth_m: f32) -> f32 {
+        let ratio = self.settings.full_weight_range_m / depth_m;
+        (ratio * ratio * ratio * ratio).min(1.0)
     }
 
-    /// Every block a ray through a sampled pixel crosses, from the camera to just behind the surface it hits.
+    /// What the reading at a pixel says.
+    #[inline]
+    fn reading(&self, depth: &PosedDepth, pixel: usize) -> Reading {
+        let depth_m = depth.depth_mm[pixel] as f32 * 0.001;
+        if depth_m <= self.settings.min_range_m {
+            Reading::Nothing
+        } else if depth_m < self.settings.max_range_m {
+            Reading::Surface { depth_m }
+        } else {
+            Reading::Beyond { depth_m }
+        }
+    }
+
+    /// Every block a ray through a sampled pixel crosses: from the camera to just behind the surface it hits, or to
+    /// the max range for a reading beyond it.
     fn blocks_in_view(&self, depth: &PosedDepth) -> FxHashSet<IVec3> {
         let stride = self.settings.allocation_stride_px;
         let block_m = self.block_m();
@@ -148,9 +186,13 @@ impl BlockTsdf {
         rows.par_iter()
             .fold(FxHashSet::default, |mut blocks, &row| {
                 for column in (0..depth.width).step_by(stride) {
-                    let Some(depth_m) = self.depth_m(depth, row * depth.width + column) else { continue };
                     let ray = depth.pose.camera_to_map * depth.intrinsics.deproject(column as f32, row as f32, 1.0);
-                    let end = depth_m + self.settings.truncation_m;
+                    // Lengths along the ray in metres of depth along the optical axis, as `ray` has unit depth.
+                    let end = match self.reading(depth, row * depth.width + column) {
+                        Reading::Nothing => continue,
+                        Reading::Surface { depth_m } => depth_m + self.settings.truncation_m,
+                        Reading::Beyond { .. } => self.settings.max_range_m,
+                    };
                     let step = 0.5 * block_m / ray.length();
                     let steps = (end / step).ceil() as usize;
                     for i in 0..=steps {
@@ -166,9 +208,19 @@ impl BlockTsdf {
             })
     }
 
+    /// Folds one reading into every voxel of the block that projects onto a pixel with one, with the reading's range
+    /// weight. A voxel at least the truncation distance in front of the reading is seen free and takes the truncation
+    /// distance; a reading beyond the max range carves the voxels within it so and is not a surface. A voxel near the
+    /// reading takes its signed distance, with a weight falling away to nothing behind it at the truncation distance.
+    /// A pixel without a reading says nothing, about free space or surface. Free and near readings weigh the same at
+    /// one range, so that noise carrying a reading either side of the truncation distance does not pull a surface.
+    ///
+    /// A reading that contradicts what a voxel holds halves the voxel's weight before it is averaged in, so that a
+    /// surface that has gone (a person who walked off) or come (a box set down) takes over within a few frames, while
+    /// a lone wrong reading moves a surface seen many times by little; see [`BlockTsdf::contradicts`].
     fn fuse_block(&self, index: IVec3, block: &mut Block, depth: &PosedDepth) {
         let voxel_m = self.settings.voxel_m;
-        let (truncation, weight) = (self.settings.truncation_m, self.settings.observation_weight);
+        let (truncation, observation_weight) = (self.settings.truncation_m, self.settings.observation_weight);
         let map_to_camera = depth.pose.camera_to_map.transpose();
         let k = depth.intrinsics;
         let first_voxel = index * BLOCK_EDGE;
@@ -186,23 +238,63 @@ impl BlockTsdf {
                     if column < 0.0 || row < 0.0 || column >= depth.width as f32 || row >= depth.height as f32 {
                         continue;
                     }
-                    let Some(depth_m) = self.depth_m(depth, row as usize * depth.width + column as usize) else { continue };
-                    let signed = depth_m - camera.z;
-                    if signed < -truncation {
-                        continue;
-                    }
-                    // Behind a surface the reading says less and less about the voxel, so its weight falls away
-                    // to nothing at the truncation distance.
-                    let weight = if signed < -voxel_m { weight * (truncation + signed) / (truncation - voxel_m) } else { weight };
+                    let observation = match self.reading(depth, row as usize * depth.width + column as usize) {
+                        Reading::Nothing => continue,
+                        Reading::Surface { depth_m } if depth_m - camera.z >= truncation => Observation::Free { margin_m: depth_m - camera.z, depth_m },
+                        Reading::Beyond { depth_m } if depth_m - camera.z >= truncation && camera.z < self.settings.max_range_m => {
+                            Observation::Free { margin_m: depth_m - camera.z, depth_m }
+                        }
+                        Reading::Beyond { .. } => continue,
+                        Reading::Surface { depth_m } => {
+                            let signed_m = depth_m - camera.z;
+                            if signed_m < -truncation {
+                                continue;
+                            }
+                            Observation::Near { signed_m, depth_m }
+                        }
+                    };
+                    let (signed, weight) = match observation {
+                        Observation::Free { depth_m, .. } => (truncation, observation_weight * self.range_weight(depth_m)),
+                        Observation::Near { signed_m, depth_m } => {
+                            let weight = observation_weight * self.range_weight(depth_m);
+                            // Behind a surface the reading says less and less about the voxel, so its weight falls
+                            // away to nothing at the truncation distance.
+                            let weight = if signed_m < -voxel_m { weight * (truncation + signed_m) / (truncation - voxel_m) } else { weight };
+                            (signed_m, weight)
+                        }
+                    };
                     if weight <= 0.0 {
                         continue;
                     }
                     let i = local_index(local);
-                    let previous = block.weight[i];
+                    let mut previous = block.weight[i];
+                    if previous > 0.0 && self.contradicts(observation, block.distance_m[i]) {
+                        previous *= 0.5;
+                    }
                     let total = previous + weight;
-                    block.distance_m[i] = (block.distance_m[i] * previous + signed.min(truncation) * weight) / total;
+                    block.distance_m[i] = (block.distance_m[i] * previous + signed * weight) / total;
                     block.weight[i] = total.min(self.settings.max_weight);
                 }
+            }
+        }
+    }
+
+    /// Whether an observation says the voxel holding `distance_m` has changed, beyond what the reading's noise
+    /// (`depth_noise_at_1_m` times the square of its range) explains: a ray that surely passed the voxel, ending
+    /// `contradiction_sigmas` of its noise beyond the truncation distance behind it, where the voxel holds a surface
+    /// or what lies behind one (less than `min_contradiction_m` short of the truncation distance); or a reading near
+    /// the voxel, in front of or at its surface, whose signed distance differs from the voxel's by more than
+    /// `contradiction_sigmas` of its noise and by more than `min_contradiction_m`. Readings well behind a surface,
+    /// whose weight is falling away, contradict nothing.
+    fn contradicts(&self, observation: Observation, distance_m: f32) -> bool {
+        let t = &self.settings;
+        let noise_m = |depth_m: f32| t.depth_noise_at_1_m * depth_m * depth_m;
+        match observation {
+            Observation::Free { margin_m, depth_m } => {
+                margin_m >= t.truncation_m + t.contradiction_sigmas * noise_m(depth_m) && distance_m < t.truncation_m - t.min_contradiction_m
+            }
+            Observation::Near { signed_m, depth_m } => {
+                signed_m >= -t.voxel_m && (signed_m - distance_m).abs() > (t.contradiction_sigmas * noise_m(depth_m)).max(t.min_contradiction_m)
             }
         }
     }
@@ -390,9 +482,29 @@ mod tests {
         let mut far_mm = Vec::new();
         let mut tsdf = BlockTsdf::new(TsdfSettings::default());
         tsdf.fuse(&facing_wall(2.0, &mut near_mm));
-        tsdf.fuse(&facing_wall(2.1, &mut far_mm));
+        tsdf.fuse(&facing_wall(2.06, &mut far_mm));
         let Sample::Observed { distance_m } = tsdf.sample(Vec3::new(0.01, 2.02, 0.01)) else { panic!("unobserved") };
-        assert!((distance_m - 0.025).abs() < 1e-4, "halfway between the two walls: {distance_m}");
+        assert!((distance_m - 0.005).abs() < 1e-4, "halfway between the two walls, which do not contradict: {distance_m}");
+    }
+
+    #[test]
+    fn a_surface_seen_through_is_carved_free_within_a_few_frames_and_one_reading_moves_it_little() {
+        let (mut wall_mm, mut beyond_mm) = (Vec::new(), Vec::new());
+        let mut tsdf = BlockTsdf::new(TsdfSettings::default());
+        for _ in 0..100 {
+            tsdf.fuse(&facing_wall(2.0, &mut wall_mm));
+        }
+        let at_wall = Vec3::new(0.01, 2.02, 0.01);
+        tsdf.fuse(&facing_wall(3.0, &mut beyond_mm));
+        let Sample::Observed { distance_m } = tsdf.sample(at_wall) else { panic!("unobserved") };
+        assert!(distance_m < 0.0, "one reading through the wall leaves it: {distance_m}");
+        let frames = (1..=20)
+            .find(|_| {
+                tsdf.fuse(&facing_wall(3.0, &mut beyond_mm));
+                matches!(tsdf.sample(at_wall), Sample::Observed { distance_m } if distance_m > 0.0)
+            })
+            .expect("carved within 20 frames");
+        assert!(frames <= 6, "a wall seen 100 times is carved in {frames} more frames");
     }
 
     #[test]

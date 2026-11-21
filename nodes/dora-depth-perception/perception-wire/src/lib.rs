@@ -1,7 +1,8 @@
 //! The messages of lib/dora-rig-messages, as single-row Arrow structs: the perception messages of perception.py
 //! here, and the camera, localization, navigation, objects, odometry, people, posed_depth and space_map modules' messages in the
 //! modules of the same names.
-//! Field names, types and nullability must match the Python modules exactly; the tests read their golden fixtures.
+//! Each message's Arrow type comes from the wire-schemas crate, the one Rust definition of every wire type; the
+//! tests read the Python modules' golden fixtures.
 
 pub mod camera;
 pub mod localization;
@@ -10,7 +11,6 @@ pub mod objects;
 pub mod odometry;
 pub mod people;
 pub mod posed_depth;
-pub mod room_layout;
 mod serde_wire;
 pub mod space_map;
 
@@ -23,10 +23,13 @@ use dora_node_api::arrow::array::{
 };
 use dora_node_api::arrow::buffer::{OffsetBuffer, ScalarBuffer};
 use dora_node_api::arrow::datatypes::{
-    ArrowPrimitiveType, DataType, Field, Fields, Float32Type, Int16Type, Int64Type, UInt16Type, UInt64Type,
+    ArrowPrimitiveType, DataType, Fields, Float32Type, Int16Type, Int64Type, UInt16Type, UInt64Type,
 };
 use eyre::{bail, eyre, Context, Result};
 use glam::Vec3;
+pub(crate) use wire_schemas::item;
+use wire_schemas::perception::{imu_fields, instance_masks_fields, keyframe_fields, object_fields, plane_fields, room_fields};
+pub(crate) use wire_schemas::perception::scene_fields;
 
 pub const NO_INSTANCE: i16 = -1;
 
@@ -89,103 +92,6 @@ pub struct Scene<'a> {
     pub planes: &'a [Plane],
     pub room: &'a Result<Room, RoomError>,
     pub objects: &'a [SceneObject<'a>],
-}
-
-fn item(data_type: DataType) -> Arc<Field> {
-    Arc::new(Field::new("item", data_type, false))
-}
-
-fn items(data_type: DataType) -> DataType {
-    DataType::List(item(data_type))
-}
-
-fn field(name: &str, data_type: DataType) -> Field {
-    Field::new(name, data_type, true)
-}
-
-fn keyframe_fields() -> Fields {
-    Fields::from(vec![
-        field("frame_id", DataType::UInt64),
-        field("captured_unix_ns", DataType::Int64),
-        field("width", DataType::UInt16),
-        field("height", DataType::UInt16),
-        field("fx", DataType::Float32),
-        field("fy", DataType::Float32),
-        field("ppx", DataType::Float32),
-        field("ppy", DataType::Float32),
-        field("specific_force", items(DataType::Float32)),
-        field("depth_mm", items(DataType::UInt16)),
-        field("color_jpeg", DataType::Binary),
-    ])
-}
-
-fn imu_fields() -> Fields {
-    Fields::from(vec![
-        field("frame_id", DataType::UInt64),
-        field("keyframe_camera_ns", DataType::Int64),
-        field("accel_camera_ns", items(DataType::Int64)),
-        field("accel_m_s2", items(DataType::Float32)),
-        field("gyro_camera_ns", items(DataType::Int64)),
-        field("gyro_rad_s", items(DataType::Float32)),
-    ])
-}
-
-fn instance_masks_fields() -> Fields {
-    Fields::from(vec![
-        field("frame_id", DataType::UInt64),
-        field("width", DataType::UInt16),
-        field("height", DataType::UInt16),
-        field("labels", items(DataType::Utf8)),
-        field("scores", items(DataType::Float32)),
-        field("instance_ids", items(DataType::Int16)),
-    ])
-}
-
-fn plane_fields() -> Fields {
-    Fields::from(vec![
-        field("kind", DataType::Utf8),
-        field("normal", items(DataType::Float32)),
-        field("offset_m", DataType::Float32),
-        field("area_m2", DataType::Float32),
-        field("outline_m", items(DataType::Float32)),
-    ])
-}
-
-fn room_fields() -> Fields {
-    Fields::from(vec![
-        field("floor_m", DataType::Float32),
-        field("ceiling_m", DataType::Float32),
-        field("footprint_m", items(DataType::Float32)),
-        field("edge_seen", items(DataType::Boolean)),
-    ])
-}
-
-fn object_fields() -> Fields {
-    Fields::from(vec![
-        field("label", DataType::Utf8),
-        field("instance_index", DataType::UInt16),
-        field("score", DataType::Float32),
-        field("point_count", DataType::UInt32),
-        field("distance_m", DataType::Float32),
-        field("footprint_long_m", DataType::Float32),
-        field("footprint_short_m", DataType::Float32),
-        field("height_m", DataType::Float32),
-        field("top_m", DataType::Float32),
-        field("corners_m", items(DataType::Float32)),
-    ])
-}
-
-pub(crate) fn scene_fields() -> Fields {
-    Fields::from(vec![
-        field("frame_id", DataType::UInt64),
-        field("captured_unix_ns", DataType::Int64),
-        field("camera_forward", items(DataType::Float32)),
-        field("camera_up", items(DataType::Float32)),
-        field("planes", DataType::List(item(DataType::Struct(plane_fields())))),
-        field("room", DataType::Struct(room_fields())),
-        field("room_problem", DataType::Utf8),
-        field("objects", DataType::List(item(DataType::Struct(object_fields())))),
-    ])
 }
 
 /// One list per row: each row's values are `values[offsets[r]..offsets[r+1]]`.

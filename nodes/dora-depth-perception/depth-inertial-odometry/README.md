@@ -81,10 +81,15 @@ measurement update's rows) and the rows a measurement update needs. A frame whos
 prediction, marked `CloudUse::NotCorrected`. Pose times strictly increase: a frame not newer than the
 last posed one is refused.
 
-The sigmas come from the filter's covariance (`State::levelled_uncertainty`). Levelling depends on up,
-so a doubt in up reaches the level position (it swings the position about the start) and the tilt; tilt
-is the body's orientation error and the error in up taken together, about the level axis where it is
-known worst. They are sigmas against the odometry's own map and do not include its drift.
+The tilt and heading sigmas come from the filter's covariance (`State::levelled_uncertainty`). Levelling
+depends on up, so a doubt in up reaches the level position (it swings the position about the start) and the
+tilt; tilt is the body's orientation error and the error in up taken together, about the level axis where it
+is known worst. The position sigmas (`DepthInertialOdometry::levelled_uncertainty`) are the filter's, which
+say how well the pose fits the odometry's own map, with what a change of the camera's depth scale since it
+laid down that map does to the position (see [Depth warm-up](#depth-warm-up)): they bound the error against
+the room while the camera rests. They leave out the map's drift while the camera travels.
+`largest_position_sigma_m` is against the map alone, which is what decides whether the next cloud can still
+correct a dead-reckoned pose.
 
 A depth frame is handled at its own time: IMU samples up to it go in first, newer ones wait for the next
 frame. When the frame is ahead of the IMU, the gyro samples up to it are paired with the latest
@@ -142,8 +147,9 @@ recording's directory to strixen and run the node's handling over it offline:
 cargo run --release -p dora-depth-inertial-odometry --bin replay-odometry-inputs -- <recording directory>
 ```
 
-It prints every loss with the second of frames before it, a progress line every 300 poses, and at the end the
-counts of depth frames, poses, corrected poses and losses, with the time each tracked frame took.
+It prints every loss with the second of frames before it, a progress line every 300 poses, the pose once a
+second of camera time with how far it has moved since its odom frame started and in the last second, and at
+the end the counts of depth frames, poses, corrected poses and losses, with the time each tracked frame took.
 
 ## The three maps
 
@@ -186,8 +192,8 @@ random, each tilt looks like a little knowledge of the sideways direction, and h
 false certainty of 2 mm. A voxel's plane is fitted to hundreds of points over many frames, so it tilts far
 less. Across wall distances and noise seeds the voxel planes report 2.5 to 16 cm.
 
-How the filter's stated one-sigma compares with the actual error on the 60 s drive (1 is honest, larger
-is overconfident):
+How the filter's stated one-sigma (against the map, without the depth warm-up part) compares with the actual
+error on the 60 s drive (1 is honest, larger is overconfident):
 
 | | Voxel planes | Grid neighbours | Tree neighbours |
 |---|---|---|---|
@@ -229,6 +235,30 @@ with `RAYON_NUM_THREADS=1` are the same):
 Downsampling costs about 55 ns per reading, so a full frame takes two thirds of a 33 ms frame period on one
 core and a stride of 4 takes 5%. `TrackerSettings::d455` reads at a stride of 4, which is the density
 the simulated drives run at and loses an eighth of the downsampled points.
+
+## Depth warm-up
+
+A D455's depth changes as the camera warms up after its stream starts. A two minute recording of the camera at
+rest, its stream started 2 s before odometry, read the depth of the same surfaces 1.2% short at first (1.8% on
+the left of the image, 0.7% on the right, 0.2% more at the bottom than the top), coming to its final reading
+over those two minutes with a time constant of about 30 s; live runs went on creeping, ever slower, for about
+five minutes. The odometry cannot tell readings that grow from a camera that moves: on the bench every first
+start of a stream crept 5.5 to 6 cm along the odom frame's x (the camera's right, away from the surfaces whose
+depth grew most) and 1.5 to 2 cm up, almost all of it in the first five minutes, and odometry started again
+in the same stream after 20 minutes crept under 2 mm in two minutes. The map does not cause it: replayed with
+the map frozen after its first 2 s, or without the people cut out, the recording creeps the same; started 60 s
+into the recording it creeps a third as fast. While the depth grows, the filter's slower states give way to
+it: at rest the recording's replay turned the pose 31 mrad in pitch and learned an accelerometer bias of
+0.25 m/s2.
+
+Nothing in the odometry estimates the depth scale. Instead every depth measurement carries how its residual
+moves with three parts of a scale error the cloud's readings share (`DepthScaleError`: uniform, growing across
+the image, growing down it), and the position sigmas add how far the cloud's own measurements would move the
+position under each part (`PoseInformation::position_shift_per_depth_scale`), at one sigma of
+`OdometrySettings::depth_scale_change_sigma`: 0.85% uniform, 0.4% across, 0.13% down, half the change a fresh
+stream goes through. On the recording the reported x sigma is 15 to 27 mm against a 46 mm error at the end,
+where the filter alone said 2 mm. A camera whose stream has run for minutes reports the same sigma and strays
+far less. A camera that should not creep at all must have streamed for five minutes before odometry starts.
 
 ## What a depth camera needs that a lidar does not
 
@@ -273,8 +303,10 @@ Each of these is in the code because the simulated drive failed without it.
   other moving things, and a person in the frames before the pose model first reports them, reach the
   measurement update (where the gate keeps most of them out) and the map.
 - The neighbour maps report their planes as exact, which is the source of their overconfidence.
-- The position sigmas are too small on every map, because the filter does not carry the map's own drift.
-  They say how well a pose fits the map, not how far the map has wandered from the room.
+- The position sigmas leave out the map's own drift while the camera travels. At rest they hold the depth
+  warm-up; they hold it at its worst whatever the camera's age, and where a cloud ties sliding to turning they
+  can reach a decimetre.
+- The depth scale is not a state: a warming camera moves the pose, the tilt and the accelerometer bias.
 - Height drifts when the floor is out of view. Nothing holds the body to the floor.
 - After dead reckoning, the estimate is corrected again only while its error is under about half a
   voxel (about 10 cm on the simulated drive): a voxel-plane lookup answers from the point's own voxel

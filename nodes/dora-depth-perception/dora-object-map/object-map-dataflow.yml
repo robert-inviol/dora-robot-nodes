@@ -10,7 +10,7 @@ nodes:
       ZENOH_SUBSCRIBE: rig/keyframe=keyframe,rig/keyframe_pose=keyframe_pose,rig/instance_masks=instance_masks
       ZENOH_PUBLISH: object_update=rig/object_update
     inputs:
-      tick: dora/timer/millis/5
+      tick: dora/timer/millis/1000
       object_update: objects/object_update
     outputs:
       - keyframe

@@ -3,7 +3,10 @@
 use glam::{DMat3, DVec3, Vec3};
 use rayon::prelude::*;
 
-use crate::filter::{point_to_plane_jacobian, PoseInformation, PoseMatrix, State};
+use nalgebra::SVector;
+
+use crate::downsampling::SensorExtrinsics;
+use crate::filter::{point_to_plane_jacobian, DepthScaleError, PoseInformation, PoseMatrix, State};
 use crate::surfaces::SurfaceMap;
 
 /// How far off a depth reading is, by how far away it was taken: a stereo camera's error grows with
@@ -68,16 +71,19 @@ impl CloudMeasurements {
     }
 }
 
-/// The cloud's point-to-plane measurements against the map, as seen from `state`.
+/// The cloud's point-to-plane measurements against the map, as seen from `state`, for a cloud taken by a depth
+/// sensor that sits on the body at `sensor`.
 ///
 /// `pose_covariance` is the prediction's covariance of the position and orientation error: a
 /// point-to-plane residual depends on no other part of the error state, so this block gives the whole
 /// of the residual's variance due to the state. Each point is gated and Huber-weighted on its
 /// innovation, in units of the innovation's sigma; the weight it enters the measurement update with
 /// is that Huber factor over the measurement's own variance, because the update holds the
-/// prediction's covariance already.
-pub fn measure(cloud: &[BodyPoint], map: &impl SurfaceMap, state: &State, pose_covariance: &PoseMatrix, settings: &AssociationSettings) -> CloudMeasurements {
+/// prediction's covariance already. Each row also says how its residual moves with a scale error shared by every
+/// depth reading ([`DepthScaleError`]), which stretches the point along its ray from the sensor.
+pub fn measure(cloud: &[BodyPoint], sensor: &SensorExtrinsics, map: &impl SurfaceMap, state: &State, pose_covariance: &PoseMatrix, settings: &AssociationSettings) -> CloudMeasurements {
     let rotation = DMat3::from_quat(state.rotation);
+    let body_to_sensor = sensor.rotation.conjugate();
     cloud
         .par_iter()
         .fold(CloudMeasurements::default, |mut measurements, point| {
@@ -96,7 +102,11 @@ pub fn measure(cloud: &[BodyPoint], map: &impl SurfaceMap, state: &State, pose_c
             let sigmas_off = innovation.abs() / innovation_variance.sqrt();
             if sigmas_off <= settings.gate_sigmas {
                 let robust = if sigmas_off <= settings.huber_sigmas { 1.0 } else { settings.huber_sigmas / sigmas_off };
-                measurements.information.add_row(&jacobian, innovation, robust / measurement_variance);
+                let ray = body - sensor.translation_m;
+                let along_ray = normal.dot(rotation * ray);
+                let optical = body_to_sensor * ray;
+                let residual_per_depth_scale = SVector::<f64, { DepthScaleError::PARTS }>::new(along_ray, along_ray * optical.x / optical.z, along_ray * optical.y / optical.z);
+                measurements.information.add_depth_row(&jacobian, innovation, robust / measurement_variance, &residual_per_depth_scale);
             }
             measurements
         })

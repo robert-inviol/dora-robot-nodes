@@ -11,7 +11,7 @@ nodes:
       ZENOH_SUBSCRIBE: rig/keyframe=keyframe,rig/keyframe_pose=keyframe_pose,rig/object_update=object_update
       ZENOH_PUBLISH: occupancy_grid=rig/occupancy_grid,topology=rig/topology,keep_out=rig/keep_out
     inputs:
-      tick: dora/timer/millis/5
+      tick: dora/timer/millis/1000
       occupancy_grid: dense_map/occupancy_grid
       topology: dense_map/topology
       keep_out: dense_map/keep_out

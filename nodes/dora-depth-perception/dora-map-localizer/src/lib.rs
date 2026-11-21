@@ -26,6 +26,7 @@
 pub mod config;
 
 use std::collections::{HashMap, VecDeque};
+use std::time::{Duration, Instant};
 
 use map_localizer::cloud::registration_cloud;
 use map_localizer::gyro::{GyroHeading, ImuMessageError, KeyframeTiming};
@@ -79,10 +80,23 @@ pub struct OdometryRestart {
     pub start: CameraNanos,
 }
 
+/// The node's own work on a keyframe, around the localizer's stages (`KeyframeEstimate::timings`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct KeyframeWork {
+    /// Points in the registration cloud.
+    pub cloud_points: usize,
+    /// Building the registration cloud from the depth.
+    pub cloud: Duration,
+    /// Joining keyframes to odometry and estimating the map to odom correction.
+    pub map_to_odom: Duration,
+}
+
 /// What handling one input did.
 #[derive(Debug, Default)]
 pub struct Handled {
     pub estimate: Option<KeyframeEstimate>,
+    /// With `estimate`, the node's own work on that keyframe.
+    pub keyframe_work: Option<KeyframeWork>,
     /// A keyframe that was waiting for its imu message and was replaced by a newer one.
     pub dropped: Option<FrameId>,
     pub gyro_gap: Option<GyroGap>,
@@ -294,9 +308,12 @@ impl LocalizerNode {
         self.previous = Some(timing);
         self.gyro_gaps += heading.gyro_problem.is_some() as u64;
         let gyro_gap = heading.gyro_problem.map(|problem| GyroGap { frame_id, problem, handled_by: without_gyro, count: self.gyro_gaps });
+        let started = Instant::now();
         let cloud = registration_cloud(&keyframe, &self.settings.cloud);
+        let (cloud_time, cloud_points) = (started.elapsed(), cloud.len());
         let estimate =
             self.localizer.localize(LocalizerInput { frame_id, captured: UnixNanos(keyframe.captured_unix_ns), cloud, yaw_prior: heading.yaw_prior });
+        let started = Instant::now();
         let mut unjoined = Vec::new();
         if let Some(link) = self.odometry.as_mut() {
             match estimate.tracking {
@@ -309,11 +326,12 @@ impl LocalizerNode {
             link.expire(camera_time, &mut unjoined);
         }
         let map_to_odom = self.map_to_odom();
+        let keyframe_work = KeyframeWork { cloud_points, cloud: cloud_time, map_to_odom: started.elapsed() };
         let moved = estimate.optimization.as_ref().and_then(|_| self.pose_graph_update());
         if estimate.selection == KeyframeSelection::Selected {
             self.sent.insert(frame_id, estimate.pose);
         }
-        Handled { estimate: Some(estimate), gyro_gap, map_to_odom, unjoined, moved, ..Handled::default() }
+        Handled { estimate: Some(estimate), keyframe_work: Some(keyframe_work), gyro_gap, map_to_odom, unjoined, moved, ..Handled::default() }
     }
 
     /// The map keyframes already sent whose map pose has moved since it was last sent, each with the keyframes not

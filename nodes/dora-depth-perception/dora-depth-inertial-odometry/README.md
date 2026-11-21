@@ -99,5 +99,5 @@ cargo test --release -p depth-inertial-odometry -p dora-depth-inertial-odometry
 `camera-dataflow.yml` wires the node to `dora-realsense` on the camera's machine.
 
 `replay-odometry-inputs <recording directory>` runs the node's handling over a recording made by
-`dora-odometry-input-recorder` (see the library's README, "Recording and replay"), offline, and prints each loss
-and the counts and timing of the frames.
+`dora-odometry-input-recorder` (see the library's README, "Recording and replay"), offline, and prints each loss,
+the pose once a second with how far it moved and its sigma, and the counts and timing of the frames.

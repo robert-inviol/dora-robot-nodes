@@ -8,12 +8,13 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use dora_node_api::arrow::array::{Array, ArrayRef, AsArray, Float32Array, Int64Array, StringArray, StructArray, UInt64Array};
-use dora_node_api::arrow::datatypes::{DataType, Field, Fields, Float32Type, Int64Type, UInt64Type};
+use dora_node_api::arrow::datatypes::{DataType, Fields, Float32Type, Int64Type, UInt64Type};
 
 use serde::{Deserialize, Serialize};
 
 use crate::navigation::{MapVersion, UnixNanos, WireError};
-use crate::serde_wire::{decode_row, encode_row, list_of, required};
+use crate::serde_wire::{decode_row, encode_row};
+pub use wire_schemas::localization::{keyframe_pose_fields, map_to_odom_fields, pose_graph_update_fields};
 
 /// A keyframe's id, as the camera node numbered it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -61,6 +62,50 @@ impl FromStr for Tracking {
     }
 }
 
+/// Whether keyframe selection added a keyframe to the map.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum KeyframeSelection {
+    /// The keyframe is a node of the pose graph. A keyframe that restarts tracking after loss is one, reported
+    /// restarted.
+    Selected,
+    /// Localized within the keyframe selection distance of the map keyframe `reference` and not added to the map;
+    /// its pose keeps its offset from the reference keyframe's.
+    NotSelected { reference: FrameId },
+    /// Not localized, and not in the map.
+    NotLocalized,
+}
+
+impl KeyframeSelection {
+    pub fn wire_name(self) -> &'static str {
+        match self {
+            KeyframeSelection::Selected => "selected",
+            KeyframeSelection::NotSelected { .. } => "not_selected",
+            KeyframeSelection::NotLocalized => "not_localized",
+        }
+    }
+
+    fn from_wire(name: &str, reference: Option<FrameId>) -> Result<KeyframeSelection, WireError> {
+        let mismatch = |has_reference| WireError::ReferenceDoesNotFitSelection { selection: name.to_owned(), has_reference };
+        match (name, reference) {
+            ("selected", None) => Ok(KeyframeSelection::Selected),
+            ("not_selected", Some(reference)) => Ok(KeyframeSelection::NotSelected { reference }),
+            ("not_localized", None) => Ok(KeyframeSelection::NotLocalized),
+            ("not_selected", None) => Err(mismatch(false)),
+            ("selected" | "not_localized", Some(_)) => Err(mismatch(true)),
+            _ => Err(WireError::UnknownName { field: "selection", name: name.to_owned() }),
+        }
+    }
+
+    /// Exactly the lost keyframes are not localized, and a restarted keyframe is in the map.
+    pub fn fits(self, tracking: Tracking) -> bool {
+        match tracking {
+            Tracking::Lost => self == KeyframeSelection::NotLocalized,
+            Tracking::Restarted => self == KeyframeSelection::Selected,
+            Tracking::Tracking | Tracking::Relocalized => self != KeyframeSelection::NotLocalized,
+        }
+    }
+}
+
 /// A turn about the vertical then a translation, in metres and radians.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Pose4Dof {
@@ -79,6 +124,7 @@ pub struct KeyframePose {
     /// The keyframe's floor frame in the map.
     pub pose: Pose4Dof,
     pub tracking: Tracking,
+    pub selection: KeyframeSelection,
     /// Registration RMS of the inliers; meaningful only when `inlier_fraction` is above zero.
     pub residual_m: f32,
     /// Share of the keyframe's points within the inlier distance of the map surface.
@@ -98,38 +144,6 @@ pub struct MapToOdom {
     pub sigma_xy_m: f32,
     pub sigma_z_m: f32,
     pub sigma_yaw_rad: f32,
-}
-
-fn field(name: &str, data_type: DataType) -> Field {
-    Field::new(name, data_type, true)
-}
-
-const POSE_FIELDS: [&str; 4] = ["x_m", "y_m", "z_m", "yaw_rad"];
-
-pub fn keyframe_pose_fields() -> Fields {
-    let mut fields = vec![
-        field("frame_id", DataType::UInt64),
-        field("captured_unix_ns", DataType::Int64),
-        field("map_version", DataType::UInt64),
-    ];
-    fields.extend(POSE_FIELDS.map(|name| field(name, DataType::Float32)));
-    fields.extend([
-        field("tracking", DataType::Utf8),
-        field("residual_m", DataType::Float32),
-        field("inlier_fraction", DataType::Float32),
-    ]);
-    Fields::from(fields)
-}
-
-pub fn map_to_odom_fields() -> Fields {
-    let mut fields = vec![
-        field("map_version", DataType::UInt64),
-        field("valid_from_camera_ns", DataType::Int64),
-        field("odom_started_camera_ns", DataType::Int64),
-    ];
-    fields.extend(POSE_FIELDS.map(|name| field(name, DataType::Float32)));
-    fields.extend(["sigma_xy_m", "sigma_z_m", "sigma_yaw_rad"].map(|name| field(name, DataType::Float32)));
-    Fields::from(fields)
 }
 
 fn checked<'a>(array: &'a dyn Array, fields: Fields, message: &'static str) -> Result<&'a StructArray, WireError> {
@@ -181,12 +195,20 @@ fn pose_columns(pose: &Pose4Dof) -> [ArrayRef; 4] {
 
 pub fn decode_keyframe_pose(array: &dyn Array) -> Result<KeyframePose, WireError> {
     let row = checked(array, keyframe_pose_fields(), "keyframe pose")?;
+    let tracking: Tracking = str_field(row, "tracking")?.parse()?;
+    let reference = column(row, "reference_frame_id").as_primitive::<UInt64Type>();
+    let reference = reference.is_valid(0).then(|| FrameId(reference.value(0)));
+    let selection = KeyframeSelection::from_wire(str_field(row, "selection")?, reference)?;
+    if !selection.fits(tracking) {
+        return Err(WireError::SelectionDoesNotFitTracking { tracking: tracking.wire_name(), selection: selection.wire_name() });
+    }
     Ok(KeyframePose {
         frame_id: FrameId(u64_field(row, "frame_id")?),
         captured: UnixNanos(i64_field(row, "captured_unix_ns")?),
         map_version: MapVersion(u64_field(row, "map_version")?),
         pose: pose_4dof(row)?,
-        tracking: str_field(row, "tracking")?.parse()?,
+        tracking,
+        selection,
         residual_m: f32_field(row, "residual_m")?,
         inlier_fraction: f32_field(row, "inlier_fraction")?,
     })
@@ -201,6 +223,11 @@ pub fn encode_keyframe_pose(message: &KeyframePose) -> StructArray {
     columns.extend(pose_columns(&message.pose));
     columns.extend([
         Arc::new(StringArray::from(vec![message.tracking.wire_name()])) as ArrayRef,
+        Arc::new(StringArray::from(vec![message.selection.wire_name()])),
+        Arc::new(UInt64Array::from(vec![match message.selection {
+            KeyframeSelection::NotSelected { reference } => Some(reference.0),
+            KeyframeSelection::Selected | KeyframeSelection::NotLocalized => None,
+        }])),
         floats(message.residual_m),
         floats(message.inlier_fraction),
     ]);
@@ -262,17 +289,6 @@ struct PoseGraphUpdateRow {
     keyframes: Vec<UpdatedKeyframePoseRow>,
 }
 
-pub fn pose_graph_update_fields() -> Fields {
-    let keyframe = DataType::Struct(Fields::from(vec![
-        required("frame_id", DataType::UInt64),
-        required("x_m", DataType::Float32),
-        required("y_m", DataType::Float32),
-        required("z_m", DataType::Float32),
-        required("yaw_rad", DataType::Float32),
-    ]));
-    Fields::from(vec![required("map_version", DataType::UInt64), required("keyframes", list_of(keyframe, false))])
-}
-
 pub fn decode_pose_graph_update(array: &dyn Array) -> eyre::Result<PoseGraphUpdate> {
     let row: PoseGraphUpdateRow = decode_row(array, &pose_graph_update_fields(), "keyframe poses moved")?;
     Ok(PoseGraphUpdate {
@@ -323,6 +339,7 @@ mod tests {
                 map_version: MapVersion(7),
                 pose: Pose4Dof { x_m: 1.25, y_m: -0.5, z_m: 0.0625, yaw_rad: 0.75 },
                 tracking: Tracking::Tracking,
+                selection: KeyframeSelection::Selected,
                 residual_m: 0.015625,
                 inlier_fraction: 0.875,
             }
@@ -336,6 +353,43 @@ mod tests {
         let message = decode_keyframe_pose(&golden).unwrap();
         assert_eq!((message.frame_id, message.tracking, message.inlier_fraction), (FrameId(43), Tracking::Lost, 0.0));
         assert_eq!(encode_keyframe_pose(&message), golden);
+    }
+
+    #[test]
+    fn the_not_selected_keyframe_pose_fixture_decodes_and_encodes_back_to_itself() {
+        let golden = fixture("keyframe_pose_not_selected");
+        let message = decode_keyframe_pose(&golden).unwrap();
+        assert_eq!((message.frame_id, message.selection), (FrameId(44), KeyframeSelection::NotSelected { reference: FrameId(42) }));
+        assert_eq!(encode_keyframe_pose(&message), golden);
+        let lost = decode_keyframe_pose(&fixture("keyframe_pose_lost")).unwrap();
+        assert_eq!(lost.selection, KeyframeSelection::NotLocalized);
+    }
+
+    #[test]
+    fn a_selection_that_does_not_fit_its_tracking_state_is_rejected() {
+        let mut message = decode_keyframe_pose(&fixture("keyframe_pose_tracking")).unwrap();
+        message.selection = KeyframeSelection::NotLocalized;
+        let error = decode_keyframe_pose(&encode_keyframe_pose(&message)).unwrap_err();
+        assert!(matches!(error, WireError::SelectionDoesNotFitTracking { tracking: "tracking", selection: "not_localized" }), "{error}");
+        message.tracking = Tracking::Restarted;
+        message.selection = KeyframeSelection::NotSelected { reference: FrameId(3) };
+        assert!(decode_keyframe_pose(&encode_keyframe_pose(&message)).is_err());
+    }
+
+    #[test]
+    fn a_reference_frame_id_that_does_not_fit_the_selection_is_rejected() {
+        let golden = fixture("keyframe_pose_tracking");
+        let with_reference = golden
+            .fields()
+            .iter()
+            .zip(golden.columns())
+            .map(|(field, column)| match field.name().as_str() {
+                "reference_frame_id" => Arc::new(UInt64Array::from(vec![Some(3)])) as ArrayRef,
+                _ => column.clone(),
+            })
+            .collect();
+        let error = decode_keyframe_pose(&StructArray::new(golden.fields().clone(), with_reference, None)).unwrap_err();
+        assert_eq!(error, WireError::ReferenceDoesNotFitSelection { selection: "selected".to_owned(), has_reference: true });
     }
 
     #[test]
@@ -370,6 +424,10 @@ mod tests {
         let mut message = decode_keyframe_pose(&fixture("keyframe_pose_tracking")).unwrap();
         for tracking in Tracking::ALL {
             message.tracking = tracking;
+            message.selection = match tracking {
+                Tracking::Lost => KeyframeSelection::NotLocalized,
+                _ => KeyframeSelection::Selected,
+            };
             assert_eq!(decode_keyframe_pose(&encode_keyframe_pose(&message)).unwrap(), message);
         }
     }

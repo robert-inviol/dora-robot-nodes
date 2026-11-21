@@ -12,7 +12,9 @@ use dora_node_api::arrow::array::{
     UInt64Array,
 };
 use dora_node_api::arrow::buffer::{NullBuffer, OffsetBuffer};
-use dora_node_api::arrow::datatypes::{DataType, Field, Fields, Float32Type, Int64Type, UInt32Type, UInt64Type};
+use dora_node_api::arrow::datatypes::{DataType, Fields, Float32Type, Int64Type, UInt32Type, UInt64Type};
+use wire_schemas::navigation::{map_pose_fields, reference_fields, reference_item};
+pub use wire_schemas::navigation::{goal_status_fields, nav_goal_fields, spatial_answer_fields, spatial_query_fields};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct GoalId(pub u64);
@@ -336,40 +338,10 @@ pub enum WireError {
     ReasonDoesNotFitState(String),
     #[error("a {} reference has an id exactly when it is not a pose", .0.wire_name())]
     IdDoesNotFitReference(ReferenceKind),
-}
-
-fn field(name: &str, data_type: DataType) -> Field {
-    Field::new(name, data_type, true)
-}
-
-fn map_pose_fields() -> Fields {
-    Fields::from(vec![
-        field("x_m", DataType::Float32),
-        field("y_m", DataType::Float32),
-        field("yaw_rad", DataType::Float32),
-    ])
-}
-
-pub fn nav_goal_fields() -> Fields {
-    Fields::from(vec![
-        field("goal_id", DataType::UInt64),
-        field("kind", DataType::Utf8),
-        field("target_id", DataType::UInt64),
-        field("target_pose", DataType::Struct(map_pose_fields())),
-        field("standoff_m", DataType::Float32),
-        field("max_speed_m_s", DataType::Float32),
-        field("deadline_unix_ns", DataType::Int64),
-        field("map_version", DataType::UInt64),
-    ])
-}
-
-pub fn goal_status_fields() -> Fields {
-    Fields::from(vec![
-        field("goal_id", DataType::UInt64),
-        field("state", DataType::Utf8),
-        field("reason", DataType::Utf8),
-        field("updated_unix_ns", DataType::Int64),
-    ])
+    #[error("a keyframe pose has a reference_frame_id exactly when it is not_selected; {selection} has {}", if *.has_reference { "one" } else { "none" })]
+    ReferenceDoesNotFitSelection { selection: String, has_reference: bool },
+    #[error("a {tracking} keyframe pose cannot have selection {selection}: exactly the lost ones are not localized, and a restarted one is selected")]
+    SelectionDoesNotFitTracking { tracking: &'static str, selection: &'static str },
 }
 
 fn checked<'a>(array: &'a dyn Array, fields: Fields, message: &'static str) -> Result<&'a StructArray, WireError> {
@@ -620,40 +592,6 @@ pub struct SpatialAnswer {
     pub references: Vec<Reference>,
     /// The nav goal the robot is on because of this answer.
     pub goal_id: Option<GoalId>,
-}
-
-pub fn spatial_query_fields() -> Fields {
-    Fields::from(vec![
-        field("question_id", DataType::UInt64),
-        field("asked_unix_ns", DataType::Int64),
-        field("asker", DataType::Utf8),
-        field("text", DataType::Utf8),
-    ])
-}
-
-fn reference_fields() -> Fields {
-    Fields::from(vec![
-        field("kind", DataType::Utf8),
-        field("id", DataType::UInt64),
-        field("x_m", DataType::Float32),
-        field("y_m", DataType::Float32),
-    ])
-}
-
-fn reference_item() -> Arc<Field> {
-    Arc::new(Field::new("item", DataType::Struct(reference_fields()), false))
-}
-
-pub fn spatial_answer_fields() -> Fields {
-    Fields::from(vec![
-        field("question_id", DataType::UInt64),
-        field("revision", DataType::UInt32),
-        field("is_final", DataType::Boolean),
-        field("model", DataType::Utf8),
-        field("text", DataType::Utf8),
-        field("references", DataType::List(reference_item())),
-        field("goal_id", DataType::UInt64),
-    ])
 }
 
 fn required_str(row: &StructArray, name: &'static str) -> Result<String, WireError> {

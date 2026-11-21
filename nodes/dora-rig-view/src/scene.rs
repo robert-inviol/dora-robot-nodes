@@ -14,19 +14,17 @@ use std::collections::BTreeMap;
 
 use bytes::Bytes;
 use glam::{Quat, Vec3};
-use perception_wire::localization::{FrameId, KeyframePose, PoseGraphUpdate, MapToOdom, Pose4Dof};
+use perception_wire::localization::{MapToOdom, Pose4Dof};
 use perception_wire::objects::{ObjectId, ObjectUpdate, ObjectUpdateKind};
 use perception_wire::odometry::OdomPose;
 use perception_wire::people::{PeopleTracks, PersonTrack, PositionFrame, TrackId, TrackState};
-use perception_wire::room_layout::RoomLayout;
 use perception_wire::space_map::Topology;
 
 use crate::surface::MeshCacheChange;
 use crate::surface_stream::{SurfaceApplication, SurfaceStreamStatus};
 
-use crate::clouds::{KeyframeMapPoses, KeyframeMapPose};
 use crate::view::{
-    mm, mm3, DoorwayView, Layer, NoticeTopic, Outgoing, PersonView, PlaceView, PlaneView, RoomBoxView, RoomView, Update,
+    mm, mm3, DoorwayView, Layer, NoticeTopic, Outgoing, PersonView, PlaceView, RoomView, Update,
 };
 
 pub struct Scene {
@@ -39,10 +37,6 @@ pub struct Scene {
     /// Every object as last sent, with its voxels.
     objects: BTreeMap<ObjectId, Update>,
     topology: Option<Update>,
-    /// The latest room layout, drawn once its keyframe has a map pose that is drawn.
-    layout: Option<RoomLayout>,
-    /// Where the localizer put the recent keyframes, for drawing the room layout at its keyframe's pose.
-    keyframe_map_poses: KeyframeMapPoses,
     notices: BTreeMap<NoticeTopic, String>,
     /// The whole surface as one message, encoded when it last changed.
     surface: Option<Bytes>,
@@ -50,9 +44,14 @@ pub struct Scene {
     surface_stream: Option<Update>,
 }
 
+impl Default for Scene {
+    fn default() -> Scene {
+        Scene::new()
+    }
+}
+
 impl Scene {
-    /// `max_keyframes` bounds the keyframe poses kept for placing a layout, as it bounds the clouds.
-    pub fn new(max_keyframes: usize) -> Scene {
+    pub fn new() -> Scene {
         Scene {
             correction: None,
             odometry: None,
@@ -60,8 +59,6 @@ impl Scene {
             last_with_position: BTreeMap::new(),
             objects: BTreeMap::new(),
             topology: None,
-            layout: None,
-            keyframe_map_poses: KeyframeMapPoses::new(max_keyframes),
             notices: BTreeMap::new(),
             surface: None,
             surface_stream: None,
@@ -81,7 +78,6 @@ impl Scene {
         out.extend(self.people_update().map(|people| Outgoing::from(&people)));
         out.extend(self.objects.values().map(Outgoing::from));
         out.extend(self.topology.iter().map(Outgoing::from));
-        out.extend(self.layout_update().map(|layout| Outgoing::from(&layout)));
         out
     }
 
@@ -112,50 +108,6 @@ impl Scene {
             }
             SurfaceApplication::Replace => self.snapshot(),
         }
-    }
-
-    pub fn on_keyframe_pose(&mut self, pose: &KeyframePose) -> Vec<Outgoing> {
-        self.set_keyframe_map_pose(pose.frame_id, KeyframeMapPose::of_keyframe_pose(pose))
-    }
-
-    pub fn on_pose_graph_update(&mut self, moved: &PoseGraphUpdate) -> Vec<Outgoing> {
-        moved.keyframes.iter().flat_map(|keyframe| self.set_keyframe_map_pose(keyframe.frame_id, self.keyframe_map_poses.moved(keyframe))).collect()
-    }
-
-    fn set_keyframe_map_pose(&mut self, frame_id: FrameId, map_pose: KeyframeMapPose) -> Vec<Outgoing> {
-        self.keyframe_map_poses.insert(frame_id, map_pose);
-        if self.layout.as_ref().is_some_and(|layout| layout.frame_id == frame_id.0) {
-            return self.layout_update().map(|layout| Outgoing::from(&layout)).into_iter().collect();
-        }
-        Vec::new()
-    }
-
-    /// Keeps the planes and room of the latest keyframe, sent once that keyframe has a map pose.
-    pub fn on_room_layout(&mut self, layout: RoomLayout) -> Vec<Outgoing> {
-        self.layout = Some(layout);
-        self.layout_update().map(|layout| Outgoing::from(&layout)).into_iter().collect()
-    }
-
-    fn layout_update(&self) -> Option<Update> {
-        let layout = self.layout.as_ref()?;
-        let map_pose = self.keyframe_map_poses.get(FrameId(layout.frame_id))?;
-        Some(Update::RoomLayout {
-            frame_id: layout.frame_id,
-            pose: map_pose.floor_pose(),
-            drawn: map_pose.standing.drawn(),
-            planes: layout
-                .planes
-                .iter()
-                .map(|plane| PlaneView { kind: plane.kind.name(), area_m2: mm(plane.area_m2), outline: plane.outline_m.iter().map(|c| mm3(*c)).collect() })
-                .collect(),
-            room: layout.room.as_ref().ok().map(|room| RoomBoxView {
-                floor_m: mm(room.floor_m),
-                ceiling_m: mm(room.ceiling_m),
-                footprint: room.footprint_m.iter().map(|c| [mm(c.x), mm(c.y)]).collect(),
-                edge_seen: room.edge_seen.clone(),
-            }),
-            room_problem: layout.room.as_ref().err().cloned(),
-        })
     }
 
     /// The robot and the people in the map with the new correction.
@@ -365,7 +317,7 @@ fn turn_and_shift(correction: &Pose4Dof) -> (Quat, Vec3) {
 #[cfg(test)]
 mod tests {
     use glam::{Vec2, Vec3};
-    use perception_wire::localization::{CameraNanos, UpdatedKeyframePose, Tracking};
+    use perception_wire::localization::{CameraNanos, FrameId};
     use perception_wire::navigation::{MapVersion, UnixNanos};
     use perception_wire::objects::ObjectExtent;
     use perception_wire::people::{Keypoint, PersonTrack, PixelBox, Point};
@@ -397,18 +349,6 @@ mod tests {
                 .to_owned(),
             })
             .collect()
-    }
-
-    fn keyframe_pose(frame_id: u64, x_m: f32, tracking: Tracking) -> KeyframePose {
-        KeyframePose {
-            frame_id: FrameId(frame_id),
-            captured: UnixNanos(1),
-            map_version: MapVersion(1),
-            pose: Pose4Dof { x_m, y_m: 0.0, z_m: 0.0, yaw_rad: 0.0 },
-            tracking,
-            residual_m: 0.01,
-            inlier_fraction: 0.9,
-        }
     }
 
     /// The odom frame turned a quarter left and moved 1 m along x in the map, from camera time `valid_from_ns`.
@@ -501,26 +441,15 @@ mod tests {
 
     #[test]
     fn a_page_that_connects_late_gets_everything_after_a_reset() {
-        let mut scene = Scene::new(600);
+        let mut scene = Scene::new();
         scene.on_object_update(&object(3, ObjectUpdateKind::Appeared));
         scene.set_surface(Bytes::from_static(&[crate::surface::SURFACE_MESSAGE]));
         assert_eq!(types(&scene.snapshot()), ["reset", "surface", "object"]);
     }
 
     #[test]
-    fn keyframe_poses_for_layouts_are_kept_only_for_the_newest_frames() {
-        let mut scene = Scene::new(2);
-        scene.on_room_layout(layout(1));
-        scene.on_keyframe_pose(&keyframe_pose(1, 0.0, Tracking::Tracking));
-        for frame_id in 2..=3 {
-            scene.on_keyframe_pose(&keyframe_pose(frame_id, 0.0, Tracking::Tracking));
-        }
-        assert_eq!(types(&scene.snapshot()), ["reset"], "frame 1's pose is no longer kept");
-    }
-
-    #[test]
     fn the_robot_waits_for_a_correction_then_goes_out_with_every_odometry_pose() {
-        let mut scene = Scene::new(600);
+        let mut scene = Scene::new();
         let waiting = json(&scene.on_odom_pose(&odom_pose(0, 10, Vec3::new(1.0, 0.0, 0.0))));
         assert_eq!(waiting.len(), 1);
         assert_eq!((waiting[0]["type"].as_str(), waiting[0]["topic"].as_str()), (Some("notice"), Some("robot")));
@@ -536,7 +465,7 @@ mod tests {
 
     #[test]
     fn a_correction_from_before_odometry_restarted_is_not_used() {
-        let mut scene = Scene::new(600);
+        let mut scene = Scene::new();
         scene.on_map_to_odom(&quarter_turn(5));
         let sent = json(&scene.on_odom_pose(&odom_pose(100, 120, Vec3::ZERO)));
         assert_eq!(sent.len(), 1, "no robot: {sent:?}");
@@ -545,7 +474,7 @@ mod tests {
 
     #[test]
     fn people_go_out_with_every_people_frame_with_their_fitted_skeleton_in_the_map() {
-        let mut scene = Scene::new(600);
+        let mut scene = Scene::new();
         scene.on_odom_pose(&odom_pose(0, 10, Vec3::ZERO));
         scene.on_map_to_odom(&quarter_turn(5));
         for _ in 0..3 {
@@ -562,7 +491,7 @@ mod tests {
 
     #[test]
     fn a_track_seen_without_a_position_is_drawn_faded_where_it_was_last_seen() {
-        let mut scene = Scene::new(600);
+        let mut scene = Scene::new();
         scene.on_odom_pose(&odom_pose(0, 10, Vec3::ZERO));
         scene.on_map_to_odom(&quarter_turn(5));
         scene.on_people_tracks(&people(ODOM));
@@ -585,7 +514,7 @@ mod tests {
 
     #[test]
     fn camera_frame_people_are_not_transformed_and_say_why() {
-        let mut scene = Scene::new(600);
+        let mut scene = Scene::new();
         scene.on_odom_pose(&odom_pose(0, 10, Vec3::ZERO));
         scene.on_map_to_odom(&quarter_turn(5));
         let sent = json(&scene.on_people_tracks(&people(PositionFrame::Camera)));
@@ -597,7 +526,7 @@ mod tests {
 
     #[test]
     fn people_of_a_new_odom_frame_wait_for_a_correction_made_in_it() {
-        let mut scene = Scene::new(600);
+        let mut scene = Scene::new();
         scene.on_odom_pose(&odom_pose(0, 10, Vec3::ZERO));
         scene.on_map_to_odom(&quarter_turn(5));
         let restarted = PositionFrame::Odom { odom_started: CameraNanos(100) };
@@ -621,7 +550,7 @@ mod tests {
         use perception_wire::space_map::MeshSequence;
         let surface = || Bytes::from_static(&[crate::surface::SURFACE_MESSAGE]);
         let change = || MeshCacheChange { update: surface(), snapshot: surface() };
-        let mut scene = Scene::new(600);
+        let mut scene = Scene::new();
         scene.on_object_update(&object(3, ObjectUpdateKind::Appeared));
         let trusted = SurfaceStreamStatus { untrusted: None, gaps: 0, snapshots: 0 };
         assert_eq!(types(&scene.on_surface(change(), SurfaceApplication::Changes, trusted)), ["surface_stream", "surface"]);
@@ -639,7 +568,7 @@ mod tests {
 
     #[test]
     fn an_object_carries_its_voxels_to_the_page() {
-        let mut scene = Scene::new(600);
+        let mut scene = Scene::new();
         let sent = json(&scene.on_object_update(&object(3, ObjectUpdateKind::Appeared)));
         assert_eq!(sent[0]["voxel_m"].as_f64().map(|v| v as f32), Some(0.05));
         assert_eq!(sent[0]["voxels"], serde_json::json!([[20, 40, 0], [21, 40, 0]]));
@@ -647,7 +576,7 @@ mod tests {
 
     #[test]
     fn an_object_is_sent_again_only_when_it_changes_and_its_voxels_only_when_they_change() {
-        let mut scene = Scene::new(600);
+        let mut scene = Scene::new();
         scene.on_object_update(&object(3, ObjectUpdateKind::Appeared));
         assert!(scene.on_object_update(&object(3, ObjectUpdateKind::Updated)).is_empty(), "nothing changed");
         let mut seen_again = object(3, ObjectUpdateKind::Updated);
@@ -661,46 +590,9 @@ mod tests {
         assert_eq!(json(&scene.snapshot())[1]["voxels"].as_array().map(Vec::len), Some(3), "a late page gets them all");
     }
 
-    fn layout(frame_id: u64) -> RoomLayout {
-        use perception_wire::room_layout::{RoomLayoutPlane, RoomBox};
-        RoomLayout {
-            frame_id,
-            planes: vec![RoomLayoutPlane {
-                kind: depth_perception::SurfaceKind::Floor,
-                area_m2: 4.0,
-                outline_m: vec![Vec3::new(0.0, 1.0, -1.0), Vec3::new(1.0, 1.0, -1.0), Vec3::new(0.0, 2.0, -1.0)],
-            }],
-            room: Ok(RoomBox {
-                floor_m: -1.0,
-                ceiling_m: 1.5,
-                footprint_m: vec![Vec2::new(-1.0, 0.5), Vec2::new(1.0, 0.5), Vec2::new(1.0, 3.0), Vec2::new(-1.0, 3.0)],
-                edge_seen: vec![false, true, true, true],
-            }),
-        }
-    }
-
-    #[test]
-    fn a_layout_waits_for_its_keyframe_pose_and_follows_it_when_it_moves() {
-        let mut scene = Scene::new(600);
-        assert!(scene.on_room_layout(layout(5)).is_empty(), "no pose yet");
-        let posed = scene.on_keyframe_pose(&keyframe_pose(5, 2.0, Tracking::Tracking));
-        let sent = json(&posed);
-        let layout_sent = sent.iter().find(|m| m["type"] == "room_layout").expect("the layout goes with the pose");
-        assert_eq!((layout_sent["drawn"].as_bool(), layout_sent["pose"]["x_m"].as_f64()), (Some(true), Some(2.0)));
-        assert_eq!(layout_sent["planes"][0]["kind"], "floor");
-        assert_eq!(layout_sent["room"]["edge_seen"], serde_json::json!([false, true, true, true]));
-        let moved = PoseGraphUpdate {
-            map_version: MapVersion(2),
-            keyframes: vec![UpdatedKeyframePose { frame_id: FrameId(5), pose: Pose4Dof { x_m: 2.5, y_m: 0.0, z_m: 0.0, yaw_rad: 0.0 } }],
-        };
-        let sent = json(&scene.on_pose_graph_update(&moved));
-        assert_eq!(sent.iter().find(|m| m["type"] == "room_layout").unwrap()["pose"]["x_m"].as_f64(), Some(2.5));
-        assert_eq!(types(&scene.snapshot()), ["reset", "room_layout"]);
-    }
-
     #[test]
     fn an_object_that_disappears_or_merges_is_removed() {
-        let mut scene = Scene::new(600);
+        let mut scene = Scene::new();
         let appeared = json(&scene.on_object_update(&object(3, ObjectUpdateKind::Appeared)));
         assert_eq!((appeared[0]["label"].as_str(), appeared[0]["bottom_m"].as_f64()), (Some("chair"), Some(0.0)));
         scene.on_object_update(&object(4, ObjectUpdateKind::Appeared));

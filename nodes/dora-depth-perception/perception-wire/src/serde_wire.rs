@@ -4,28 +4,12 @@
 use std::sync::Arc;
 
 use dora_node_api::arrow::array::{Array, StructArray};
-use dora_node_api::arrow::datatypes::{DataType, Field, Fields, Schema};
+use dora_node_api::arrow::datatypes::{Fields, Schema};
 use dora_node_api::arrow::json::{ArrayWriter, ReaderBuilder};
 use dora_node_api::arrow::record_batch::RecordBatch;
 use eyre::{eyre, Context, Result};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
-
-pub(crate) fn required(name: &str, data_type: DataType) -> Field {
-    Field::new(name, data_type, false)
-}
-
-pub(crate) fn optional(name: &str, data_type: DataType) -> Field {
-    Field::new(name, data_type, true)
-}
-
-pub(crate) fn list_of(item_type: DataType, nullable_items: bool) -> DataType {
-    DataType::List(Arc::new(Field::new("item", item_type, nullable_items)))
-}
-
-pub(crate) fn floats_struct(names: &[&str]) -> DataType {
-    DataType::Struct(names.iter().map(|name| required(name, DataType::Float32)).collect())
-}
 
 pub(crate) fn encode_row<T: Serialize>(row: &T, fields: Fields) -> StructArray {
     let mut decoder = ReaderBuilder::new(Arc::new(Schema::new(fields)))

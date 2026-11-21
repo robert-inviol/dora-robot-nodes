@@ -254,6 +254,89 @@ fn resting_in_the_room(checkpoints: &[Duration]) -> Vec<RestingConfidence> {
     found
 }
 
+/// How a still camera's position strayed and what the odometry said of it, over one stretch of a long rest.
+#[derive(Debug)]
+struct RestingStretch {
+    /// The largest error of the levelled position along any level axis over the stretch.
+    worst_error_m: f64,
+    /// The largest error along any level axis in units of the sigma reported along that axis, over the stretch.
+    worst_error_sigmas: f64,
+    /// The same in units of the sigma against the map alone, which leaves the depth scale out.
+    worst_error_map_sigmas: f64,
+}
+
+/// Stands still in the room for `stretches` stretches of `stretch_for` each, with the camera's depth scale coming
+/// to `1 + depth_scale_change` as a stereo camera's does while it warms up (an exponential approach with
+/// `warm_up_for` as its time constant), and reports each stretch.
+fn resting_while_the_depth_warms_up(depth_scale_change: f64, warm_up_for: Duration, stretch_for: Duration, stretches: u32) -> Vec<RestingStretch> {
+    let (walk, scene, errors) = (Walk::on_a_robot(Duration::from_secs(3600)), Scene::living_room(), ImuErrors::consumer());
+    let camera = DepthCamera { columns: 106, rows: 60, ..DepthCamera::d455_quarter() };
+    let settings = OdometrySettings::d455();
+    let mut rng = seeded(13);
+    let stationary_samples = (STATIONARY.as_micros() / IMU_PERIOD.as_micros()) as u32;
+    let stationary: Vec<_> = (0..stationary_samples).map(|i| walk.imu_sample(IMU_PERIOD * i, &errors, &mut rng)).collect();
+    let mut odometry = DepthInertialOdometry::new(StaticInitialization::from_samples(&stationary, settings.gravity_m_s2).expect("at rest"), voxel_planes(), settings);
+    let mut found: Vec<RestingStretch> = Vec::new();
+    let clouds_per_stretch = (stretch_for.as_micros() / (IMU_PERIOD * IMU_PER_CLOUD).as_micros()) as u32;
+    let mut cloud_index = 0u32;
+    for i in stationary_samples.. {
+        let time = IMU_PERIOD * i;
+        odometry.add_imu(walk.imu_sample(time, &errors, &mut rng)).expect("in order");
+        if i % IMU_PER_CLOUD != 0 {
+            continue;
+        }
+        let seconds = time.as_secs_f64();
+        let warmed = 1.0 - (-(time - STATIONARY).as_secs_f64() / warm_up_for.as_secs_f64()).exp();
+        let warming = DepthCamera { depth_scale: 1.0 + depth_scale_change * warmed, ..camera };
+        odometry.add_cloud(time, &warming.cloud(&scene, walk.position(seconds), walk.rotation(seconds), &mut rng)).expect("a still camera's cloud registers");
+        let stretch = (cloud_index / clouds_per_stretch) as usize;
+        if stretch == stretches as usize {
+            return found;
+        }
+        if stretch == found.len() {
+            found.push(RestingStretch { worst_error_m: 0.0, worst_error_sigmas: 0.0, worst_error_map_sigmas: 0.0 });
+        }
+        let error = (odometry.state().levelled_pose().0 - walk.pose_from_start(seconds).0).abs();
+        let sigma = odometry.levelled_uncertainty().position_sigma_m;
+        let in_sigmas = error / sigma;
+        let in_map_sigmas = error / odometry.filter().levelled_uncertainty().position_sigma_m;
+        found[stretch].worst_error_map_sigmas = found[stretch].worst_error_map_sigmas.max(in_map_sigmas.max_element());
+        found[stretch].worst_error_m = found[stretch].worst_error_m.max(error.max_element());
+        found[stretch].worst_error_sigmas = found[stretch].worst_error_sigmas.max(in_sigmas.max_element());
+        cloud_index += 1;
+    }
+    unreachable!("the rest ends after its last stretch")
+}
+
+/// A camera at rest whose depth is steady: its position must not creep with time at rest, and the reported sigma
+/// must cover the error.
+#[test]
+fn a_still_camera_with_steady_depth_does_not_creep() {
+    let stretches = resting_while_the_depth_warms_up(0.0, Duration::from_secs(40), Duration::from_secs(30), 5);
+    println!("at rest for 150 s with steady depth: {stretches:?}");
+    for (index, stretch) in stretches.iter().enumerate() {
+        assert!(stretch.worst_error_m < 0.006, "stretch {index}: strayed {:.4} m", stretch.worst_error_m);
+        assert!(stretch.worst_error_sigmas < 2.5, "stretch {index}: an error of {:.1} sigmas", stretch.worst_error_sigmas);
+    }
+    let (first, last) = (&stretches[0], &stretches[stretches.len() - 1]);
+    assert!(last.worst_error_m < first.worst_error_m + 0.003, "the error grows with time at rest: {first:?} at first, {last:?} at the end");
+}
+
+/// A camera at rest whose depth grows by half a percent as it warms up: the position moves with the depth, which
+/// the odometry cannot tell from motion, stops moving once the depth stops changing, and stays within the sigma it
+/// reports.
+#[test]
+fn a_still_camera_whose_depth_warms_up_strays_no_further_than_its_sigma_says() {
+    let stretches = resting_while_the_depth_warms_up(0.005, Duration::from_secs(30), Duration::from_secs(30), 5);
+    println!("at rest for 150 s while the depth scale grows by 0.5%: {stretches:?}");
+    for (index, stretch) in stretches.iter().enumerate() {
+        assert!(stretch.worst_error_m < 0.025, "stretch {index}: strayed {:.4} m", stretch.worst_error_m);
+        assert!(stretch.worst_error_sigmas < 2.5, "stretch {index}: an error of {:.1} sigmas", stretch.worst_error_sigmas);
+    }
+    let (settled, last) = (&stretches[3], &stretches[4]);
+    assert!(last.worst_error_m < settled.worst_error_m + 0.003, "the error grows once the depth has settled: {settled:?}, then {last:?}");
+}
+
 #[test]
 fn a_still_cameras_map_and_pose_confidence_stop_growing_at_the_floor() {
     let found = resting_in_the_room(&[Duration::from_secs(10), Duration::from_secs(40)]);

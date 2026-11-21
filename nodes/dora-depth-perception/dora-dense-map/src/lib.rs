@@ -94,18 +94,20 @@ pub fn settings_from_environment() -> Result<DenseMapSettings> {
 pub struct DenseMapNode {
     mapper: DenseMapper<BlockTsdf>,
     tally: MeshBlockTally,
-    /// Why posed depth frames are not being fused, while they are not.
+    /// Why posed depth frames are not being fused, while they are not, and how many have not been.
     unfused: Option<Unfused>,
+    unfused_frames: u64,
     /// Surface snapshots sent on request in this run.
     snapshots: u64,
 }
 
-/// How often each block's surface was sent over a minute, logged so that blocks whose surface keeps changing can be
-/// found.
+/// How often each block's surface was sent over a minute, and how often a block meshed again was kept as sent by
+/// the resend rule, logged so that blocks whose surface keeps changing can be found.
 struct MeshBlockTally {
     started: Option<Instant>,
     sends: std::collections::HashMap<[i32; 3], u32>,
     emptied: u32,
+    kept_as_sent: usize,
 }
 
 impl MeshBlockTally {
@@ -135,8 +137,8 @@ impl MeshBlockTally {
             .collect();
         let sent: u32 = self.sends.values().sum();
         let seconds = now.duration_since(started).as_secs();
-        tracing::info!(seconds, sent, blocks = self.sends.len(), emptied = self.emptied, busiest = %shown.join(", "), "mesh blocks sent");
-        *self = MeshBlockTally { started: Some(now), sends: Default::default(), emptied: 0 };
+        tracing::info!(seconds, sent, blocks = self.sends.len(), emptied = self.emptied, kept_as_sent = self.kept_as_sent, busiest = %shown.join(", "), "mesh blocks sent");
+        *self = MeshBlockTally { started: Some(now), sends: Default::default(), emptied: 0, kept_as_sent: 0 };
     }
 }
 
@@ -145,8 +147,8 @@ impl DenseMapNode {
     pub fn new(settings: DenseMapSettings, run_started: UnixNanos) -> Result<DenseMapNode> {
         settings.validate()?;
         let field = BlockTsdf::new(settings.tsdf);
-        let tally = MeshBlockTally { started: None, sends: Default::default(), emptied: 0 };
-        Ok(DenseMapNode { mapper: DenseMapper::new(settings, field, run_started), tally, unfused: None, snapshots: 0 })
+        let tally = MeshBlockTally { started: None, sends: Default::default(), emptied: 0, kept_as_sent: 0 };
+        Ok(DenseMapNode { mapper: DenseMapper::new(settings, field, run_started), tally, unfused: None, unfused_frames: 0, snapshots: 0 })
     }
 
     pub fn mapper(&self) -> &DenseMapper<BlockTsdf> {
@@ -226,6 +228,7 @@ impl DenseMapNode {
 
     fn messages(&mut self, (outputs, report): (Vec<MapOutput>, TickReport), now: Instant) -> Vec<(Output, StructArray)> {
         log_tick(&report);
+        self.tally.kept_as_sent += report.mesh_blocks_kept_as_sent;
         let block_m = self.mapper.field().voxel_m() * BLOCK_EDGE_VOXELS as f32;
         let messages = outputs
             .into_iter()
@@ -246,11 +249,13 @@ impl DenseMapNode {
     fn log_fusion(&mut self, arrival: PosedDepthArrival) {
         match (arrival, self.unfused) {
             (PosedDepthArrival::Fused, Some(_)) => {
-                tracing::info!("fusing posed depth frames again");
+                tracing::info!(unfused_frames = self.unfused_frames, "fusing posed depth frames again");
                 self.unfused = None;
+                self.unfused_frames = 0;
             }
             (PosedDepthArrival::Fused, None) => {}
-            (PosedDepthArrival::Unfused(why), before) if before != Some(why) => {
+            (PosedDepthArrival::Unfused(why), before) if is_new_reason(before, why) => {
+                self.unfused_frames += 1;
                 match why {
                     Unfused::NoCorrection => tracing::warn!("posed depth frames are not fused until the localizer corrects their odom frame"),
                     Unfused::OtherOdomFrame { frame, correction } => tracing::warn!(
@@ -258,11 +263,25 @@ impl DenseMapNode {
                         correction_odom_started_ns = correction.0,
                         "posed depth frames are not fused: the localizer's correction is for another odom frame"
                     ),
+                    Unfused::BeforeCorrections { captured, oldest_valid_from } => tracing::warn!(
+                        captured_ns = captured.0,
+                        oldest_valid_from_ns = oldest_valid_from.0,
+                        "posed depth frames are not fused: captured before the oldest correction held for their odom frame"
+                    ),
                 }
                 self.unfused = Some(why);
             }
-            (PosedDepthArrival::Unfused(_), _) => {}
+            (PosedDepthArrival::Unfused(_), _) => self.unfused_frames += 1,
         }
+    }
+}
+
+/// Whether frames are not fused for another reason than before: a frame before the corrections held is the same
+/// reason whatever its capture time.
+fn is_new_reason(before: Option<Unfused>, why: Unfused) -> bool {
+    match (before, why) {
+        (Some(Unfused::BeforeCorrections { .. }), Unfused::BeforeCorrections { .. }) => false,
+        (before, why) => before != Some(why),
     }
 }
 

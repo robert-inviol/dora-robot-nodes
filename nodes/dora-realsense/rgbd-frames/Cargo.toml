@@ -1,7 +1,7 @@
 [package]
 name = "rgbd-frames"
 version = "0.1.0"
-description = "What a RealSense node does to each frame without librealsense: which framesets go out, the model input letterbox and IMU correction"
+description = "What a RealSense node does to each frame without librealsense: the camera clock unwrapped, which framesets go out, the model input letterbox and IMU correction"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

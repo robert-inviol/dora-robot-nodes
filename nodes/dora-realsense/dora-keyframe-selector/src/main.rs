@@ -1,11 +1,12 @@
 //! dora node: selects keyframes from dora-realsense's frames. It follows the camera's `imu` and `depth`, selects a frame
 //! at least once a second and sooner when the camera turns, asks the camera for that frame's colour, and sends an
-//! `imu` message with every sample since the previous keyframe, then the `keyframe`: depth aligned to colour, the
-//! colour as JPEG, and the gravity estimate.
+//! `imu` message with every sample since the previous keyframe, then the `keyframe`: depth aligned to colour with the
+//! people of the pose model's `person_poses` cut out, the colour as JPEG, and the gravity estimate.
 
 use std::fs::File;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use dora_keyframe_selector::people::PeopleCut;
 use dora_keyframe_selector::selection::{KeyframeAssembler, SelectedKeyframe};
 use dora_node_api::arrow::array::{Array, AsArray, RecordBatch, StructArray, UInt64Array};
 use dora_node_api::arrow::datatypes::{Schema, UInt16Type, UInt8Type};
@@ -15,6 +16,7 @@ use dora_node_api::{DoraNode, Event, MetadataParameters, Parameter};
 use eyre::{bail, eyre, Context, Result};
 use glam::Vec3;
 use perception_wire::camera::{decode_camera_calibration, CameraCalibration};
+use perception_wire::people::decode_person_poses;
 use perception_wire::{decode_imu, encode_imu, encode_keyframe};
 use rgbd_keyframes::KeyframeSettings;
 use shared_memory_outputs::SharedMemoryOutputs;
@@ -23,6 +25,7 @@ const IMU_INPUT: &str = "imu";
 const DEPTH_INPUT: &str = "depth";
 const COLOR_INPUT: &str = "color";
 const CALIBRATION_INPUT: &str = "calibration";
+const PERSON_POSES_INPUT: &str = "person_poses";
 const REQUEST_COLOR_OUTPUT: &str = "request_color";
 const IMU_OUTPUT: &str = "imu";
 const KEYFRAME_OUTPUT: &str = "keyframe";
@@ -99,6 +102,15 @@ fn send_selected(
     keyframe_recorder: &mut Option<Recorder>,
 ) -> Result<()> {
     let output = |name: &str| DataId::from(name.to_owned());
+    let frame_id = selected.keyframe.frame_id;
+    match selected.people {
+        PeopleCut::Cut { people, pixels, age_ns } => {
+            eprintln!("[keyframes] keyframe {frame_id}: {people} people cut out, {pixels} pixels, poses {:.1} ms from the depth", age_ns as f64 * 1e-6)
+        }
+        PeopleCut::NoPosesNear { nearest_age_ns } => {
+            eprintln!("[keyframes] keyframe {frame_id}: nobody cut out, the nearest person poses are {:.1} ms from the depth", nearest_age_ns as f64 * 1e-6)
+        }
+    }
     // The imu message goes first, so a consumer has the samples before the keyframe they lead up to.
     let imu_message = encode_imu(&selected.imu);
     if let Some(recorder) = imu_recorder.as_mut() {
@@ -131,7 +143,16 @@ fn main() -> Result<()> {
                 IMU_INPUT => {
                     assembler.add_imu(&decode_imu(data.as_ref()).wrap_err("reading an imu message")?);
                     if let Some(calibration) = calibration.as_ref() {
-                        for selected in assembler.take_ready(calibration) {
+                        for selected in assembler.take_ready(calibration)? {
+                            send_selected(&mut node, &mut outputs, selected, &mut imu_recorder, &mut keyframe_recorder)?;
+                        }
+                    }
+                }
+                // Before the calibration there is no colour stream to check the poses against, and nothing is selected.
+                PERSON_POSES_INPUT => {
+                    if let Some(calibration) = calibration.as_ref() {
+                        assembler.add_person_poses(&decode_person_poses(data.as_ref()).wrap_err("reading person poses")?, calibration)?;
+                        for selected in assembler.take_ready(calibration)? {
                             send_selected(&mut node, &mut outputs, selected, &mut imu_recorder, &mut keyframe_recorder)?;
                         }
                     }
@@ -160,7 +181,7 @@ fn main() -> Result<()> {
                     let jpeg = encode_jpeg(rgb.values(), width as u16, height as u16)?;
                     eprintln!("[keyframes] keyframe {frame_id}: jpeg {:.1} ms", started.elapsed().as_secs_f64() * 1e3);
                     assembler.add_color(frame_id, jpeg);
-                    for selected in assembler.take_ready(calibration) {
+                    for selected in assembler.take_ready(calibration)? {
                         send_selected(&mut node, &mut outputs, selected, &mut imu_recorder, &mut keyframe_recorder)?;
                     }
                 }

@@ -33,6 +33,29 @@ class Tracking(Enum):
     LOST = "lost"
 
 
+@dataclass(frozen=True)
+class Selected:
+    """The keyframe is a node of the pose graph. A keyframe that restarts tracking after loss is one, reported
+    restarted."""
+
+
+@dataclass(frozen=True)
+class NotSelected:
+    """Localized within the keyframe selection distance of the map keyframe `reference` and not added to the map;
+    its pose keeps its offset from the reference keyframe's."""
+
+    reference: FrameId
+
+
+@dataclass(frozen=True)
+class NotLocalized:
+    """Not localized, and not in the map."""
+
+
+# Whether keyframe selection added a keyframe to the map.
+KeyframeSelection = Selected | NotSelected | NotLocalized
+
+
 KEYFRAME_POSE_TYPE = pa.struct(
     [
         ("frame_id", pa.uint64()),
@@ -44,6 +67,10 @@ KEYFRAME_POSE_TYPE = pa.struct(
         ("z_m", pa.float32()),
         ("yaw_rad", pa.float32()),
         ("tracking", pa.string()),
+        # "selected", "not_selected" or "not_localized".
+        ("selection", pa.string()),
+        # The map keyframe a not selected keyframe keeps its offset from; set exactly when selection is "not_selected".
+        ("reference_frame_id", pa.uint64()),
         # Registration RMS of the inliers; meaningful only when inlier_fraction is above zero.
         ("residual_m", pa.float32()),
         # Share of the keyframe's points within the inlier distance of the map surface.
@@ -111,6 +138,7 @@ class KeyframePose:
     z_m: float
     yaw_rad: float
     tracking: Tracking
+    selection: KeyframeSelection
     residual_m: float
     inlier_fraction: float
 
@@ -120,6 +148,14 @@ class KeyframePose:
         _finite_not_negative("residual_m", self.residual_m)
         if not 0.0 <= self.inlier_fraction <= 1.0:
             raise ValueError(f"inlier_fraction is {self.inlier_fraction}, expected 0 to 1")
+        if (self.tracking == Tracking.LOST) != isinstance(self.selection, NotLocalized):
+            raise ValueError(
+                f"a {self.tracking.value} keyframe pose has selection {self.selection}: exactly the lost ones are not localized"
+            )
+        if self.tracking == Tracking.RESTARTED and not isinstance(self.selection, Selected):
+            raise ValueError(
+                f"a restarted keyframe pose has selection {self.selection}: a restarted keyframe is in the map"
+            )
 
     def to_arrow(self) -> pa.Array:
         return one_row(
@@ -132,6 +168,8 @@ class KeyframePose:
                 "z_m": self.z_m,
                 "yaw_rad": self.yaw_rad,
                 "tracking": self.tracking.value,
+                "selection": _SELECTION_NAMES[type(self.selection)],
+                "reference_frame_id": self.selection.reference if isinstance(self.selection, NotSelected) else None,
                 "residual_m": self.residual_m,
                 "inlier_fraction": self.inlier_fraction,
             },
@@ -150,9 +188,29 @@ class KeyframePose:
             z_m=row["z_m"],
             yaw_rad=row["yaw_rad"],
             tracking=Tracking(row["tracking"]),
+            selection=_selection(row["selection"], row["reference_frame_id"]),
             residual_m=row["residual_m"],
             inlier_fraction=row["inlier_fraction"],
         )
+
+
+_SELECTION_NAMES = {Selected: "selected", NotSelected: "not_selected", NotLocalized: "not_localized"}
+
+
+def _selection(name: str, reference_frame_id: int | None) -> KeyframeSelection:
+    match name, reference_frame_id:
+        case "selected", None:
+            return Selected()
+        case "not_selected", int(reference):
+            return NotSelected(FrameId(reference))
+        case "not_localized", None:
+            return NotLocalized()
+        case "not_selected", None:
+            raise ValueError("a not selected keyframe pose carries no reference_frame_id")
+        case ("selected" | "not_localized"), _:
+            raise ValueError(f"a {name} keyframe pose carries a reference_frame_id")
+        case _:
+            raise ValueError(f"keyframe pose selection is {name!r}, not selected, not_selected or not_localized")
 
 
 @dataclass(frozen=True)
@@ -261,6 +319,7 @@ FIXTURE_EXAMPLES: dict[str, KeyframePose | MapToOdom | PoseGraphUpdate] = {
         z_m=0.0625,
         yaw_rad=0.75,
         tracking=Tracking.TRACKING,
+        selection=Selected(),
         residual_m=0.015625,
         inlier_fraction=0.875,
     ),
@@ -273,8 +332,22 @@ FIXTURE_EXAMPLES: dict[str, KeyframePose | MapToOdom | PoseGraphUpdate] = {
         z_m=0.0625,
         yaw_rad=1.0,
         tracking=Tracking.LOST,
+        selection=NotLocalized(),
         residual_m=0.0,
         inlier_fraction=0.0,
+    ),
+    "keyframe_pose_not_selected": KeyframePose(
+        frame_id=FrameId(44),
+        captured_unix_ns=1_762_560_001_123_456_789,
+        map_version=MapVersion(7),
+        x_m=1.3125,
+        y_m=-0.5,
+        z_m=0.0625,
+        yaw_rad=0.8125,
+        tracking=Tracking.TRACKING,
+        selection=NotSelected(FrameId(42)),
+        residual_m=0.0078125,
+        inlier_fraction=0.9375,
     ),
     "keyframe_pose_restarted": KeyframePose(
         frame_id=FrameId(47),
@@ -285,6 +358,7 @@ FIXTURE_EXAMPLES: dict[str, KeyframePose | MapToOdom | PoseGraphUpdate] = {
         z_m=0.0625,
         yaw_rad=1.25,
         tracking=Tracking.RESTARTED,
+        selection=Selected(),
         residual_m=0.0,
         inlier_fraction=0.0,
     ),

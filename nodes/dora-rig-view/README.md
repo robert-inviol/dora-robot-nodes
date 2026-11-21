@@ -2,10 +2,11 @@
 
 A [dora](https://dora-rs.ai) node serving a live 3D page of the robot's map for people to watch: the dense map's
 surface, with every object's voxels painted on it in the object's colour; the robot and its path from odometry;
-people with their fitted skeletons; objects as labelled boxes; rooms, places and doorways; the planes and the room
-of the latest keyframe, as the plane_segmentation node found them in it; and, when turned on, every keyframe's depth as a
-coloured point cloud at its map pose from the localizer. Drag to orbit, right-drag to pan, scroll
-to zoom, or follow the robot. Surface faces point to the free side, so walls are see-through from behind.
+people with their fitted skeletons; and objects as labelled boxes. Diagnostic layers, off until turned on: the
+keyframe clouds (each new view's depth as a coloured point cloud at its map pose from the localizer); and the dense
+map's rooms, doorways and places. Each toggle says on hover what it shows and who uses it, and the page remembers the
+toggles in the browser. Drag to orbit, right-drag to pan, scroll to zoom, or follow the robot. Surface faces point to
+the free side, so walls are see-through from behind.
 
 A page gets the whole scene once when it connects, then only what changes, over one WebSocket:
 
@@ -14,9 +15,8 @@ A page gets the whole scene once when it connects, then only what changes, over 
 | Surface blocks: each changed block's whole surface, gzip | with each of the dense map's surface messages, at most 5 a second | 1-2 KB a block; a 6 x 5 m room is about 500 blocks |
 | The whole scene again, starting with a reset, as a page that connects gets it | when a snapshot repairs the surface, or a new run of the dense map replaces it | as a connecting page's |
 | Surface stream counts: gaps in the dense map's surface sequence and snapshots taken | when either changes | about 50 B |
-| A keyframe's cloud, in its own floor frame, gzip | once per keyframe, only to a page that shows the clouds | about 20 KB at 320x240 px, roughly 100 KB at 848x480 px with the default stride |
-| A cloud's space carving: the indices of the points a later keyframe saw through | when a registered keyframe gets its map pose, only to a page that shows the clouds | 4 B a point, gzip |
-| The planes and room of the latest keyframe | once that keyframe has a map pose, and when it moves | a few KB |
+| A keyframe's cloud, in its own floor frame, gzip | once per keyframe from a new view, only to a page that shows the clouds | about 20 KB at 320x240 px, roughly 300 KB at 1280x720 px with the default stride |
+| A cloud's space carving: the indices of the points removed | when a registered keyframe's depth removes points, only to a page that shows the clouds | 4 B a point, gzip |
 | A keyframe's pose | when the localizer sends it, and again whenever a pose graph optimization moves it | about 100 B |
 | The robot | with every odometry pose, 30 a second on the rig | about 100 B |
 | People | with every people frame, 30 a second on the rig | about 400 B a person |
@@ -27,20 +27,32 @@ Every vertex of a mesh block is sent as millimetres from its block's corner. A v
 colour when its own voxel of the object grid, or one beside it, holds a point of the object.
 
 A page asks for the keyframe clouds with `{"clouds": true}` when its clouds layer is turned on, gets the clouds so
-far, and stops them with `{"clouds": false}`. When a registered keyframe gets its map pose, space carving removes the
-points of every other drawn cloud that its depth lies more than 10 cm beyond: whatever was there, such as a person
-walking through, has moved away.
+far, and stops them with `{"clouds": false}`. The clouds so far go out between the scene's updates, which go first,
+so the robot and the people keep moving while they come.
+
+A keyframe's cloud is drawn only for a new view (`src/clouds.rs`): one cloud per keyframe the localizer selected into
+the map, as its keyframe pose's `selection` says. A keyframe it did not select (`not_selected`, localized near the map
+keyframe it names) is a repeat view: its cloud is not kept or sent. So a still camera draws one cloud, and a keyframe a second from the same place changes nothing on
+the page but what its depth carves away. A keyframe waits for its map pose before it is drawn or not.
+
+Space carving: the depth of every registered keyframe, repeat views included, votes on each point of every drawn
+cloud but its own. Depth more than 10 cm beyond the point saw through it; depth within 10 cm of it saw it again. A
+point is removed once more views saw through it than saw it, counting the view it came from as one that saw it. A
+person who walked through is removed after two more views; one who stood for a while, once more views have seen past
+them than saw them. Depth noise, which sees through a point now and then but sees it most of the time, removes
+only the readings it put well in front of the surface, in the first few views, and then nothing. A removed point stays
+removed.
 
 How a keyframe's tracking state decides what is drawn (`MapPoseStanding` in `src/clouds.rs`):
 
-- `tracking` and `relocalized`: the cloud and the room layout are drawn at the keyframe's map pose, and its depth
-  carves the other clouds.
+- `tracking` and `relocalized`: the cloud (for a new view) is drawn at the keyframe's map pose,
+  and its depth votes on the other clouds.
 - `restarted`: the keyframe starts a new run after tracking was lost. It is a map keyframe at a dead-reckoned pose that
-  later pose graph updates move, so its cloud and room layout are drawn at that pose and move with the updates, but
+  later pose graph updates move, so its cloud is drawn at that pose and move with the updates, but
   its depth carves nothing, since the pose is not registered against the map. Other clouds' depth still carves it.
 - `lost`: dead reckoning outside the map; nothing is drawn at its pose and it carves nothing.
 
-A pose graph update moves a keyframe and keeps the standing its keyframe pose gave it.
+A pose graph update moves a keyframe and keeps the standing and selection its keyframe pose gave it.
 
 Each cloud stays in its keyframe's floor frame (gravity aligned, origin at the camera, x right, y forward, z up)
 and the page draws it at the keyframe's map pose. When the localizer's pose graph moves keyframes, only their poses
@@ -88,7 +100,6 @@ a second, and how long since the latest people frame came (amber past 200 ms).
 | `mesh_blocks` | `mesh_blocks` | `dora-dense-map` |
 | `object_update` | `object_update` | `dora-object-map` |
 | `topology` | `topology` | `dora-dense-map` |
-| `room_layout` | `room_layout` (or `scene`) | `dora-depth-perception`, the plane_segmentation node |
 
 Every input is optional; an input of another name, or an error from dora, stops the node, as does a keyframe or
 surface message it cannot draw, or the background thread falling 64 messages behind.
@@ -103,7 +114,7 @@ surface message it cannot draw, or the background thread falling 64 messages beh
 | `RIG_VIEW_PORT` | Port of the page; required |
 | `RIG_VIEW_STRIDE_PX` | Every n-th depth pixel each way becomes a point; default 4 |
 | `RIG_VIEW_MAX_RANGE_M` | Depth beyond this is left out of the clouds; default 5, at most 32 |
-| `RIG_VIEW_MAX_KEYFRAMES` | The newest this many clouds are kept; default 600 |
+| `RIG_VIEW_MAX_KEYFRAMES` | The newest this many clouds of new views are kept; default 600 |
 
 It runs as the `rig_view` node of the spatial server's dataflow,
 `nodes/dora-depth-perception/examples/spatial-server-dataflow.yml`.

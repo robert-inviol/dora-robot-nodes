@@ -1,0 +1,15 @@
+[package]
+name = "wire-schemas"
+version = "0.1.0"
+description = "The Arrow type, name and schema fingerprint of every message lib/dora-rig-messages defines"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+# The arrow-schema of dora-node-api's arrow, so these types are the node API's own.
+arrow-schema = "54"
+sha2 = "0.10"
+
+[dev-dependencies]
+serde_json = "1"

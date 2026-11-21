@@ -11,7 +11,7 @@ dora node that places every keyframe in the map with the `map-localizer` library
 
 | Output | Message |
 |---|---|
-| `keyframe_pose` | `keyframe_pose` (lib/dora-rig-messages localization): one per keyframe, with the map version, tracking state, registration RMS and inlier fraction, whether or not keyframe selection added it to the map. Metadata `localize_ms` is the time taken |
+| `keyframe_pose` | `keyframe_pose` (lib/dora-rig-messages localization): one per keyframe, whether or not keyframe selection added it to the map, with the map version, tracking state, keyframe selection (`selected`, `not_selected` naming the map keyframe it keeps its offset from, or `not_localized` when lost), registration RMS and inlier fraction. Metadata `localize_ms` is the time taken |
 | `pose_graph_update` | `pose_graph_update` (lib/dora-rig-messages localization): after an optimization of the pose graph, every map keyframe already sent that it moved more than 1 cm or 0.23 degrees from the pose last sent for it, at its new pose, followed by the keyframes not selected that follow it. A map keyframe that restarted tracking after loss is sent `restarted` and is among them when it moves. A keyframe's own `keyframe_pose` is never sent again |
 | `map_to_odom` | `map_to_odom` (lib/dora-rig-messages localization): with odometry, the transform taking odometry poses into the map, sent after every keyframe and every odometry pose that joined a keyframe |
 
@@ -57,6 +57,12 @@ other combination is refused when the settings are read, and an imu message arri
 the node.
 
 `RUST_LOG` picks what is logged; without it, info and above.
+
+Each keyframe's `keyframe localized` line gives its tracking state, keyframe selection, fitness and pose, the
+points in its registration cloud (`cloud_points`), and the time of each stage in milliseconds: `cloud_ms` (the
+registration cloud from the depth), `tracking_target_ms`, `seed_trials_ms`, `refinement_ms`, `loop_closure_ms`,
+`relocalization_ms`, `optimization_ms` (see the map-localizer README), `map_to_odom_ms` (joining keyframes to
+odometry and the correction), and `localize_ms`, the whole input's handling. The colour image is not decoded.
 
 ## Settings
 

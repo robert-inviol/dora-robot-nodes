@@ -1,8 +1,10 @@
-"""Golden examples of every message, stored as Arrow IPC files that each language's tests read.
+"""Golden examples of every message, stored as Arrow IPC files that each language's tests read, and the table of
+every wire type's fingerprint, which the Rust wire-schemas crate's tests compare its own definitions with.
 
 Regenerate with `python -m dora_rig_messages.fixtures` after a deliberate change to a wire type.
 """
 
+import json
 from pathlib import Path
 from typing import Protocol
 
@@ -11,19 +13,54 @@ import pyarrow as pa
 import numpy as np
 
 from . import camera, localization, navigation, objects, people, posed_depth, space_map
-from .drive import DriveDemand
+from .drive import DRIVE_DEMAND_TYPE, DriveDemand
 from .navigation import (
     GoalId, GoalKind, GoalReason, GoalState, GoalStatus, MapPose, MapVersion, NavGoal, ObjectId,
 )
-from .odometry import OdomPose, DegenerateDirection
-from .operator import DriveMode, OperatorCommand
+from .odometry import ODOM_POSE_TYPE, OdomPose, DegenerateDirection
+from .operator import OPERATOR_COMMAND_TYPE, DriveMode, OperatorCommand
 from .perception import (
+    IMU_TYPE, INSTANCE_MASKS_TYPE, KEYFRAME_TYPE, LABELS_TYPE, SCENE_TYPE,
     CameraIntrinsics, Labels, Imu, Keyframe, Plane, Room, Scene, SceneObject, InstanceMasks, SurfaceKind,
 )
-from .scan import RangeReading, Scan
-from .status import DriverStatus, PilotStatus, TrackId
+from .scan import SCAN_TYPE, RangeReading, Scan
+from .status import DRIVER_STATUS_TYPE, PILOT_STATUS_TYPE, DriverStatus, PilotStatus, TrackId
+from .wire import canonical_encoding, fingerprint
 
 FIXTURE_DIR = Path(__file__).parent / "fixtures"
+FINGERPRINT_TABLE = FIXTURE_DIR / "wire_fingerprints.json"
+
+# Every message's wire type under its stable name, the name the Rust wire-schemas crate gives it.
+WIRE_TYPES: dict[str, pa.StructType] = {
+    "drive_demand": DRIVE_DEMAND_TYPE,
+    "operator_command": OPERATOR_COMMAND_TYPE,
+    "pilot_status": PILOT_STATUS_TYPE,
+    "driver_status": DRIVER_STATUS_TYPE,
+    "scan": SCAN_TYPE,
+    "keyframe": KEYFRAME_TYPE,
+    "imu": IMU_TYPE,
+    "labels": LABELS_TYPE,
+    "instance_masks": INSTANCE_MASKS_TYPE,
+    "scene": SCENE_TYPE,
+    "camera_calibration": camera.CAMERA_CALIBRATION_TYPE,
+    "keyframe_pose": localization.KEYFRAME_POSE_TYPE,
+    "map_to_odom": localization.MAP_TO_ODOM_TYPE,
+    "pose_graph_update": localization.KEYFRAME_POSES_MOVED_TYPE,
+    "nav_goal": navigation.NAV_GOAL_TYPE,
+    "goal_status": navigation.GOAL_STATUS_TYPE,
+    "spatial_query": navigation.SPATIAL_QUERY_TYPE,
+    "spatial_answer": navigation.SPATIAL_ANSWER_TYPE,
+    "object_update": objects.OBJECT_UPDATE_TYPE,
+    "odom_pose": ODOM_POSE_TYPE,
+    "person_poses": people.PERSON_POSES_TYPE,
+    "people_tracks": people.PEOPLE_TRACKS_TYPE,
+    "posed_depth_frame": posed_depth.POSED_DEPTH_FRAME_TYPE,
+    "occupancy_grid": space_map.OCCUPANCY_GRID_TYPE,
+    "topology": space_map.TOPOLOGY_TYPE,
+    "keep_out": space_map.KEEP_OUT_TYPE,
+    "mesh_blocks": space_map.MESH_BLOCKS_TYPE,
+    "mesh_snapshot_request": space_map.MESH_SNAPSHOT_REQUEST_TYPE,
+}
 
 
 class Message(Protocol):
@@ -175,7 +212,25 @@ def write_fixture(name: str, message: Message) -> None:
         writer.write_batch(batch)
 
 
+def fingerprint_table() -> dict[str, dict[str, str]]:
+    """Every wire type's fingerprint and the canonical encoding it is the hash of, by name."""
+    return {
+        name: {"fingerprint": fingerprint(wire_type), "canonical": canonical_encoding(wire_type)}
+        for name, wire_type in sorted(WIRE_TYPES.items())
+    }
+
+
+def read_fingerprint_table() -> dict[str, dict[str, str]]:
+    return json.loads(FINGERPRINT_TABLE.read_text())
+
+
+def write_fingerprint_table() -> None:
+    FINGERPRINT_TABLE.write_text(json.dumps(fingerprint_table(), indent=2) + "\n")
+
+
 if __name__ == "__main__":
     for example_name, example in EXAMPLES.items():
         write_fixture(example_name, example)
         print(f"wrote {fixture_path(example_name)}")
+    write_fingerprint_table()
+    print(f"wrote {FINGERPRINT_TABLE}")

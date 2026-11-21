@@ -9,13 +9,27 @@ pub struct TsdfSettings {
     pub voxel_m: f32,
     /// Signed distances are clamped to this either side of a surface; voxels further behind one are left alone.
     pub truncation_m: f32,
-    /// The weight one keyframe adds to a voxel it sees.
+    /// The weight one reading no further than the full weight range adds to a voxel it sees.
     pub observation_weight: f32,
-    /// A voxel's weight stops growing here, so later keyframes can still move its surface.
+    /// Readings further than this add less weight, by the inverse square of their noise: `(full_weight_range_m /
+    /// depth)^4`, as stereo depth noise grows with the square of the range. A voxel at its weight cap then wanders
+    /// with the same noise at any range.
+    pub full_weight_range_m: f32,
+    /// The depth camera's noise, one sigma, at a range of 1 m; it grows with the square of the range.
+    pub depth_noise_at_1_m: f32,
+    /// A reading contradicts a voxel when it differs from it by more than this many sigmas of its noise, and by more
+    /// than `min_contradiction_m`; a contradicting reading halves the voxel's weight before it is averaged in.
+    pub contradiction_sigmas: f32,
+    pub min_contradiction_m: f32,
+    /// A voxel's weight stops growing here, so later keyframes can still move its surface, and a settled surface
+    /// wanders with the noise of about its last `max_weight / observation_weight` readings.
     pub max_weight: f32,
-    /// A voxel with less weight than this counts as never seen.
+    /// A voxel with less weight than this counts as never seen: below what one reading at the max range adds, so a
+    /// surface seen once is meshed at any range, and above what a reading adds just short of the truncation distance
+    /// behind a surface.
     pub min_observed_weight: f32,
-    /// Depth readings outside this range are not fused.
+    /// A reading nearer than the min range says nothing. Readings within the range are surfaces and carve the voxels
+    /// in front of them free; a reading beyond the max range is no surface, and carves the voxels within it.
     pub min_range_m: f32,
     pub max_range_m: f32,
     /// Every n-th pixel each way casts a ray that decides which blocks a keyframe touches.
@@ -28,8 +42,12 @@ impl Default for TsdfSettings {
             voxel_m: 0.05,
             truncation_m: 0.2,
             observation_weight: 1.0,
+            full_weight_range_m: 3.0,
+            depth_noise_at_1_m: 0.005,
+            contradiction_sigmas: 3.0,
+            min_contradiction_m: 0.1,
             max_weight: 64.0,
-            min_observed_weight: 0.5,
+            min_observed_weight: 0.1,
             min_range_m: 0.4,
             max_range_m: 5.0,
             allocation_stride_px: 4,
@@ -77,19 +95,19 @@ impl Default for OccupancyGridSettings {
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct MeshSettings {
-    /// The shortest time between two mesh_blocks messages.
+    /// The shortest time between two mesh_blocks messages, which is also the shortest time between two sends of one
+    /// block.
     pub period_s: f32,
-    /// A block is sent again when a vertex has moved further than this from where it was last sent...
-    pub min_vertex_move_m: f32,
-    /// ...or more than this fraction of its cells holding a vertex appeared or went...
-    pub min_changed_cells: f32,
-    /// ...and no sooner than this after it was last sent.
-    pub min_block_period_s: f32,
+    /// A vertex further than this from the other surface has moved: a vertex meshed now from the surface last sent,
+    /// or a vertex last sent from the surface now.
+    pub surface_tolerance_m: f32,
+    /// A block is sent again once at least this many of its vertices have moved, or all of them when it has fewer.
+    pub min_moved_vertices: usize,
 }
 
 impl Default for MeshSettings {
     fn default() -> Self {
-        MeshSettings { period_s: 0.2, min_vertex_move_m: 0.02, min_changed_cells: 0.1, min_block_period_s: 0.5 }
+        MeshSettings { period_s: 0.2, surface_tolerance_m: 0.02, min_moved_vertices: 3 }
     }
 }
 
@@ -151,11 +169,14 @@ impl Default for KeepOutSettings {
 pub struct BufferSettings {
     /// Keyframes waiting for their pose beyond this many drop the oldest.
     pub max_awaiting_pose: usize,
+    /// Corrections from the odom frame to the map held, so that a posed depth frame is fused with the one valid when
+    /// it was captured; a frame older than the oldest held is not fused.
+    pub max_corrections: usize,
 }
 
 impl Default for BufferSettings {
     fn default() -> Self {
-        BufferSettings { max_awaiting_pose: 64 }
+        BufferSettings { max_awaiting_pose: 64, max_corrections: 16 }
     }
 }
 
@@ -225,6 +246,10 @@ impl DenseMapSettings {
         check("tsdf.voxel_m", t.voxel_m, t.voxel_m > 0.0, "expected above 0")?;
         check("tsdf.truncation_m", t.truncation_m, t.truncation_m >= t.voxel_m, "expected at least one voxel")?;
         check("tsdf.observation_weight", t.observation_weight, t.observation_weight > 0.0, "expected above 0")?;
+        check("tsdf.depth_noise_at_1_m", t.depth_noise_at_1_m, t.depth_noise_at_1_m >= 0.0, "expected at least 0")?;
+        check("tsdf.contradiction_sigmas", t.contradiction_sigmas, t.contradiction_sigmas >= 0.0, "expected at least 0")?;
+        check("tsdf.min_contradiction_m", t.min_contradiction_m, t.min_contradiction_m >= 0.0 && t.min_contradiction_m < t.truncation_m, "expected 0 up to the truncation")?;
+        check("tsdf.full_weight_range_m", t.full_weight_range_m, t.full_weight_range_m > 0.0, "expected above 0")?;
         check("tsdf.max_weight", t.max_weight, t.max_weight >= t.observation_weight, "expected at least one observation")?;
         check("tsdf.min_range_m", t.min_range_m, t.min_range_m >= 0.0 && t.min_range_m < t.max_range_m, "expected 0 up to the max range")?;
         check("tsdf.allocation_stride_px", t.allocation_stride_px as f32, t.allocation_stride_px > 0, "expected above 0")?;
@@ -233,14 +258,13 @@ impl DenseMapSettings {
         check("occupancy_grid.period_s", s.period_s, s.period_s >= 0.0, "expected at least 0")?;
         check("mesh.period_s", self.mesh.period_s, self.mesh.period_s >= 0.0, "expected at least 0")?;
         let mesh = &self.mesh;
-        check("mesh.min_vertex_move_m", mesh.min_vertex_move_m, mesh.min_vertex_move_m >= 0.0, "expected at least 0")?;
-        let cells = mesh.min_changed_cells;
-        check("mesh.min_changed_cells", cells, (0.0..=1.0).contains(&cells), "expected 0 to 1")?;
-        check("mesh.min_block_period_s", mesh.min_block_period_s, mesh.min_block_period_s >= 0.0, "expected at least 0")?;
+        check("mesh.surface_tolerance_m", mesh.surface_tolerance_m, mesh.surface_tolerance_m >= 0.0, "expected at least 0")?;
+        check("mesh.min_moved_vertices", mesh.min_moved_vertices as f32, mesh.min_moved_vertices > 0, "expected above 0")?;
         check("topology.door_width_m", p.door_width_m, p.door_width_m > p.min_door_width_m, "expected above the min door width")?;
         check("topology.place_spacing_m", p.place_spacing_m, p.place_spacing_m > t.voxel_m, "expected above one voxel")?;
         check("topology.max_edge_length_m", p.max_edge_length_m, p.max_edge_length_m >= p.place_spacing_m, "expected at least the place spacing")?;
         check("keep_out.margin_m", self.keep_out.margin_m, self.keep_out.margin_m >= 0.0, "expected at least 0")?;
+        check("buffers.max_corrections", self.buffers.max_corrections as f32, self.buffers.max_corrections > 0, "expected above 0")?;
         let k = &self.keyframes;
         check("keyframes.pose_cell_m", k.pose_cell_m, k.pose_cell_m > 0.0, "expected above 0")?;
         check("keyframes.pose_cell_yaw_deg", k.pose_cell_yaw_deg, k.pose_cell_yaw_deg > 0.0 && k.pose_cell_yaw_deg <= 360.0, "expected above 0 up to 360")?;
@@ -256,7 +280,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_changed_mesh_block_may_go_again_after_half_a_second() {
-        assert_eq!(DenseMapSettings::default().mesh.min_block_period_s, 0.5);
+    fn the_defaults_are_valid() {
+        assert_eq!(DenseMapSettings::default().validate(), Ok(()));
     }
 }
