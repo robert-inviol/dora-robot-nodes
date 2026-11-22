@@ -190,6 +190,35 @@ detected `keypoints_3d` are not recorded), which is in COCO order; the store's j
 (`world_model::world::Joint::ALL`). The heading is the walking direction at 0.2 m/s or faster, otherwise the facing
 from the shoulders, then the hips (`world-store/src/geometry.rs`).
 
+## Objects described and found by meaning
+
+The spatial agent can find objects by what they are, not only by their SAM 3 label ("red cup" finds the red mug
+labelled `cup`). It is on when the agent's settings file has `[object_descriptions]` (commented out in
+`nodes/dora-world-agent/world-agent/spatial-agent.example.toml`), and then needs `GEMINI_API_KEY` in the node's
+environment, or the node stops at start. Without the section nothing is described and `find` matches words.
+
+1. The object map (`nodes/dora-depth-perception/object-map`) cleans each SAM 3 mask in 3D before it places an object
+   (`cleaning`: sparse points dropped, then only the largest cluster kept, joined across gaps of up to 2 cells of
+   3 cm, 5 along the line of sight; a large dropped cluster is logged at info as a likely second object under the
+   mask). It cuts each object's best view (`crop`) with the cleaned mask, as the mask's box
+   grown by `crop.context_margin` (0.25), the object as it is and the rest dimmed to 0.35 (`crop.background =
+   "dimmed"`; `"blank"` puts it on grey). It sends it on `object_update` when a view is new to the
+   receiver: on appearing, moving, and a view `crop.min_improvement` times better. It makes no network calls.
+2. In dora-world-agent, `nodes/dora-world-agent/object-descriptions` describes each view in the background (bounded
+   queue, a newer view replacing a waiting one): one Claude Haiku call through the agent's signed-in Claude Code CLI
+   with the image, a facts line (size in cm, every label the object was reported under) and `Describe this object.`,
+   the reply shaped by `--json-schema` (name, category, description, colour, material); then two Gemini
+   `gemini-embedding-2` calls, the description's text and the view's image, into one vector space. Labels in
+   `person_labels` are never described or embedded. Failed calls are retried on `retry_after_s`, then logged and
+   counted; nothing empty is stored.
+3. The world store keeps them in `object_caption` and `object_embedding` (schema version 4, which also added
+   `object_label`). `find` embeds its query text and ranks every object by its closest similarity (to description or
+   view) plus 0.1 times the share of query words in its label or description, and returns those scores;
+   `describe_object` returns the description and the views.
+
+Cost: one Haiku call and two Gemini embedding calls per described view, one Gemini call per `find` with text. Not yet
+run live; `object-descriptions/examples/describe_and_rank.rs` runs the real path on one image.
+
 ## Localizer and odometry
 
 dora-map-localizer registers each keyframe against the map, keeps the map keyframes in a 4-DoF pose graph, and
@@ -327,6 +356,9 @@ Odometry, in order:
   only on the GPU machine's debug page.
 - Space carving: removing cloud points a later view saw through (rig view).
 - Instance masks: SAM 3's per-pixel instance ids with their labels (`instance_masks`, `instance_ids`).
+- View: an object's best view, cut from a keyframe's colour image around its mask (`crop_jpeg`); its description is a
+  vision model's structured account of it (`ObjectCaption`), and its embeddings are the vectors of the description's
+  text and of the view's image (`object_embedding`).
 - Open-vocabulary labels: the object type names Claude lists for a keyframe (`labels`).
 - Observation: where a person, a joint or an object was seen at one time (`Observation`, `PersonObservation`,
   `JointObservation`).

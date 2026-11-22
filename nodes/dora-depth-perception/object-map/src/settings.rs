@@ -5,6 +5,9 @@ use std::time::Duration;
 use depth_perception::objects::FootprintSettings;
 use serde::Deserialize;
 
+use crate::cleaning::CleaningSettings;
+use crate::crop::CropBackground;
+
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ObjectMapSettings {
@@ -25,14 +28,14 @@ pub struct ObjectMapSettings {
 pub struct DetectionSettings {
     /// Masks scored below this are ignored.
     pub min_score: f32,
-    /// Mask edges smear foreground and background depth together; this much is shaved off first.
+    /// A mask's edge can lie on the surface the object stands on or leans against, which cleaning cannot tell from
+    /// the object where they touch; only points this far inside the mask place the object.
     pub erosion_px: usize,
-    /// Fewer mask pixels with depth than this, after erosion, and the mask is ignored.
+    /// Fewer points than this on the object's surface, after cleaning and erosion, and the mask is ignored.
     pub min_points: usize,
-    /// A jump in depth this large separates the object's surface from background seen through the mask.
-    pub max_depth_gap_m: f32,
     /// Fewer voxels than this and the mask is ignored.
     pub min_voxels: usize,
+    pub cleaning: CleaningSettings,
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]
@@ -87,6 +90,10 @@ pub struct CropSettings {
     pub jpeg_quality: u8,
     /// A view replaces the best one when its score times visible area is at least this many times larger.
     pub min_improvement: f32,
+    /// The view is the box around the mask grown on every side by this share of the box's width or height.
+    pub context_margin: f32,
+    /// What the view shows around the mask.
+    pub background: CropBackground,
 }
 
 impl Default for ObjectMapSettings {
@@ -111,8 +118,8 @@ impl Default for DetectionSettings {
             min_score: 0.3,
             erosion_px: footprint.erosion_px,
             min_points: footprint.min_points,
-            max_depth_gap_m: footprint.max_depth_gap_m,
             min_voxels: 4,
+            cleaning: CleaningSettings::default(),
         }
     }
 }
@@ -151,18 +158,7 @@ impl Default for AbsenceSettings {
 
 impl Default for CropSettings {
     fn default() -> Self {
-        CropSettings { jpeg_quality: 85, min_improvement: 1.2 }
-    }
-}
-
-impl DetectionSettings {
-    pub fn footprint(&self) -> FootprintSettings {
-        FootprintSettings {
-            erosion_px: self.erosion_px,
-            min_points: self.min_points,
-            max_depth_gap_m: self.max_depth_gap_m,
-            ..FootprintSettings::default()
-        }
+        CropSettings { jpeg_quality: 85, min_improvement: 1.2, context_margin: 0.25, background: CropBackground::Dimmed }
     }
 }
 

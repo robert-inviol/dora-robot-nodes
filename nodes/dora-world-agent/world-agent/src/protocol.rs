@@ -48,10 +48,32 @@ enum Role {
     User,
 }
 
+/// Where an image's bytes are, as the Messages API takes it.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ImageSource {
+    Base64 { media_type: &'static str, data: String },
+}
+
+/// One block of a user message that carries more than text.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum UserInputBlock {
+    Image { source: ImageSource },
+    Text { text: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(untagged)]
+pub enum UserInputContent {
+    Text(String),
+    Blocks(Vec<UserInputBlock>),
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct UserBody {
     role: Role,
-    content: String,
+    content: UserInputContent,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -78,7 +100,16 @@ pub enum InputMessage {
 
 impl InputMessage {
     pub fn user(uuid: MessageUuid, text: String) -> Self {
-        InputMessage::User { message: UserBody { role: Role::User, content: text }, parent_tool_use_id: None, uuid }
+        Self::user_content(uuid, UserInputContent::Text(text))
+    }
+
+    /// A user message of blocks, such as an image followed by text.
+    pub fn user_blocks(uuid: MessageUuid, blocks: Vec<UserInputBlock>) -> Self {
+        Self::user_content(uuid, UserInputContent::Blocks(blocks))
+    }
+
+    fn user_content(uuid: MessageUuid, content: UserInputContent) -> Self {
+        InputMessage::User { message: UserBody { role: Role::User, content }, parent_tool_use_id: None, uuid }
     }
 
     pub fn control(request_id: RequestId, request: ControlRequestBody) -> Self {
@@ -313,6 +344,8 @@ pub struct TurnResult {
     pub usage: Option<Usage>,
     pub total_cost_usd: Option<f64>,
     pub duration_ms: Option<u64>,
+    /// The reply in the shape of `--json-schema`, when the process was given one.
+    pub structured_output: Option<Value>,
 }
 
 impl TurnResult {
@@ -521,6 +554,29 @@ mod tests {
                 "uuid": "00000000-0000-0000-0000-000000000000",
             })
         );
+    }
+
+    #[test]
+    fn an_image_and_text_go_as_content_blocks() {
+        let blocks = vec![
+            UserInputBlock::Image { source: ImageSource::Base64 { media_type: "image/jpeg", data: "/9j/".to_owned() } },
+            UserInputBlock::Text { text: "Describe this object.".to_owned() },
+        ];
+        let value: Value = serde_json::from_str(&InputMessage::user_blocks(MessageUuid(Uuid::nil()), blocks).to_line()).unwrap();
+        assert_eq!(
+            value["message"],
+            json!({"role": "user", "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": "/9j/"}},
+                {"type": "text", "text": "Describe this object."},
+            ]})
+        );
+    }
+
+    #[test]
+    fn a_result_carries_its_structured_output() {
+        let line = r#"{"type":"result","subtype":"success","is_error":false,"result":"","session_id":"00000000-0000-0000-0000-000000000000","structured_output":{"name":"mug"}}"#;
+        let OutputEvent::Result(result) = OutputEvent::parse(line).unwrap() else { panic!("not a result") };
+        assert_eq!(result.structured_output, Some(json!({"name": "mug"})));
     }
 
     #[test]

@@ -6,7 +6,7 @@
 use rusqlite::{Connection, Transaction};
 
 /// Each entry moves the schema from version `index` to `index + 1`.
-const MIGRATIONS: [&str; 3] = [r#"
+const MIGRATIONS: [&str; 4] = [r#"
 CREATE TABLE map_version (
     map_version INTEGER PRIMARY KEY,
     first_seen_unix_ns INTEGER NOT NULL
@@ -275,6 +275,44 @@ DROP TABLE track_joint;
 DROP TABLE track_pose;
 ALTER TABLE track_pose_nullable_speed RENAME TO track_pose;
 ALTER TABLE track_joint_nullable_speed RENAME TO track_joint;
+"#, r#"
+-- object_caption holds a vision model's structured description of the view it was given; the free-text table it
+-- replaces held nothing the node wrote.
+DROP TABLE object_caption;
+CREATE TABLE object_caption (
+    object_id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL,
+    category TEXT NOT NULL,
+    description TEXT NOT NULL,
+    colour TEXT NOT NULL,
+    material TEXT NOT NULL,
+    -- The keyframe the described view was cut from.
+    view_frame_id INTEGER NOT NULL,
+    model TEXT NOT NULL,
+    captioned_unix_ns INTEGER NOT NULL
+);
+
+-- One vector per object and source: the embedding of its description's text, and of its described view's image.
+CREATE TABLE object_embedding (
+    object_id INTEGER NOT NULL,
+    source TEXT NOT NULL CHECK (source IN ('description', 'view')),
+    model TEXT NOT NULL,
+    dimensions INTEGER NOT NULL CHECK (dimensions > 0),
+    -- dimensions little-endian float32 values.
+    vector BLOB NOT NULL CHECK (length(vector) = 4 * dimensions),
+    view_frame_id INTEGER NOT NULL,
+    embedded_unix_ns INTEGER NOT NULL,
+    PRIMARY KEY (object_id, source)
+);
+
+-- Every label the object map has reported an object under, including those of objects merged into it.
+CREATE TABLE object_label (
+    object_id INTEGER NOT NULL,
+    label TEXT NOT NULL,
+    first_reported_unix_ns INTEGER NOT NULL,
+    PRIMARY KEY (object_id, label)
+);
+INSERT INTO object_label SELECT object_id, label, min(valid_from_unix_ns) FROM object GROUP BY object_id, label;
 "#];
 
 pub const SCHEMA_VERSION: u32 = MIGRATIONS.len() as u32;
@@ -329,7 +367,7 @@ mod tests {
         for table in [
             "map_version", "topology", "room", "room_vertex", "room_name", "doorway", "place", "place_edge", "free_space",
             "object", "object_extent", "object_caption", "object_view", "object_relation", "robot_pose", "track",
-            "track_pose", "track_joint", "goal", "event",
+            "track_pose", "track_joint", "goal", "event", "object_embedding", "object_label",
         ] {
             assert!(names.iter().any(|n| n == table), "{table} missing from {names:?}");
         }
@@ -366,7 +404,7 @@ mod tests {
         assert!(connection.execute("INSERT INTO track_pose VALUES (7, 300, 3, 0.0, 0.0, 0.0, NULL, NULL)", []).is_err(), "version 2 needs a speed");
 
         assert_eq!(migrate(&mut connection).unwrap(), SCHEMA_VERSION);
-        assert_eq!(schema_version(&connection).unwrap(), 3);
+        assert_eq!(schema_version(&connection).unwrap(), SCHEMA_VERSION);
         let poses: Vec<(i64, f64, Option<f64>, Option<f64>)> = connection
             .prepare("SELECT seen_unix_ns, x_m, heading_rad, speed_m_s FROM track_pose ORDER BY seen_unix_ns")
             .unwrap()
@@ -383,6 +421,38 @@ mod tests {
         assert!(orphan.is_err(), "track_joint still references track_pose");
         let tables = tables(&connection);
         assert!(!tables.iter().any(|name| name.contains("nullable_speed")), "{tables:?}");
+    }
+
+    #[test]
+    fn a_database_at_version_3_keeps_the_labels_its_objects_were_reported_under() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        assert_eq!(migrate_to(&mut connection, 3).unwrap(), 3);
+        connection.execute("INSERT INTO map_version VALUES (1, 0)", []).unwrap();
+        let insert = "INSERT INTO object (object_id, label, centre_x_m, centre_y_m, centre_z_m, corner0_x_m, corner0_y_m,
+             corner1_x_m, corner1_y_m, corner2_x_m, corner2_y_m, corner3_x_m, corner3_y_m, long_m, short_m, height_m, top_m,
+             score, confidence, seen_count, frame_id, map_version, valid_from_unix_ns, valid_to_unix_ns, last_seen_unix_ns)
+             VALUES (7, ?1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0.1, 0.1, 0.1, 0.1, 0.9, 1, 3, 1, 1, ?2, ?3, ?2)";
+        connection.execute(insert, rusqlite::params!["cup", 100, 200]).unwrap();
+        connection.execute(insert, rusqlite::params!["mug", 200, Option::<i64>::None]).unwrap();
+
+        migrate(&mut connection).unwrap();
+        let labels: Vec<(String, i64)> = connection
+            .prepare("SELECT label, first_reported_unix_ns FROM object_label WHERE object_id = 7 ORDER BY label")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(labels, [("cup".to_owned(), 100), ("mug".to_owned(), 200)]);
+    }
+
+    #[test]
+    fn a_stored_vector_must_hold_its_dimensions() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        migrate(&mut connection).unwrap();
+        let short = connection.execute("INSERT INTO object_embedding VALUES (1, 'view', 'm', 2, x'00000000', 5, 0)", []);
+        assert!(short.is_err(), "a vector of one float cannot have two dimensions");
+        connection.execute("INSERT INTO object_embedding VALUES (1, 'view', 'm', 1, x'0000803f', 5, 0)", []).unwrap();
     }
 
     #[test]

@@ -43,6 +43,7 @@ async fn haiku_answers_moves_the_robot_and_reconciles_through_the_mcp_endpoint()
         ChannelGoalSink(goal_sender),
         FakeWorld::house(),
         answer_sender,
+        None,
     )
     .await
     .unwrap();

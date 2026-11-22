@@ -7,6 +7,7 @@
 //! sees clearly past an object's surface, often enough, the object has gone; if one with its label turns up
 //! elsewhere soon after, it has moved.
 
+pub mod cleaning;
 pub mod crop;
 pub mod detection;
 pub mod evidence;

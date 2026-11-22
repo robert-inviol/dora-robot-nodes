@@ -1,8 +1,27 @@
-//! Cutting an object's view out of a keyframe's colour image.
+//! Cutting an object's view out of a keyframe's colour image: the box around its mask, grown by a margin, with the
+//! pixels outside the mask dimmed or blanked so the object stands out.
 
 use eyre::{bail, eyre, Result};
 use jpeg_decoder::PixelFormat;
 use jpeg_encoder::{ColorType, Encoder};
+use serde::Deserialize;
+
+/// Dimmed surroundings keep this share of their brightness: dark enough that the object stands out, light enough
+/// that what it stands on and its scale stay readable.
+const DIMMED_BRIGHTNESS: f32 = 0.35;
+
+/// The grey a blank background is filled with, neutral so it suggests no colour of its own.
+const BLANK_GREY: u8 = 128;
+
+/// What a view shows around the object's mask.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CropBackground {
+    /// The surroundings at reduced brightness.
+    Dimmed,
+    /// Neutral grey in place of the surroundings.
+    Blank,
+}
 
 /// A rectangle of pixels: columns `left..right`, rows `top..bottom`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -37,6 +56,19 @@ impl PixelBox {
     pub fn height(&self) -> usize {
         self.bottom - self.top
     }
+
+    /// The box grown on every side by `margin` times its own width or height, kept inside a `width` by `height`
+    /// image.
+    pub fn grown(&self, margin: f32, width: usize, height: usize) -> PixelBox {
+        let across = (self.width() as f32 * margin).round() as usize;
+        let down = (self.height() as f32 * margin).round() as usize;
+        PixelBox {
+            left: self.left.saturating_sub(across),
+            top: self.top.saturating_sub(down),
+            right: (self.right + across).min(width),
+            bottom: (self.bottom + down).min(height),
+        }
+    }
 }
 
 /// Decoded colour, three bytes per pixel, row major.
@@ -61,11 +93,21 @@ impl RgbImage {
         Ok(RgbImage { width, height, pixels })
     }
 
-    pub fn crop_jpeg(&self, area: PixelBox, quality: u8) -> Result<Vec<u8>> {
+    /// The area as a JPEG, the pixels for which `in_object` (given a row-major pixel index of the whole image) is
+    /// true as they are and the rest shown as `background` says.
+    pub fn isolate_jpeg(&self, area: PixelBox, in_object: impl Fn(usize) -> bool, background: CropBackground, quality: u8) -> Result<Vec<u8>> {
         assert!(area.right <= self.width && area.bottom <= self.height, "{area:?} is outside {}x{}", self.width, self.height);
         let mut pixels = Vec::with_capacity(3 * area.width() * area.height());
         for row in area.top..area.bottom {
-            pixels.extend_from_slice(&self.pixels[3 * (row * self.width + area.left)..3 * (row * self.width + area.right)]);
+            for column in area.left..area.right {
+                let index = row * self.width + column;
+                let rgb = &self.pixels[3 * index..3 * index + 3];
+                match (in_object(index), background) {
+                    (true, _) => pixels.extend_from_slice(rgb),
+                    (false, CropBackground::Dimmed) => pixels.extend(rgb.iter().map(|&c| (c as f32 * DIMMED_BRIGHTNESS).round() as u8)),
+                    (false, CropBackground::Blank) => pixels.extend([BLANK_GREY; 3]),
+                }
+            }
         }
         encode_rgb_jpeg(area.width(), area.height(), &pixels, quality)
     }
@@ -89,15 +131,44 @@ mod tests {
         assert_eq!(found, PixelBox { left: 2, top: 1, right: 8, bottom: 4 });
     }
 
-    #[test]
-    fn a_crop_is_a_jpeg_of_the_box_size_and_colour() {
+    /// A 32x24 image, red on the left half and blue on the right, with every pixel of the left half in the object.
+    fn red_object_beside_blue() -> (RgbImage, impl Fn(usize) -> bool) {
         let (width, height) = (32, 24);
         let pixels: Vec<u8> = (0..width * height).flat_map(|i| if i % width < 16 { [200, 30, 30] } else { [30, 30, 200] }).collect();
         let image = RgbImage::decode(&encode_rgb_jpeg(width, height, &pixels, 95).unwrap(), width, height).unwrap();
-        let crop = image.crop_jpeg(PixelBox { left: 0, top: 4, right: 8, bottom: 20 }, 90).unwrap();
-        let back = RgbImage::decode(&crop, 8, 16).unwrap();
-        let centre = &back.pixels[3 * (8 * 8 + 4)..3 * (8 * 8 + 4) + 3];
-        assert!(centre[0] > 150 && centre[2] < 80, "{centre:?}");
+        (image, move |index: usize| index % width < 16)
+    }
+
+    fn pixel(image: &RgbImage, column: usize, row: usize) -> [u8; 3] {
+        let at = 3 * (row * image.width + column);
+        [image.pixels[at], image.pixels[at + 1], image.pixels[at + 2]]
+    }
+
+    #[test]
+    fn an_isolated_view_keeps_the_object_and_dims_its_surroundings() {
+        let (image, in_object) = red_object_beside_blue();
+        let view = image.isolate_jpeg(PixelBox { left: 8, top: 4, right: 24, bottom: 20 }, in_object, CropBackground::Dimmed, 95).unwrap();
+        let back = RgbImage::decode(&view, 16, 16).unwrap();
+        let object = pixel(&back, 3, 8);
+        assert!(object[0] > 170 && object[2] < 60, "the object keeps its colour: {object:?}");
+        let surroundings = pixel(&back, 12, 8);
+        assert!(surroundings[2] > 40 && surroundings[2] < 100 && surroundings[0] < 30, "the surroundings stay blue, dimmed: {surroundings:?}");
+    }
+
+    #[test]
+    fn a_blank_background_replaces_the_surroundings_with_grey() {
+        let (image, in_object) = red_object_beside_blue();
+        let view = image.isolate_jpeg(PixelBox { left: 8, top: 4, right: 24, bottom: 20 }, in_object, CropBackground::Blank, 95).unwrap();
+        let back = RgbImage::decode(&view, 16, 16).unwrap();
+        let surroundings = pixel(&back, 12, 8);
+        assert!(surroundings.iter().all(|&c| c.abs_diff(BLANK_GREY) < 10), "{surroundings:?}");
+    }
+
+    #[test]
+    fn a_grown_box_stays_inside_the_image() {
+        let mask_box = PixelBox { left: 2, top: 10, right: 12, bottom: 14 };
+        assert_eq!(mask_box.grown(0.5, 14, 100), PixelBox { left: 0, top: 8, right: 14, bottom: 16 });
+        assert_eq!(mask_box.grown(0.0, 14, 100), mask_box);
     }
 
     #[test]

@@ -103,8 +103,7 @@ YOLOv8 pose on a Hailo-8 (`dora-hailo-perception`'s `dora-hailo-pose`), odometry
 (`dora-depth-inertial-odometry`), the people placed in 3D in the odom frame (`dora-people-3d`), keyframes
 (`dora-keyframe-selector`) and posed depth frames (`dora-posed-depth`). It publishes `rig/people_tracks`,
 `rig/odom_pose`, `rig/keyframe`, `rig/imu`, `rig/calibration` and `rig/posed_depth` over `dora-zenoh-bridge`; only
-`rig/posed_depth` and `rig/people_tracks` may lose a message to a newer one. It also runs the LD06 lidar
-(`dora-serial-lidar`), whose `scan` stays on the camera's machine.
+`rig/posed_depth` and `rig/people_tracks` may lose a message to a newer one.
 
 On a Raspberry Pi 5 the node uses about 40% of one core with `model_input`, `depth`, `imu`, `calibration` and
 `color` on request listed; shrinking one frame into the model input takes about 5.3 ms. The keyframe selector uses

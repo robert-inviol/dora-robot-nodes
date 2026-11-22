@@ -279,7 +279,10 @@ impl ObjectMap {
                 return Ok(());
             }
         }
-        let crop_jpeg = colour.image()?.crop_jpeg(detection.mask_box, self.settings.crop.jpeg_quality)?;
+        let settings = &self.settings.crop;
+        let image = colour.image()?;
+        let area = detection.mask_box.grown(settings.context_margin, image.width, image.height);
+        let crop_jpeg = image.isolate_jpeg(area, |pixel| detection.shows(pixel), settings.background, settings.jpeg_quality)?;
         debug!(object = %object.id, quality, "best view replaced");
         object.best_view = Some(BestView { quality, crop_jpeg });
         object.crop_unsent = true;
@@ -435,6 +438,7 @@ mod tests {
     use glam::IVec3;
 
     use super::*;
+    use crate::cleaning::CleaningReport;
     use crate::crop::PixelBox;
 
     const SECOND_NS: i64 = 1_000_000_000;
@@ -512,7 +516,15 @@ mod tests {
 
     fn detection(label: &str, voxels: VoxelSet) -> Detection {
         let mask_box = PixelBox::around(4, [0usize, 5].into_iter()).expect("two pixels");
-        Detection { instance_index: 0, label: Label::new(label), score: 0.8, voxels, mask_box, mask_pixels: 2 }
+        Detection {
+            instance_index: 0,
+            label: Label::new(label),
+            score: 0.8,
+            voxels,
+            view_pixels: vec![0, 5],
+            mask_box,
+            cleaning: CleaningReport::default(),
+        }
     }
 
     #[test]

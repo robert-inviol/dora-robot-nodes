@@ -12,6 +12,10 @@
 //! `fake <model> after <other model> <step>` applies only to a reconciler prompt whose later answer is from the other
 //! model. A model with no script answers `echo: <message>`, or the text of `[fake:reply=<text>]` in its system prompt.
 //! `[fake:permission=<mode>]` in the system prompt sets the permission mode its init event reports.
+//!
+//! A user message of content blocks is read as its text blocks, each image block standing in the text as
+//! `<media type, N base64 characters>`. With `--json-schema`, the init event lists the `StructuredOutput` tool and every
+//! result carries `structured_output`: the JSON of `[fake:structured=<json>]` in the system prompt, or null.
 
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -259,6 +263,8 @@ struct Fake {
     session: String,
     permission_mode: String,
     reply: Option<String>,
+    /// Set when the process was given `--json-schema`: the structured output every result carries.
+    structured: Option<Value>,
     mcp: Option<McpServer>,
     running: Option<Running>,
 }
@@ -277,14 +283,18 @@ impl Fake {
             "usage": {"input_tokens": 2, "output_tokens": 5, "cache_read_input_tokens": 100, "cache_creation_input_tokens": 10},
             "total_cost_usd": 0.0001,
             "duration_ms": 5,
+            "structured_output": self.structured.clone(),
         }));
     }
 
     fn init(&self) {
-        let (tools, servers) = match &self.mcp {
+        let (mut tools, servers): (Vec<String>, Value) = match &self.mcp {
             Some(_) => (TOOLS.iter().map(|t| format!("mcp__world__{t}")).collect(), json!([{"name": "world", "status": "connected"}])),
             None => (Vec::new(), json!([])),
         };
+        if self.structured.is_some() {
+            tools.push("StructuredOutput".to_owned());
+        }
         emit(json!({
             "type": "system",
             "subtype": "init",
@@ -300,7 +310,23 @@ impl Fake {
 
     fn user_message(&mut self, message: &Value) {
         let uuid = message["uuid"].as_str().expect("the client sets a uuid").to_owned();
-        let text = message["message"]["content"].as_str().expect("text content").to_owned();
+        let content = &message["message"]["content"];
+        let text = match content.as_array() {
+            None => content.as_str().expect("text content").to_owned(),
+            Some(blocks) => blocks
+                .iter()
+                .map(|block| match block["type"].as_str() {
+                    Some("text") => block["text"].as_str().expect("a text block's text").to_owned(),
+                    Some("image") => format!(
+                        "<{}, {} base64 characters>",
+                        block["source"]["media_type"].as_str().expect("an image's media type"),
+                        block["source"]["data"].as_str().expect("an image's data").len()
+                    ),
+                    other => panic!("unexpected content block {other:?}"),
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        };
         self.init();
         emit(json!({"type": "stream_event", "event": {"type": "message_start", "message": {}}}));
         let mut steps = script(&text, &self.model);
@@ -417,6 +443,8 @@ fn main() {
         session: argument_after(&args, "--session-id").expect("the client sets --session-id"),
         permission_mode: directive(&prompt, "permission").unwrap_or_else(|| argument_after(&args, "--permission-mode").unwrap_or_default()),
         reply: directive(&prompt, "reply"),
+        structured: argument_after(&args, "--json-schema")
+            .map(|_| directive(&prompt, "structured").map_or(Value::Null, |json| serde_json::from_str(&json).expect("structured JSON"))),
         mcp: McpServer::from_arguments(&args),
         running: None,
         args,

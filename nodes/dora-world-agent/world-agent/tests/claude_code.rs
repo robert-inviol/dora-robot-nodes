@@ -6,14 +6,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::{claude, watchdog, WorkDir};
-use perception_wire::navigation::{QuestionId, RoomId};
+use perception_wire::navigation::{ObjectId, QuestionId, RoomId};
 use serde_json::Value;
 use world_agent::claude_code::{AskError, ClaudeCodeClient, DownReason};
 use world_agent::config::{AnswererRole, Effort, ModelName, SystemPrompt};
 use world_agent::identity::AgentRegistry;
 use world_agent::mcp::McpUrl;
-use world_agent::model::{AnswererId, Duty, ModelClient, ModelReply, Prompt};
-use world_agent::process::{Launcher, ProcessProfile, ToolAccess};
+use world_agent::model::{AnswererId, Duty, ModelClient, ModelReply, Prompt, PromptImage};
+use world_agent::process::{Launcher, ProcessProfile, ReplySchema, ReplyShape, ToolAccess};
 
 const MODEL: &str = "test-model";
 const ANSWER: Duty = Duty::Answer { question: QuestionId(1), answerer: AnswererId(0), role: AnswererRole::Fast };
@@ -25,6 +25,10 @@ struct Harness {
 
 impl Harness {
     fn start(system_prompt: &str, tools: ToolAccess) -> Self {
+        Self::start_with(system_prompt, tools, ReplyShape::FreeText)
+    }
+
+    fn start_with(system_prompt: &str, tools: ToolAccess, reply: ReplyShape) -> Self {
         let work_dir = WorkDir::new();
         std::fs::create_dir_all(&work_dir.0).unwrap();
         let profile = ProcessProfile {
@@ -32,6 +36,7 @@ impl Harness {
             effort: Effort::Low,
             system_prompt: SystemPrompt(system_prompt.to_owned()),
             tools,
+            reply,
         };
         let registry = Arc::new(AgentRegistry::default());
         let launcher = Launcher::new(claude(&work_dir.0), profile, registry.clone(), watchdog().startup);
@@ -43,7 +48,7 @@ impl Harness {
     }
 
     async fn ask(&self, step: &str) -> Result<ModelReply, AskError> {
-        let prompt = Prompt(format!("Hello.\nfake {MODEL} {step}"));
+        let prompt = Prompt::text(format!("Hello.\nfake {MODEL} {step}"));
         tokio::time::timeout(Duration::from_secs(20), self.client.ask(ANSWER, prompt)).await.expect("the call ends")
     }
 
@@ -185,7 +190,43 @@ async fn a_process_started_with_the_wrong_permission_mode_takes_the_client_down(
 #[tokio::test]
 async fn a_tool_call_from_a_process_without_tools_fails_the_call() {
     let harness = Harness::start("You name rooms.", ToolAccess::None);
-    let prompt = Prompt(format!("fake {MODEL} call find {{}}"));
+    let prompt = Prompt::text(format!("fake {MODEL} call find {{}}"));
     let error = harness.client.ask(Duty::NameRoom { room: RoomId(1) }, prompt).await.unwrap_err();
     assert!(error.to_string().contains("this process has no MCP server"), "{error}");
+}
+
+fn describing(system_prompt: &str) -> Harness {
+    let schema = ReplySchema(serde_json::json!({"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}));
+    Harness::start_with(system_prompt, ToolAccess::None, ReplyShape::Structured(schema))
+}
+
+async fn describe(harness: &Harness) -> Result<ModelReply, AskError> {
+    let prompt = Prompt::about_image(PromptImage::Jpeg(vec![0xFF, 0xD8, 0xFF]), "Describe this object.");
+    let call = harness.client.ask(Duty::DescribeObject { object: ObjectId(5) }, prompt);
+    tokio::time::timeout(Duration::from_secs(20), call).await.expect("the call ends")
+}
+
+#[tokio::test]
+async fn an_image_prompt_to_a_client_with_a_schema_gets_the_structured_reply() {
+    let harness = describing(r#"You describe objects. [fake:structured={"name": "mug"}]"#);
+    let reply = describe(&harness).await.unwrap();
+    assert_eq!(reply.structured, Some(serde_json::json!({"name": "mug"})));
+    assert_eq!(reply.text, "echo: <image/jpeg, 4 base64 characters>\nDescribe this object.", "the image goes first, as a block");
+}
+
+#[tokio::test]
+async fn a_client_with_a_schema_is_given_it_on_the_command_line() {
+    let harness = describing(r#"You describe objects. [fake:structured={"name": "mug"}]"#);
+    let prompt = Prompt::text(format!("fake {MODEL} argv"));
+    let reply = harness.client.ask(Duty::DescribeObject { object: ObjectId(5) }, prompt).await.unwrap();
+    let report: Value = serde_json::from_str(&reply.text).unwrap();
+    let schema: Value = serde_json::from_str(after(&arguments(&report), "--json-schema")).unwrap();
+    assert_eq!(schema["required"], serde_json::json!(["name"]));
+}
+
+#[tokio::test]
+async fn a_reply_without_the_structured_output_a_schema_asks_for_is_an_error() {
+    let harness = describing("You describe objects.");
+    let error = describe(&harness).await.unwrap_err();
+    assert!(matches!(&error, AskError::Protocol(message) if message.contains("no structured output")), "{error}");
 }

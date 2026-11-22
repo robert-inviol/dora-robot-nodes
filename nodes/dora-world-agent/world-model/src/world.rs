@@ -11,6 +11,8 @@ use std::str::FromStr;
 use perception_wire::navigation::{GoalTarget, MapPose, MapVersion, ObjectId, PlaceId, RoomId, TrackId, UnixNanos};
 use serde::Serialize;
 
+use crate::meaning::{MatchScores, ObjectCaption, QueryEmbedding};
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 #[serde(transparent)]
 pub struct RoomName(pub String);
@@ -301,8 +303,10 @@ pub struct WorldSnapshot {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct FindQuery {
-    /// Free text, matched against labels and captions.
+    /// Free text, its words matched against labels and descriptions.
     pub text: Option<String>,
+    /// The text's embedding, compared with every object's description and view embeddings of the same model.
+    pub meaning: Option<QueryEmbedding>,
     pub label: Option<String>,
     pub room: Option<RoomName>,
     pub near: Option<Point>,
@@ -319,8 +323,10 @@ pub struct FoundObject {
     pub distance_from_robot_m: f32,
     #[serde(serialize_with = "serialize_unix_nanos")]
     pub last_seen: UnixNanos,
-    /// 0 to 1, higher is a better match.
+    /// Higher is a better match: `matched.score_by_meaning()` for a query with an embedding, otherwise
+    /// `matched.score_by_words()`.
     pub score: f32,
+    pub matched: MatchScores,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -353,7 +359,8 @@ impl fmt::Debug for PngImage {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ObjectDescription {
     pub summary: ObjectSummary,
-    pub caption: Option<String>,
+    /// The description of its best view, once a vision model has given one.
+    pub caption: Option<ObjectCaption>,
     pub relations: Vec<Relation>,
     pub history: Vec<LocationInterval>,
     /// The best views of the object, cropped from keyframes.

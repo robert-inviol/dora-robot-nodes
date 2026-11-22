@@ -215,7 +215,7 @@ impl<W: WorldModel, C: ModelClient, G: GoalSink> QuestionDesk<W, C, G> {
         let id = question.question_id;
         let deadline = tokio::time::sleep(self.settings.deadline);
         tokio::pin!(deadline);
-        let prompt = Prompt(compose_question(digest, &question.text));
+        let prompt = Prompt::text(compose_question(digest, &question.text));
         let mut pending: JoinSet<AnswerResult<C::Error>> = JoinSet::new();
         for answerer in &self.answerers {
             let (client, prompt) = (answerer.client.clone(), prompt.clone());

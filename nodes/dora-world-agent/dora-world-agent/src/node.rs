@@ -4,7 +4,13 @@
 use std::sync::Arc;
 
 use dora_node_api::arrow::array::Array;
-use eyre::{Result, WrapErr};
+use eyre::{eyre, Result, WrapErr};
+use object_descriptions::describer::{describer_profile, ClaudeDescriber};
+use object_descriptions::embedder::QueriesOf;
+use object_descriptions::gemini::{GeminiApiKey, GeminiEmbedder, GEMINI_API_KEY_VARIABLE};
+use object_descriptions::service::{DescriptionSettings, ObjectDescriptions};
+use world_agent::claude_code::ClaudeCodeClient;
+use world_agent::search::QueryEmbedder;
 use perception_wire::navigation::{decode_goal_status, decode_spatial_query, NavGoal, SpatialAnswer};
 use tokio::sync::mpsc;
 use world_agent::clock;
@@ -48,21 +54,46 @@ pub struct Outputs {
     pub goals: mpsc::UnboundedReceiver<SentGoal>,
 }
 
+/// The describer of object views, when the settings have `[object_descriptions]`.
+type Descriptions<W> = ObjectDescriptions<ClaudeDescriber<ClaudeCodeClient>, GeminiEmbedder, W>;
+
 pub struct SpatialNode<W> {
     world: Arc<W>,
     service: SpatialService<W, ChannelGoalSink, W>,
+    descriptions: Option<Descriptions<W>>,
     authors: GoalAuthors,
 }
 
 impl<W: WorldStore + Clone> SpatialNode<W> {
-    /// Starts the spatial agent on the world; its answers and goals come out of `Outputs`.
-    pub async fn start(config: &SpatialConfig, world: W) -> Result<(Self, Outputs)> {
+    /// Starts the spatial agent on the world; its answers and goals come out of `Outputs`. With
+    /// `[object_descriptions]` in the settings, object views are described and embedded with the Gemini key, which
+    /// must then be given, and `find` searches by meaning.
+    pub async fn start(config: &SpatialConfig, world: W, gemini_key: Option<GeminiApiKey>) -> Result<(Self, Outputs)> {
         let (goal_sender, goals) = mpsc::unbounded_channel();
         let (answer_sender, answers) = mpsc::unbounded_channel();
         let world = Arc::new(world);
-        let service =
-            SpatialService::start(config, world.clone(), ChannelGoalSink(goal_sender), world.as_ref().clone(), answer_sender).await?;
-        Ok((Self { world, service, authors: GoalAuthors::of(config) }, Outputs { answers, goals }))
+        let embedder = match (&config.object_descriptions, gemini_key) {
+            (Some(descriptions), Some(key)) => Some(Arc::new(GeminiEmbedder::new(key, &descriptions.embedding).wrap_err("starting the Gemini client")?)),
+            (Some(_), None) => return Err(eyre!("the settings have [object_descriptions] but {GEMINI_API_KEY_VARIABLE} is not set")),
+            (None, Some(_)) => {
+                tracing::info!("{GEMINI_API_KEY_VARIABLE} is set, but the settings have no [object_descriptions]: objects are not described");
+                None
+            }
+            (None, None) => None,
+        };
+        let query_embedder = embedder.clone().map(|e| Arc::new(QueriesOf(e)) as Arc<dyn QueryEmbedder>);
+        let mut service =
+            SpatialService::start(config, world.clone(), ChannelGoalSink(goal_sender), world.as_ref().clone(), answer_sender, query_embedder)
+                .await?;
+        let descriptions = match (&config.object_descriptions, embedder) {
+            (Some(settings), Some(embedder)) => {
+                let describer = ClaudeDescriber::new(service.client(describer_profile(settings)), settings.describe_timeout);
+                tracing::info!(describer = %settings.describer.model, embedding = %settings.embedding.model, "object views are described and embedded");
+                Some(ObjectDescriptions::start(describer, embedder, world.clone(), DescriptionSettings::of(settings)))
+            }
+            _ => None,
+        };
+        Ok((Self { world, service, descriptions, authors: GoalAuthors::of(config) }, Outputs { answers, goals }))
     }
 
     /// Handles one dora input: a question starts answering, everything else goes to the world store.
@@ -80,8 +111,14 @@ impl<W: WorldStore + Clone> SpatialNode<W> {
                 Err(error) => return Err(error.into()),
             }
         }
-        if self.world.ingest(input, data)? == Ingested::RoomsChanged {
-            self.service.rooms_changed(self.world.rooms().await?);
+        match self.world.ingest(input, data)? {
+            Ingested::Recorded => {}
+            Ingested::RoomsChanged => self.service.rooms_changed(self.world.rooms().await?),
+            Ingested::ObjectUpdated(update) => {
+                if let Some(descriptions) = &self.descriptions {
+                    descriptions.offer(&update);
+                }
+            }
         }
         Ok(())
     }
@@ -100,6 +137,9 @@ impl<W: WorldStore + Clone> SpatialNode<W> {
 
     /// Stops every question in flight and every claude process, then commits what the store has pending.
     pub async fn shutdown(self) -> Result<()> {
+        if let Some(descriptions) = &self.descriptions {
+            descriptions.shutdown().await;
+        }
         self.service.shutdown().await;
         self.world.close()
     }

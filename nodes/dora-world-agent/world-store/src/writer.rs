@@ -17,8 +17,8 @@ use crate::inputs::{Arrivals, Clock};
 use crate::map::{parse_unnamed_room, MapState, UNMAPPED_ROOM};
 use crate::relations::{relation, Solid, NEXT_TO_M};
 use crate::types::{
-    Caption, FloorVelocity, OccupancyGrid, InputSource, IssuedGoal, JpegImage, ObjectChange, ObjectUpdate, PersonObservation, RobotPoseSample,
-    RoomId, Topology,
+    DescribedView, FloorVelocity, OccupancyGrid, InputSource, IssuedGoal, JpegImage, ObjectChange, ObjectEmbedding, ObjectUpdate,
+    PersonObservation, RobotPoseSample, RoomId, Topology,
 };
 
 /// How many crops of each object the store keeps, best first.
@@ -67,7 +67,8 @@ pub struct WriterStats {
 
 enum Command {
     Object(Box<ObjectUpdate>),
-    Caption(ObjectId, Caption, UnixNanos),
+    Description(ObjectId, Box<DescribedView>, UnixNanos),
+    Embedding(ObjectId, Box<ObjectEmbedding>, UnixNanos),
     Topology(Box<Topology>),
     OccupancyGrid(Box<OccupancyGrid>),
     RobotPose(RobotPoseSample),
@@ -147,8 +148,15 @@ impl WorldWriter {
         self.send(Command::Object(Box::new(update)))
     }
 
-    pub fn set_caption(&self, object: ObjectId, caption: Caption) -> Result<(), IngestError> {
-        self.send(Command::Caption(object, caption, self.shared.clock.now()))
+    /// Keeps a description of an object, unless the one kept is of a view from a later keyframe.
+    pub fn set_description(&self, object: ObjectId, described: DescribedView) -> Result<(), IngestError> {
+        self.send(Command::Description(object, Box::new(described), self.shared.clock.now()))
+    }
+
+    /// Keeps an embedding of an object in place of the one from the same source, unless that one is of a view from a
+    /// later keyframe.
+    pub fn set_embedding(&self, object: ObjectId, embedding: ObjectEmbedding) -> Result<(), IngestError> {
+        self.send(Command::Embedding(object, Box::new(embedding), self.shared.clock.now()))
     }
 
     pub fn set_topology(&self, topology: Topology) -> Result<(), IngestError> {
@@ -318,7 +326,8 @@ type Applied = rusqlite::Result<Result<(), Rejection>>;
 fn apply(connection: &Connection, map: &RwLock<MapState>, command: Command, now: UnixNanos, record_people_every: Duration) -> Applied {
     match command {
         Command::Object(update) => apply_object(connection, map, &update, now),
-        Command::Caption(object, caption, at) => set_caption(connection, object, &caption, at),
+        Command::Description(object, described, at) => set_description(connection, object, &described, at),
+        Command::Embedding(object, embedding, at) => set_embedding(connection, object, &embedding, at),
         Command::Topology(topology) => apply_topology(connection, map, *topology, now),
         Command::OccupancyGrid(occupancy_grid) => apply_occupancy_grid(connection, map, *occupancy_grid, now),
         Command::RobotPose(sample) => record_robot_pose(connection, map, sample, now),
@@ -386,6 +395,9 @@ fn apply_object(connection: &Connection, map: &RwLock<MapState>, update: &Object
             params![kind, captured, earliest, id.0 as i64, other.map(|o| o.0 as i64), update.label, room, from_room],
         )
     };
+    if !matches!(update.change, ObjectChange::Disappeared | ObjectChange::MergedInto(_)) {
+        note_label(connection, id, &update.label, captured)?;
+    }
     match (update.change, current) {
         (ObjectChange::Appeared, _) => {
             insert_row(connection, update, room)?;
@@ -409,6 +421,10 @@ fn apply_object(connection: &Connection, map: &RwLock<MapState>, update: &Object
             return Ok(Ok(()));
         }
         (ObjectChange::MergedInto(into), Some(current)) => {
+            connection.execute(
+                "INSERT OR IGNORE INTO object_label SELECT ?1, label, first_reported_unix_ns FROM object_label WHERE object_id = ?2",
+                params![into.0 as i64, id.0 as i64],
+            )?;
             close_row(connection, current.history_id, captured)?;
             forget_relations(connection, id)?;
             event("merged", current.last_seen, current.room, None, Some(into))?;
@@ -542,13 +558,51 @@ fn relate(connection: &Connection, object: ObjectId, at: UnixNanos) -> rusqlite:
     Ok(())
 }
 
-fn set_caption(connection: &Connection, object: ObjectId, caption: &Caption, at: UnixNanos) -> Applied {
-    let known: bool = connection.query_row("SELECT EXISTS (SELECT 1 FROM object WHERE object_id = ?1)", [object.0 as i64], |r| r.get(0))?;
-    if !known {
+fn is_known_object(connection: &Connection, object: ObjectId) -> rusqlite::Result<bool> {
+    connection.query_row("SELECT EXISTS (SELECT 1 FROM object WHERE object_id = ?1)", [object.0 as i64], |r| r.get(0))
+}
+
+fn set_description(connection: &Connection, object: ObjectId, described: &DescribedView, at: UnixNanos) -> Applied {
+    if !is_known_object(connection, object)? {
         return Ok(Err(Rejection::UnknownObject(object)));
     }
-    connection.execute("INSERT OR REPLACE INTO object_caption VALUES (?1, ?2, ?3)", params![object.0 as i64, caption.0, at.0])?;
+    let caption = &described.caption;
+    connection.execute(
+        "INSERT INTO object_caption VALUES (:object_id, :name, :category, :description, :colour, :material, :frame, :model, :at)
+         ON CONFLICT (object_id) DO UPDATE SET name = excluded.name, category = excluded.category,
+             description = excluded.description, colour = excluded.colour, material = excluded.material,
+             view_frame_id = excluded.view_frame_id, model = excluded.model, captioned_unix_ns = excluded.captioned_unix_ns
+         WHERE excluded.view_frame_id >= object_caption.view_frame_id",
+        named_params! {
+            ":object_id": object.0 as i64, ":name": caption.name, ":category": caption.category,
+            ":description": caption.description, ":colour": caption.colour, ":material": caption.material,
+            ":frame": described.view_frame.0 as i64, ":model": described.model.0, ":at": at.0,
+        },
+    )?;
     Ok(Ok(()))
+}
+
+fn set_embedding(connection: &Connection, object: ObjectId, embedding: &ObjectEmbedding, at: UnixNanos) -> Applied {
+    if !is_known_object(connection, object)? {
+        return Ok(Err(Rejection::UnknownObject(object)));
+    }
+    connection.execute(
+        "INSERT INTO object_embedding VALUES (:object_id, :source, :model, :dimensions, :vector, :frame, :at)
+         ON CONFLICT (object_id, source) DO UPDATE SET model = excluded.model, dimensions = excluded.dimensions,
+             vector = excluded.vector, view_frame_id = excluded.view_frame_id, embedded_unix_ns = excluded.embedded_unix_ns
+         WHERE excluded.view_frame_id >= object_embedding.view_frame_id",
+        named_params! {
+            ":object_id": object.0 as i64, ":source": embedding.source.as_str(), ":model": embedding.model.0,
+            ":dimensions": embedding.vector.dimensions() as i64, ":vector": embedding.vector.to_le_bytes(),
+            ":frame": embedding.view_frame.0 as i64, ":at": at.0,
+        },
+    )?;
+    Ok(Ok(()))
+}
+
+fn note_label(connection: &Connection, object: ObjectId, label: &str, at: i64) -> rusqlite::Result<()> {
+    connection.execute("INSERT OR IGNORE INTO object_label VALUES (?1, ?2, ?3)", params![object.0 as i64, label, at])?;
+    Ok(())
 }
 
 fn apply_topology(connection: &Connection, map: &RwLock<MapState>, topology: Topology, now: UnixNanos) -> Applied {

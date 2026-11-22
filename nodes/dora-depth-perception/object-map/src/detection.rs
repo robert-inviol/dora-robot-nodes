@@ -1,11 +1,16 @@
-//! One keyframe's masks lifted into the map as voxel sets.
+//! One keyframe's masks lifted into the map as voxel sets. Each mask's pixels with depth are lifted into the
+//! keyframe's floor frame and cleaned in 3D (`cleaning`): flying pixels and noise are dropped, and of the clusters
+//! left only the largest is kept. The kept points within the eroded mask become the detection's voxels; the mask's
+//! pixels less those whose points were dropped become the mask its view is cut with.
 
-use depth_perception::{object_footprint, DepthImage, FloorFrame, ObjectFootprint, ObjectMask, RangeLimits};
-use glam::{Vec2, Vec3};
+use depth_perception::objects::eroded;
+use depth_perception::{FloorFrame, ObjectMask, RangeLimits};
+use glam::Vec3;
 use perception_wire::NO_INSTANCE;
 use rayon::prelude::*;
-use tracing::debug;
+use tracing::{debug, info};
 
+use crate::cleaning::{clean, CleaningReport};
 use crate::crop::PixelBox;
 use crate::label::Label;
 use crate::settings::DetectionSettings;
@@ -20,14 +25,22 @@ pub struct Detection {
     pub label: Label,
     pub score: f32,
     pub voxels: VoxelSet,
+    /// The pixels of the object's view, row-major indices in ascending order: the mask less the pixels whose points
+    /// cleaning dropped.
+    pub view_pixels: Vec<usize>,
     pub mask_box: PixelBox,
-    pub mask_pixels: usize,
+    pub cleaning: CleaningReport,
 }
 
 impl Detection {
     /// How good a view of the object this mask gives: a confident mask that covers many pixels.
     pub fn view_quality(&self) -> f32 {
-        self.score * self.mask_pixels as f32
+        self.score * self.view_pixels.len() as f32
+    }
+
+    /// Whether a pixel, by its row-major index, shows the object.
+    pub fn shows(&self, pixel: usize) -> bool {
+        self.view_pixels.binary_search(&pixel).is_ok()
     }
 }
 
@@ -72,91 +85,42 @@ fn place_mask(
         return None;
     }
     let pixels: Vec<bool> = instance_masks.instance_ids.iter().map(|&id| id != NO_INSTANCE && id as u16 == instance_index).collect();
-    let mask_pixels = pixels.iter().filter(|&&p| p).count();
-    let mask_box = PixelBox::around(keyframe.width, pixels.iter().enumerate().filter(|(_, &p)| p).map(|(i, _)| i))?;
+    let lifted: Vec<(usize, Vec3)> = pixels
+        .iter()
+        .enumerate()
+        .filter(|(index, &in_mask)| in_mask && RangeLimits::D455.contains(geometry.depth_m[*index]))
+        .map(|(index, _)| {
+            let (column, row) = ((index % keyframe.width) as f32, (index / keyframe.width) as f32);
+            (index, geometry.floor.to_floor(keyframe.intrinsics.deproject(column, row, geometry.depth_m[index])))
+        })
+        .collect();
+    let points: Vec<Vec3> = lifted.iter().map(|(_, point)| *point).collect();
+    let (keep, cleaning) = clean(&points, &settings.cleaning);
+    for points in cleaning.large_dropped_clusters(settings.cleaning.large_cluster_share) {
+        let share = points as f32 / cleaning.points as f32;
+        info!(frame_id, %label, points, share, mask_points = cleaning.points, "a large cluster under the mask was dropped: possibly a second object");
+    }
+    let mut dropped = vec![false; pixels.len()];
+    for ((index, _), kept) in lifted.iter().zip(&keep) {
+        dropped[*index] = !kept;
+    }
+    let view_pixels: Vec<usize> = (0..pixels.len()).filter(|&index| pixels[index] && !dropped[index]).collect();
+    let mask_box = PixelBox::around(keyframe.width, view_pixels.iter().copied())?;
     let mask = ObjectMask { width: keyframe.width, height: keyframe.height, pixels: &pixels };
-    let depth = DepthImage::new(keyframe.width, keyframe.height, &geometry.depth_m);
-    let Some(footprint) =
-        object_footprint(&mask, &depth, &keyframe.intrinsics, &geometry.floor, RangeLimits::D455, &settings.footprint())
-    else {
-        debug!(frame_id, %label, mask_pixels, "mask ignored: too few points with depth on the object's surface");
+    let mut inside = vec![false; pixels.len()];
+    for index in eroded(&mask, settings.erosion_px) {
+        inside[index] = true;
+    }
+    let surface: Vec<Vec3> = lifted.iter().zip(&keep).filter(|((index, _), &kept)| kept && inside[*index]).map(|((_, point), _)| *point).collect();
+    if surface.len() < settings.min_points {
+        debug!(frame_id, %label, points = surface.len(), ?cleaning, "mask ignored: too few points on the object's surface");
         return None;
-    };
-    let voxels = surface_voxels(frame, geometry, grid, &pixels, mask_box, &footprint);
+    }
+    let voxels: VoxelSet = surface.iter().map(|&point| grid.cell(frame.pose.apply(point))).collect();
     if voxels.len() < settings.min_voxels {
         debug!(frame_id, %label, voxels = voxels.len(), "mask ignored: too few voxels");
         return None;
     }
-    Some(Detection { instance_index, label, score, voxels, mask_box, mask_pixels })
+    Some(Detection { instance_index, label, score, voxels, view_pixels, mask_box, cleaning })
 }
 
-/// The map cells of the mask's points that lie within the object's footprint rectangle and height band, which
-/// leaves out background seen through or around the mask.
-fn surface_voxels(
-    frame: &ObservedFrame,
-    geometry: &FrameGeometry,
-    grid: VoxelGrid,
-    pixels: &[bool],
-    mask_box: PixelBox,
-    footprint: &ObjectFootprint,
-) -> VoxelSet {
-    let keyframe = &frame.keyframe;
-    let slack_m = grid.size_m / 2.0;
-    let rectangle = Rectangle::new(&footprint.corners_m, slack_m);
-    let band = (footprint.top_above_camera_m - footprint.height_m - slack_m)..=(footprint.top_above_camera_m + slack_m);
-    let mut voxels = VoxelSet::default();
-    for row in mask_box.top..mask_box.bottom {
-        for column in mask_box.left..mask_box.right {
-            let index = row * keyframe.width + column;
-            let depth_m = geometry.depth_m[index];
-            if !pixels[index] || !RangeLimits::D455.contains(depth_m) {
-                continue;
-            }
-            let point: Vec3 = geometry.floor.to_floor(keyframe.intrinsics.deproject(column as f32, row as f32, depth_m));
-            if band.contains(&point.z) && rectangle.contains(point.truncate()) {
-                voxels.insert(grid.cell(frame.pose.apply(point)));
-            }
-        }
-    }
-    voxels
-}
-
-/// A rectangle given by four corners in order, grown by a slack on every side.
-struct Rectangle {
-    origin: Vec2,
-    axes: [Vec2; 2],
-    lengths: [f32; 2],
-    slack_m: f32,
-}
-
-impl Rectangle {
-    fn new(corners: &[Vec2; 4], slack_m: f32) -> Rectangle {
-        let sides = [corners[1] - corners[0], corners[3] - corners[0]];
-        Rectangle {
-            origin: corners[0],
-            axes: sides.map(|s| s.normalize_or_zero()),
-            lengths: sides.map(|s| s.length()),
-            slack_m,
-        }
-    }
-
-    fn contains(&self, point: Vec2) -> bool {
-        let offset = point - self.origin;
-        (0..2).all(|k| (-self.slack_m..=self.lengths[k] + self.slack_m).contains(&offset.dot(self.axes[k])))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_rectangle_holds_points_within_its_slack() {
-        let corners = [Vec2::new(0.0, 0.0), Vec2::new(2.0, 0.0), Vec2::new(2.0, 1.0), Vec2::new(0.0, 1.0)];
-        let rectangle = Rectangle::new(&corners, 0.1);
-        assert!(rectangle.contains(Vec2::new(1.0, 0.5)));
-        assert!(rectangle.contains(Vec2::new(2.05, -0.05)));
-        assert!(!rectangle.contains(Vec2::new(2.2, 0.5)));
-        assert!(!rectangle.contains(Vec2::new(1.0, 1.2)));
-    }
-}

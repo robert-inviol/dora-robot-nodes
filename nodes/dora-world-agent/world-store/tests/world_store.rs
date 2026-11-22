@@ -10,11 +10,11 @@ use perception_wire::navigation::{
     TrackId, UnixNanos,
 };
 use world_model::{
-    ChangeKind, EntityRef, FindQuery, Joint, Landmark, Point, ReadOnlySql, RoomName, Size, SqlValue, TrackLiveness, ViewKind,
-    ViewRequest, WorldError, WorldModel,
+    ChangeKind, Embedding, EmbeddingModel, EntityRef, FindQuery, Joint, Landmark, ObjectCaption, Point, QueryEmbedding, ReadOnlySql,
+    RoomName, Size, SqlValue, TrackLiveness, ViewKind, ViewRequest, WorldError, WorldModel,
 };
 use world_store::{
-    AgentName, Caption, ClearanceMm, Clock, DoorwayId, DoorwaySpan, FrameId, OccupancyGrid, HeightBand, IngestError, IssuedGoal,
+    AgentName, ClearanceMm, DescribedView, EmbeddingSource, ObjectEmbedding, Clock, DoorwayId, DoorwaySpan, FrameId, OccupancyGrid, HeightBand, IngestError, IssuedGoal,
     JpegImage, ManualClock, ModelName, ObjectChange, ObjectUpdate, OpenError, PlaceEdge, PlaceNode, Position3, Footprint,
     FloorVelocity, JointInMap, PersonObservation, Rejection, RobotPoseSample, RoomId, RoomShape, StoreConfig, Topology,
     WorldStore, WorldWriter,
@@ -215,6 +215,21 @@ fn config(dir: &Path) -> (StoreConfig, ManualClock) {
     (config, clock)
 }
 
+/// The furniture's caption as a vision model's description of the view from keyframe `frame`.
+fn described(f: &Furniture, frame: FrameId) -> DescribedView {
+    DescribedView {
+        caption: ObjectCaption {
+            name: f.label.to_owned(),
+            category: "furniture".to_owned(),
+            description: f.caption.to_owned(),
+            colour: String::new(),
+            material: String::new(),
+        },
+        view_frame: frame,
+        model: ModelName("claude-haiku-5-5".to_owned()),
+    }
+}
+
 fn seed(writer: &WorldWriter) {
     writer.set_topology(topology()).unwrap();
     for &(id, name, _) in &ROOMS {
@@ -224,7 +239,7 @@ fn seed(writer: &WorldWriter) {
     for f in &FURNITURE {
         let appeared = if f.id == 51 { ago(300) } else { ago(86_400) };
         writer.apply_object_update(update(f, ObjectChange::Appeared, f.at, appeared)).unwrap();
-        writer.set_caption(ObjectId(f.id), Caption(f.caption.to_owned())).unwrap();
+        writer.set_description(ObjectId(f.id), described(f, FrameId(1))).unwrap();
     }
     for f in FURNITURE.iter().filter(|f| ![21, 51].contains(&f.id)) {
         writer.apply_object_update(update(f, ObjectChange::Updated, f.at, ago(last_seen_ago(f.id)))).unwrap();
@@ -273,6 +288,15 @@ async fn find_ranks_text_matches_and_filters_by_room() {
     assert_eq!(ids(&chairs), vec![ObjectId(44), ObjectId(43)]);
     let error = store.find(FindQuery { room: Some(room("garage")), ..FindQuery::default() }).await.unwrap_err();
     assert_eq!(error, WorldError::UnknownRoom(room("garage")));
+}
+
+#[tokio::test]
+async fn find_matches_whole_words_only() {
+    let House { store, _dir, .. } = house();
+    let chairs = store.find(FindQuery { text: Some("chair".to_owned()), ..FindQuery::default() }).await.unwrap();
+    assert_eq!(ids(&chairs), vec![ObjectId(44), ObjectId(43)], "the armchair does not hold the word chair");
+    let wood = store.find(FindQuery { text: Some("wood".to_owned()), ..FindQuery::default() }).await.unwrap();
+    assert!(wood.is_empty(), "wood is not wooden: {wood:?}");
 }
 
 #[tokio::test]
@@ -388,7 +412,7 @@ async fn a_move_keeps_where_the_object_stood_before() {
 async fn describing_an_object_gives_its_caption_relations_and_views() {
     let House { store, _dir, .. } = house();
     let mug = store.describe_object(ObjectId(51)).await.unwrap();
-    assert_eq!(mug.caption.as_deref(), Some("a blue mug"));
+    assert_eq!(mug.caption.map(|c| c.description).as_deref(), Some("a blue mug"));
     assert_eq!(mug.relations.iter().map(|r| (r.relation.as_str(), r.other)).collect::<Vec<_>>(), vec![("on", ObjectId(42))]);
     assert!(mug.views.is_empty());
     let table = store.describe_object(ObjectId(42)).await.unwrap();
@@ -815,4 +839,129 @@ fn a_corrupt_database_fails_its_integrity_check_on_open() {
         Err(other) => panic!("expected an integrity failure, got {other}"),
         Ok(_) => panic!("a corrupt database opened"),
     }
+}
+
+const EMBEDDING_MODEL: &str = "gemini-embedding-2";
+
+fn vector(values: &[f32]) -> Embedding {
+    Embedding::new(values.to_vec()).unwrap()
+}
+
+fn embedding(source: EmbeddingSource, values: &[f32], frame: u64) -> ObjectEmbedding {
+    ObjectEmbedding { source, model: EmbeddingModel(EMBEDDING_MODEL.to_owned()), vector: vector(values), view_frame: FrameId(frame) }
+}
+
+fn meaning(values: &[f32]) -> Option<QueryEmbedding> {
+    Some(QueryEmbedding { model: EmbeddingModel(EMBEDDING_MODEL.to_owned()), vector: vector(values) })
+}
+
+#[tokio::test]
+async fn find_ranks_an_object_close_in_meaning_above_one_that_only_shares_a_word() {
+    let House { store, writer, _dir, .. } = house();
+    writer.set_embedding(ObjectId(12), embedding(EmbeddingSource::Description, &[1.0, 0.1, 0.0], 2)).unwrap();
+    for chair in [43, 44] {
+        writer.set_embedding(ObjectId(chair), embedding(EmbeddingSource::Description, &[0.0, 1.0, 0.0], 2)).unwrap();
+        writer.set_embedding(ObjectId(chair), embedding(EmbeddingSource::View, &[0.0, 0.0, 1.0], 2)).unwrap();
+    }
+    writer.flush().unwrap();
+
+    let found = store.find(FindQuery { text: Some("chair".to_owned()), meaning: meaning(&[1.0, 0.0, 0.0]), ..FindQuery::default() }).await.unwrap();
+    assert_eq!(ids(&found), vec![ObjectId(12), ObjectId(44), ObjectId(43)], "the armchair is not a chair by its words: {found:#?}");
+    let sofa = &found[0];
+    assert!(sofa.matched.description.unwrap().get() > 0.99 && sofa.matched.view.is_none(), "{sofa:?}");
+    assert_eq!(sofa.matched.words.get(), 0.0);
+    let chair = &found[1];
+    assert_eq!(chair.matched.words.get(), 1.0);
+    assert!(chair.matched.description.unwrap().get().abs() < 1e-6 && chair.matched.view.unwrap().get().abs() < 1e-6);
+    assert!((chair.score - world_model::WORD_MATCH_WEIGHT).abs() < 1e-6, "{chair:?}");
+}
+
+#[tokio::test]
+async fn find_by_meaning_uses_whichever_vector_an_object_has_so_far() {
+    let House { store, writer, _dir, .. } = house();
+    writer.set_embedding(ObjectId(51), embedding(EmbeddingSource::View, &[0.6, 0.8], 2)).unwrap();
+    writer.set_embedding(ObjectId(20), embedding(EmbeddingSource::Description, &[0.8, 0.6], 2)).unwrap();
+    writer.flush().unwrap();
+
+    let found = store.find(FindQuery { text: Some("cup".to_owned()), meaning: meaning(&[0.6, 0.8]), ..FindQuery::default() }).await.unwrap();
+    assert_eq!(ids(&found), vec![ObjectId(51), ObjectId(20)], "objects with no vector and no word are not found: {found:#?}");
+    assert!(found[0].matched.description.is_none() && (found[0].matched.view.unwrap().get() - 1.0).abs() < 1e-6);
+    assert!(found[1].matched.view.is_none() && (found[1].matched.description.unwrap().get() - 0.96).abs() < 1e-5);
+}
+
+#[tokio::test]
+async fn vectors_of_another_embedding_model_or_size_are_not_compared() {
+    let House { store, writer, _dir, .. } = house();
+    let mut other_model = embedding(EmbeddingSource::View, &[1.0, 0.0], 2);
+    other_model.model = EmbeddingModel("another-model".to_owned());
+    writer.set_embedding(ObjectId(51), other_model).unwrap();
+    writer.set_embedding(ObjectId(20), embedding(EmbeddingSource::View, &[1.0, 0.0, 0.0], 2)).unwrap();
+    writer.flush().unwrap();
+
+    let found = store.find(FindQuery { text: Some("thing".to_owned()), meaning: meaning(&[1.0, 0.0]), ..FindQuery::default() }).await.unwrap();
+    assert!(found.is_empty(), "{found:#?}");
+}
+
+#[tokio::test]
+async fn a_description_or_embedding_of_an_older_view_does_not_replace_a_newer_one() {
+    let House { store, writer, _dir, .. } = house();
+    let mug = FURNITURE.iter().find(|f| f.id == 51).unwrap();
+    let mut newer = described(mug, FrameId(9));
+    newer.caption.description = "a red mug with a chipped handle".to_owned();
+    writer.set_description(ObjectId(51), newer).unwrap();
+    writer.set_description(ObjectId(51), described(mug, FrameId(5))).unwrap();
+    writer.set_embedding(ObjectId(51), embedding(EmbeddingSource::View, &[0.0, 1.0], 9)).unwrap();
+    writer.set_embedding(ObjectId(51), embedding(EmbeddingSource::View, &[1.0, 0.0], 5)).unwrap();
+    writer.flush().unwrap();
+
+    let caption = store.describe_object(ObjectId(51)).await.unwrap().caption.unwrap();
+    assert_eq!(caption.description, "a red mug with a chipped handle");
+    let found = store.find(FindQuery { text: Some("mug".to_owned()), meaning: meaning(&[0.0, 1.0]), ..FindQuery::default() }).await.unwrap();
+    assert!((found[0].matched.view.unwrap().get() - 1.0).abs() < 1e-6, "{found:#?}");
+}
+
+#[tokio::test]
+async fn a_description_of_an_object_never_seen_is_rejected() {
+    let House { writer, _dir, .. } = house();
+    let ghost = Furniture { id: 77, label: "ghost", at: (1.0, 1.0), size: (0.2, 0.2, 0.2), resting_on_m: 0.0, caption: "a ghost" };
+    let before = writer.stats().rejected;
+    writer.set_description(ObjectId(77), described(&ghost, FrameId(1))).unwrap();
+    writer.set_embedding(ObjectId(77), embedding(EmbeddingSource::View, &[1.0], 1)).unwrap();
+    writer.flush().unwrap();
+    assert_eq!(writer.stats().rejected - before, 2);
+}
+
+#[tokio::test]
+async fn descriptions_and_embeddings_survive_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let (config, _clock) = config(dir.path());
+        let (_store, writer) = WorldStore::open(config).unwrap();
+        seed(&writer);
+        writer.set_embedding(ObjectId(51), embedding(EmbeddingSource::Description, &[0.0, 1.0], 2)).unwrap();
+        writer.close().unwrap();
+    }
+    let (config, _clock) = config(dir.path());
+    let (store, writer) = WorldStore::open(config).unwrap();
+    let mug = store.describe_object(ObjectId(51)).await.unwrap();
+    assert_eq!(mug.caption.unwrap().description, "a blue mug");
+    let found = store.find(FindQuery { text: Some("drink".to_owned()), meaning: meaning(&[0.0, 1.0]), ..FindQuery::default() }).await.unwrap();
+    assert_eq!(ids(&found), vec![ObjectId(51)]);
+    writer.close().unwrap();
+}
+
+#[tokio::test]
+async fn an_object_keeps_every_label_it_was_reported_under_and_those_of_objects_merged_into_it() {
+    let House { store, writer, _dir, .. } = house();
+    let mug = FURNITURE.iter().find(|f| f.id == 51).unwrap();
+    let chair = FURNITURE.iter().find(|f| f.id == 43).unwrap();
+    let mut as_cup = update(mug, ObjectChange::Updated, mug.at, ago(5));
+    as_cup.label = "cup".to_owned();
+    writer.apply_object_update(as_cup).unwrap();
+    writer.apply_object_update(update(chair, ObjectChange::MergedInto(ObjectId(44)), chair.at, ago(4))).unwrap();
+    writer.flush().unwrap();
+
+    assert_eq!(store.object_labels(ObjectId(51)).await.unwrap(), ["mug", "cup"]);
+    assert_eq!(store.object_labels(ObjectId(44)).await.unwrap(), ["chair"]);
+    assert_eq!(store.object_labels(ObjectId(999)).await.unwrap(), Vec::<String>::new());
 }

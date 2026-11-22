@@ -13,8 +13,8 @@ use perception_wire::navigation::{GoalTarget, LookTarget, MapPose, MapVersion, O
 use rusqlite::{params, params_from_iter, Connection, OpenFlags, OptionalExtension, Row};
 use world_model::clock::seconds_between;
 use world_model::{
-    Change, ChangeKind, Clearance, Doorway, EntityRef, FindQuery, FoundObject, Joint, JointPosition, Landmark, ObjectDescription,
-    ObjectSummary,
+    Change, ChangeKind, Clearance, Doorway, Embedding, EntityRef, FindQuery, FoundObject, Joint, JointPosition, Landmark, MatchScores,
+    ObjectCaption, ObjectDescription, ObjectSummary, Similarity, WordShare,
     PersonSpeed, PersonTrack, PlaceSummary, LocationInterval, PngImage, Point, ReadOnlySql, Relation, RobotState, RoomName, RoomSummary, Route,
     Observation, Size, SqlRows, StaleSource, Timestamp, TrackLiveness, ViewKind, ViewRequest, WorldError, WorldModel, WorldSnapshot,
 };
@@ -26,7 +26,7 @@ use crate::render::{self, Canvas};
 use crate::schema::{migrate, MigrationError};
 use crate::sql::{open_guarded, run_read_only};
 use crate::types::{
-    Cell, ClearanceMm, DoorwayId, DoorwaySpan, OccupancyGrid, HeightBand, InputSource, PlaceEdge, PlaceNode, RoomId, RoomLabels,
+    Cell, ClearanceMm, DoorwayId, DoorwaySpan, EmbeddingSource, OccupancyGrid, HeightBand, InputSource, PlaceEdge, PlaceNode, RoomId, RoomLabels,
     RoomShape, Topology,
 };
 use crate::writer::WorldWriter;
@@ -729,29 +729,24 @@ fn exits_ahead(map: &MapState, position: Point, heading_rad: f32) -> Vec<String>
     ahead.iter().map(|p| format!("{} ({})", p.id, map.place_name(p))).collect()
 }
 
-fn escape_like(word: &str) -> String {
-    word.chars().fold(String::new(), |mut escaped, c| {
-        if matches!(c, '%' | '_' | '\\') {
-            escaped.push('\\');
-        }
-        escaped.push(c);
-        escaped
-    })
-}
-
+/// Words of the query found as whole words in an object's label or description, and its stored embeddings of the
+/// query's model compared with the query's, are scored in Rust. Every current object that matches the filters is scored, so
+/// the search is linear in the objects of the map, which is hundreds.
 fn find(inner: &Inner, connection: &Connection, map: &MapState, query: FindQuery) -> Result<Vec<FoundObject>, WorldError> {
     let room = query.room.as_ref().map(|name| resolve_room(map, name)).transpose()?;
     let (_, robot_pose) = latest_robot(connection)?;
     let robot = on_floor(robot_pose);
     let near = query.near.unwrap_or(robot);
-    let words: Vec<String> = query.text.iter().flat_map(|t| t.split_whitespace()).map(str::to_lowercase).collect();
     let mut values: Vec<rusqlite::types::Value> = Vec::new();
-    let hits = match words.is_empty() {
-        true => "1".to_owned(),
-        false => {
-            values.extend(words.iter().map(|w| format!("%{}%", escape_like(w)).into()));
-            vec!["((o.label || ' ' || coalesce(c.caption, '')) LIKE ? ESCAPE '\\')"; words.len()].join(" + ")
+    let embeddings = match &query.meaning {
+        Some(meaning) => {
+            for source in [EmbeddingSource::Description, EmbeddingSource::View] {
+                values.extend([source.as_str().to_owned().into(), meaning.model.0.clone().into(), (meaning.vector.dimensions() as i64).into()]);
+            }
+            "LEFT JOIN object_embedding d ON d.object_id = o.object_id AND d.source = ? AND d.model = ? AND d.dimensions = ?
+             LEFT JOIN object_embedding v ON v.object_id = o.object_id AND v.source = ? AND v.model = ? AND v.dimensions = ?"
         }
+        None => "LEFT JOIN (SELECT NULL AS vector) d ON 0 LEFT JOIN (SELECT NULL AS vector) v ON 0",
     };
     let mut filters = String::new();
     if let Some(label) = &query.label {
@@ -766,40 +761,63 @@ fn find(inner: &Inner, connection: &Connection, map: &MapState, query: FindQuery
         Some(RoomFilter::Unmapped) => filters.push_str(" AND o.room_id IS NULL"),
         None => {}
     }
-    values.extend([near.x_m, near.x_m, near.y_m, near.y_m].map(|v| f64::from(v).into()));
-    let limit = query.limit.unwrap_or(inner.config.find_limit).get();
-    values.push((limit as i64).into());
     let sql = format!(
-        "SELECT {columns}, hits FROM (
-             SELECT o.*, ({hits}) AS hits FROM object o LEFT JOIN object_caption c USING (object_id)
-             WHERE o.valid_to_unix_ns IS NULL {filters})
-         WHERE hits > 0
-         ORDER BY hits DESC, (centre_x_m - ?) * (centre_x_m - ?) + (centre_y_m - ?) * (centre_y_m - ?), object_id
-         LIMIT ?",
+        "SELECT {columns}, description_vector, view_vector, name, category, description, colour, material FROM (
+             SELECT o.*, d.vector AS description_vector, v.vector AS view_vector,
+                 c.name, c.category, c.description, c.colour, c.material
+             FROM object o LEFT JOIN object_caption c ON c.object_id = o.object_id {embeddings}
+             WHERE o.valid_to_unix_ns IS NULL {filters})",
         columns = ROW_COLUMNS,
     );
     let mut statement = connection.prepare(&sql).map_err(store)?;
     let rows = statement
-        .query_map(params_from_iter(values), |r| Ok((ObjectRow::read(r)?, r.get::<_, i64>(19)?)))
+        .query_map(params_from_iter(values), |r| {
+            let text: Vec<String> = (21..26).map(|i| r.get::<_, Option<String>>(i)).collect::<rusqlite::Result<Vec<_>>>()?.into_iter().flatten().collect();
+            Ok((ObjectRow::read(r)?, text, r.get::<_, Option<Vec<u8>>>(19)?, r.get::<_, Option<Vec<u8>>>(20)?))
+        })
         .map_err(store)?
         .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(store)?;
-    let word_count = words.len().max(1) as f32;
-    Ok(rows
-        .into_iter()
-        .map(|(row, hits)| FoundObject {
-            id: row.id,
-            label: row.label.clone(),
-            room: map.room_name(row.room),
-            position: row.position,
-            distance_from_robot_m: row.position.distance_to(robot),
-            last_seen: row.last_seen,
-            score: match words.is_empty() {
-                true => 1.0,
-                false => hits as f32 / word_count,
-            },
-        })
-        .collect())
+    let similarity = |id: ObjectId, source: EmbeddingSource, stored: Option<Vec<u8>>| -> Result<Option<Similarity>, WorldError> {
+        let (Some(meaning), Some(bytes)) = (&query.meaning, stored) else { return Ok(None) };
+        let vector = Embedding::from_le_bytes(&bytes).map_err(|e| WorldError::Store(format!("the stored {source} embedding of {id}: {e}")))?;
+        Ok(Some(meaning.vector.similarity(&vector)))
+    };
+    let mut found = Vec::new();
+    for (row, caption, description, view) in rows {
+        let words = match &query.text {
+            None => WordShare::ALL,
+            Some(text) => {
+                let texts: Vec<&str> = std::iter::once(row.label.as_str()).chain(caption.iter().map(String::as_str)).collect();
+                WordShare::of_query(text, &texts)
+            }
+        };
+        let matched = MatchScores {
+            words,
+            description: similarity(row.id, EmbeddingSource::Description, description)?,
+            view: similarity(row.id, EmbeddingSource::View, view)?,
+        };
+        if matched.is_match() {
+            found.push((row.position.distance_to(near), FoundObject {
+                id: row.id,
+                label: row.label.clone(),
+                room: map.room_name(row.room),
+                position: row.position,
+                distance_from_robot_m: row.position.distance_to(robot),
+                last_seen: row.last_seen,
+                score: match query.meaning {
+                    Some(_) => matched.score_by_meaning(),
+                    None => matched.score_by_words(),
+                },
+                matched,
+            }));
+        }
+    }
+    found.sort_by(|(a_distance, a), (b_distance, b)| {
+        b.score.total_cmp(&a.score).then(a_distance.total_cmp(b_distance)).then(a.id.cmp(&b.id))
+    });
+    let limit = query.limit.unwrap_or(inner.config.find_limit).get();
+    Ok(found.into_iter().take(limit).map(|(_, object)| object).collect())
 }
 
 /// The mean position of a group of objects; the group is never empty.
@@ -866,8 +884,10 @@ fn snapshot(inner: &Inner, connection: &Connection, map: &MapState) -> Result<Wo
 
 fn describe_object(connection: &Connection, map: &MapState, id: ObjectId) -> Result<ObjectDescription, WorldError> {
     let latest = latest_row(connection, id)?.ok_or(WorldError::UnknownObject(id))?;
-    let caption: Option<String> = connection
-        .query_row("SELECT caption FROM object_caption WHERE object_id = ?1", [id.0 as i64], |r| r.get(0))
+    let caption = connection
+        .query_row("SELECT name, category, description, colour, material FROM object_caption WHERE object_id = ?1", [id.0 as i64], |r| {
+            Ok(ObjectCaption { name: r.get(0)?, category: r.get(1)?, description: r.get(2)?, colour: r.get(3)?, material: r.get(4)? })
+        })
         .optional()
         .map_err(store)?;
     let relations = connection
@@ -1116,6 +1136,21 @@ impl WorldModel for WorldStore {
 }
 
 impl WorldStore {
+    /// Every label the object map has reported the object under, the first reported first, including the labels of
+    /// objects merged into it.
+    pub async fn object_labels(&self, id: ObjectId) -> Result<Vec<String>, WorldError> {
+        self.read(move |_, connection, _| {
+            connection
+                .prepare("SELECT label FROM object_label WHERE object_id = ?1 ORDER BY first_reported_unix_ns, label")
+                .map_err(store)?
+                .query_map([id.0 as i64], |r| r.get(0))
+                .map_err(store)?
+                .collect::<rusqlite::Result<Vec<String>>>()
+                .map_err(store)
+        })
+        .await
+    }
+
     /// Every room of the current topology, in topology order, with its given name and the labels of the objects in it.
     pub async fn room_labels(&self) -> Result<Vec<RoomLabels>, WorldError> {
         self.read(|_, connection, map| {

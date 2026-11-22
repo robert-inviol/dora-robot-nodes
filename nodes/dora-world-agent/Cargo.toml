@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["world-model", "world-store", "world-agent", "dora-world-agent"]
+members = ["world-model", "world-store", "world-agent", "object-descriptions", "dora-world-agent"]
 
 [workspace.package]
 edition = "2021"

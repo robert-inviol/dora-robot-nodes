@@ -87,5 +87,6 @@ pub fn config(work_dir: &Path, deadline: Duration) -> SpatialConfig {
         },
         mcp: McpConfig { port: 0, sql_row_limit: NonZeroUsize::new(10).unwrap() },
         world_store: WorldStoreSettings { path: work_dir.with_extension("sqlite"), backup: None },
+        object_descriptions: None,
     }
 }

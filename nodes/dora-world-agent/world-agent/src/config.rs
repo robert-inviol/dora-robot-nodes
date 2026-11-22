@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use perception_wire::navigation::NonNegative;
 use serde::{Deserialize, Deserializer};
+use world_model::EmbeddingModel;
 
 use crate::goals::Approach;
 
@@ -50,6 +51,13 @@ pub struct SystemPrompt(pub String);
 fn seconds<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Duration, D::Error> {
     let value = f64::deserialize(deserializer)?;
     Duration::try_from_secs_f64(value).map_err(|e| serde::de::Error::custom(format!("{value} seconds: {e}")))
+}
+
+fn seconds_each<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<Duration>, D::Error> {
+    Vec::<f64>::deserialize(deserializer)?
+        .into_iter()
+        .map(|value| Duration::try_from_secs_f64(value).map_err(|e| serde::de::Error::custom(format!("{value} seconds: {e}"))))
+        .collect()
 }
 
 fn metres<'de, D: Deserializer<'de>>(deserializer: D) -> Result<NonNegative, D::Error> {
@@ -225,6 +233,65 @@ pub struct WorldStoreSettings {
     pub backup: Option<WorldStoreBackup>,
 }
 
+/// How many values an embedding has: Gemini's embedding models give 128 to 3072.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EmbeddingDimensions(u32);
+
+impl EmbeddingDimensions {
+    pub const RANGE: std::ops::RangeInclusive<u32> = 128..=3072;
+
+    pub fn new(value: u32) -> Result<Self, String> {
+        match Self::RANGE.contains(&value) {
+            true => Ok(Self(value)),
+            false => Err(format!("{value} dimensions is outside {:?}", Self::RANGE)),
+        }
+    }
+
+    pub fn get(self) -> u32 {
+        self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for EmbeddingDimensions {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        EmbeddingDimensions::new(u32::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+/// The Gemini embedding model that embeds descriptions, views and the text of `find` queries alike.
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EmbeddingConfig {
+    pub model: EmbeddingModel,
+    pub dimensions: EmbeddingDimensions,
+    /// Each embedding request fails after this long; a `find` waits for one, so it must be shorter than
+    /// `claude.mcp_tool_timeout_s`.
+    #[serde(rename = "request_timeout_s", deserialize_with = "seconds")]
+    pub request_timeout: Duration,
+}
+
+/// Describing and embedding each object's best view as it arrives, so `find` can search by meaning. The Gemini API
+/// key is read from `GEMINI_API_KEY` at start.
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObjectDescriptionsConfig {
+    /// The model that describes a view, given the image and one line of facts; it answers in a JSON schema.
+    pub describer: ModelProfile,
+    /// One description call fails after this long.
+    #[serde(rename = "describe_timeout_s", deserialize_with = "seconds")]
+    pub describe_timeout: Duration,
+    pub embedding: EmbeddingConfig,
+    /// A failed call is tried again after each of these pauses in turn, then reported as failed.
+    #[serde(rename = "retry_after_s", deserialize_with = "seconds_each")]
+    pub retry_after: Vec<Duration>,
+    /// Objects waiting to be described; a newer view of a waiting object takes its place.
+    pub queue_capacity: NonZeroUsize,
+    /// Objects described at once.
+    pub concurrent_objects: NonZeroUsize,
+    /// An object reported under any of these labels (any case or spacing) is never described or embedded.
+    pub person_labels: Vec<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SpatialConfig {
@@ -236,6 +303,8 @@ pub struct SpatialConfig {
     pub goals: GoalDefaults,
     pub mcp: McpConfig,
     pub world_store: WorldStoreSettings,
+    /// Without this section objects are not described or embedded, and `find` matches words only.
+    pub object_descriptions: Option<ObjectDescriptionsConfig>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -246,6 +315,8 @@ pub enum ConfigError {
     Parse(#[from] toml::de::Error),
     #[error("exactly one answerer must be fast, not {0}")]
     FastAnswerers(usize),
+    #[error("object_descriptions.embedding.request_timeout_s ({embedding:?}) must be shorter than claude.mcp_tool_timeout_s ({tool:?}): find waits for an embedding")]
+    EmbeddingOutlastsTool { embedding: Duration, tool: Duration },
 }
 
 impl SpatialConfig {
@@ -254,6 +325,12 @@ impl SpatialConfig {
         let fast = config.answering.answerers.iter().filter(|a| a.role == AnswererRole::Fast).count();
         if fast != 1 {
             return Err(ConfigError::FastAnswerers(fast));
+        }
+        if let Some(descriptions) = &config.object_descriptions {
+            let (embedding, tool) = (descriptions.embedding.request_timeout, config.claude.mcp_tool_timeout);
+            if embedding >= tool {
+                return Err(ConfigError::EmbeddingOutlastsTool { embedding, tool });
+            }
         }
         Ok(config)
     }
@@ -290,6 +367,39 @@ mod tests {
         assert_eq!(config.claude.mcp_tool_timeout, Duration::from_secs(5));
         assert_eq!(config.world_store.path, Path::new("/tmp/spatial-agent-world.sqlite"));
         assert_eq!(config.world_store.backup, None);
+        assert_eq!(config.object_descriptions, None, "objects are described only when the section is given");
+    }
+
+    /// The example settings with their commented `[object_descriptions]` section in force.
+    fn example_with_descriptions() -> String {
+        let example = example();
+        let start = example.find("# [object_descriptions]").expect("the example shows the section");
+        let section: String = example[start..].lines().map(|line| line.strip_prefix("# ").unwrap_or(line)).collect::<Vec<_>>().join("\n");
+        format!("{}{section}\n", &example[..start])
+    }
+
+    #[test]
+    fn the_example_object_descriptions_use_haiku_and_gemini_embedding_2() {
+        let config = SpatialConfig::parse(&example_with_descriptions()).unwrap();
+        let descriptions = config.object_descriptions.unwrap();
+        assert_eq!(descriptions.describer.model, ModelName("claude-haiku-5-5".to_owned()));
+        assert_eq!(descriptions.embedding.model, EmbeddingModel("gemini-embedding-2".to_owned()));
+        assert_eq!(descriptions.embedding.dimensions.get(), 768);
+        assert_eq!(descriptions.retry_after, [Duration::from_secs(10), Duration::from_secs(60), Duration::from_secs(300)]);
+        assert!(descriptions.person_labels.iter().any(|l| l == "person"));
+    }
+
+    #[test]
+    fn an_embedding_timeout_as_long_as_a_tool_call_is_an_error() {
+        let text = example_with_descriptions().replace("request_timeout_s = 4", "request_timeout_s = 5");
+        assert!(matches!(SpatialConfig::parse(&text), Err(ConfigError::EmbeddingOutlastsTool { .. })));
+    }
+
+    #[test]
+    fn embedding_dimensions_outside_what_gemini_gives_are_an_error() {
+        let text = example_with_descriptions().replace("dimensions = 768", "dimensions = 64");
+        let error = SpatialConfig::parse(&text).unwrap_err();
+        assert!(error.to_string().contains("64 dimensions is outside"), "{error}");
     }
 
     #[test]

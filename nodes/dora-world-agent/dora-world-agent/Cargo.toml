@@ -17,6 +17,7 @@ doc = false
 
 [dependencies]
 perception-wire = { path = "../../dora-depth-perception/perception-wire" }
+object-descriptions = { path = "../object-descriptions" }
 world-agent = { path = "../world-agent" }
 world-store = { path = "../world-store" }
 serde_json = "1"

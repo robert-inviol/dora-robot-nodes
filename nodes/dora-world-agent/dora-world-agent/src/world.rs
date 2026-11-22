@@ -20,6 +20,9 @@ use world_store::{
     BackupConfig, OccupancyGrid, IssuedGoal, ObjectUpdate, OpenError, RobotPoseSample, StoreConfig, Topology, WorldWriter,
 };
 
+use object_descriptions::service::DescriptionStore;
+use world_store::{DescribedView, IngestError, ObjectEmbedding};
+
 use crate::people::{transform_people_to_map, NotTransformed};
 
 /// The world store's inputs, by their dora input ids.
@@ -63,16 +66,18 @@ impl StoreInput {
 }
 
 /// What an ingested message changed that the node has to act on.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Ingested {
     Recorded,
     /// The rooms changed; the room namer has to see them.
     RoomsChanged,
+    /// An object update was recorded; its view, if it carries one, goes to be described.
+    ObjectUpdated(Box<ObjectUpdate>),
 }
 
-/// The world model the node answers from, which also keeps room names, takes the store's inputs and records the
-/// goals the node sends.
-pub trait WorldStore: WorldModel + RoomNameSink {
+/// The world model the node answers from, which also keeps room names and object descriptions, takes the store's
+/// inputs and records the goals the node sends.
+pub trait WorldStore: WorldModel + RoomNameSink + DescriptionStore {
     /// Decodes one input message and hands it to the store.
     fn ingest(&self, input: StoreInput, data: &dyn Array) -> Result<Ingested>;
 
@@ -168,8 +173,9 @@ impl WorldStore for SqliteWorld {
                 self.writer.set_occupancy_grid(OccupancyGrid::try_from(occupancy_grid).wrap_err("a occupancy grid")?)?;
             }
             StoreInput::ObjectUpdate => {
-                let update = decode_object_update(data).wrap_err("decoding an object update")?;
-                self.writer.apply_object_update(ObjectUpdate::try_from(update).wrap_err("an object update")?)?;
+                let update = ObjectUpdate::try_from(decode_object_update(data).wrap_err("decoding an object update")?).wrap_err("an object update")?;
+                self.writer.apply_object_update(update.clone())?;
+                return Ok(Ingested::ObjectUpdated(Box::new(update)));
             }
             StoreInput::KeyframePose => self.record_keyframe_pose(data)?,
             StoreInput::MapToOdom => {
@@ -198,6 +204,20 @@ impl WorldStore for SqliteWorld {
 
     fn close(&self) -> Result<()> {
         Ok(self.writer.close()?)
+    }
+}
+
+impl DescriptionStore for SqliteWorld {
+    async fn object_labels(&self, object: ObjectId) -> Result<Vec<String>, WorldError> {
+        self.store.object_labels(object).await
+    }
+
+    fn set_description(&self, object: ObjectId, described: DescribedView) -> Result<(), IngestError> {
+        self.writer.set_description(object, described)
+    }
+
+    fn set_embedding(&self, object: ObjectId, embedding: ObjectEmbedding) -> Result<(), IngestError> {
+        self.writer.set_embedding(object, embedding)
     }
 }
 

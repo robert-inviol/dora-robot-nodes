@@ -11,7 +11,7 @@ use tokio::sync::mpsc;
 use world_agent::claude_code::ClaudeCodeClient;
 use world_agent::config::{CompositionChange, Effort, ModelName, SystemPrompt};
 use world_agent::identity::AgentRegistry;
-use world_agent::process::{Launcher, ProcessProfile, ToolAccess};
+use world_agent::process::{Launcher, ProcessProfile, ToolAccess, ReplyShape};
 use world_agent::room_names::{RoomContents, RoomNameSink, RoomNameSinkError, RoomNamer};
 use world_agent::world::RoomName;
 
@@ -38,6 +38,7 @@ impl Harness {
             effort: Effort::Low,
             system_prompt: SystemPrompt(format!("You name rooms. [fake:reply={reply}]")),
             tools: ToolAccess::None,
+            reply: ReplyShape::FreeText,
         };
         let registry = Arc::new(AgentRegistry::default());
         let launcher = Launcher::new(claude(&work_dir.0), profile, registry.clone(), watchdog().startup);

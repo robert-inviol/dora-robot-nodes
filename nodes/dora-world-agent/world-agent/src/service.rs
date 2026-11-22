@@ -9,14 +9,15 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::claude_code::ClaudeCodeClient;
-use crate::config::{SpatialConfig, WatchdogConfig};
+use crate::config::{ClaudeConfig, SpatialConfig, WatchdogConfig};
 use crate::goals::{GoalBook, GoalBookError, GoalLedger, GoalSink};
 use crate::identity::AgentRegistry;
 use crate::mcp::{router, McpEndpoint, ToolContext};
 use crate::model::AnswererId;
-use crate::process::{Launcher, ProcessProfile, ToolAccess};
+use crate::process::{Launcher, ProcessProfile, ReplyShape, ToolAccess};
 use crate::questions::{Answerer, DeskSettings, QuestionDesk};
 use crate::room_names::{RoomContents, RoomNameSink, RoomNamer};
+use crate::search::QueryEmbedder;
 use crate::world::WorldModel;
 
 #[derive(Debug, thiserror::Error)]
@@ -43,17 +44,22 @@ pub struct SpatialService<W, G, S> {
     namer: Arc<RoomNamer<ClaudeCodeClient, S>>,
     goals: Arc<GoalBook>,
     clients: Vec<Arc<ClaudeCodeClient>>,
+    registry: Arc<AgentRegistry>,
+    claude: ClaudeConfig,
+    watchdog: WatchdogConfig,
     _mcp: McpEndpoint,
 }
 
 impl<W: WorldModel, G: GoalSink, S: RoomNameSink> SpatialService<W, G, S> {
-    /// Starts the endpoint and a warm process for every model. Answers go out on `answers`.
+    /// Starts the endpoint and a warm process for every model. Answers go out on `answers`. With a query embedder,
+    /// `find` searches by meaning.
     pub async fn start(
         config: &SpatialConfig,
         world: Arc<W>,
         goal_sink: G,
         room_names: S,
         answers: mpsc::UnboundedSender<SpatialAnswer>,
+        query_embedder: Option<Arc<dyn QueryEmbedder>>,
     ) -> Result<Self, StartError> {
         prepare_work_dir(&config.claude.work_dir)?;
         let registry = Arc::new(AgentRegistry::default());
@@ -67,6 +73,7 @@ impl<W: WorldModel, G: GoalSink, S: RoomNameSink> SpatialService<W, G, S> {
             sink: sink.clone(),
             goal_defaults: config.goals,
             sql_row_limit: config.mcp.sql_row_limit,
+            query_embedder,
         });
         let cancel = CancellationToken::new();
         let mcp = McpEndpoint::start(router(context, registry.clone(), cancel.clone()), config.mcp.port, cancel)
@@ -92,6 +99,7 @@ impl<W: WorldModel, G: GoalSink, S: RoomNameSink> SpatialService<W, G, S> {
                     effort: answerer.effort,
                     system_prompt: config.answering.system_prompt.clone(),
                     tools: ToolAccess::World(mcp.url.clone()),
+                    reply: ReplyShape::FreeText,
                 }),
             })
             .collect();
@@ -103,7 +111,15 @@ impl<W: WorldModel, G: GoalSink, S: RoomNameSink> SpatialService<W, G, S> {
         let settings = DeskSettings { deadline: config.answering.deadline, stop_approach: config.goals.approach() };
         let desk = Arc::new(QuestionDesk::new(world, goals.clone(), ledger, sink, answerers, reconciler, settings, answers));
         let namer = Arc::new(RoomNamer::new(namer_client, Arc::new(room_names), config.room_namer.rename_after_change));
-        Ok(Self { desk, namer, goals, clients, _mcp: mcp })
+        Ok(Self { desk, namer, goals, clients, registry, claude: config.claude.clone(), watchdog, _mcp: mcp })
+    }
+
+    /// A client of one more model, started like the others and stopped with them.
+    pub fn client(&mut self, profile: ProcessProfile) -> Arc<ClaudeCodeClient> {
+        let launcher = Launcher::new(self.claude.clone(), profile, self.registry.clone(), self.watchdog.startup);
+        let client = Arc::new(ClaudeCodeClient::start(launcher, self.registry.clone(), self.watchdog));
+        self.clients.push(client.clone());
+        client
     }
 
     pub fn ask(&self, question: SpatialQuery) {

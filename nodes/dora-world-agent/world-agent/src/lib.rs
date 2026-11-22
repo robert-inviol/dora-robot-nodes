@@ -18,4 +18,5 @@ pub mod questions;
 pub mod reconcile;
 pub mod references;
 pub mod room_names;
+pub mod search;
 pub mod service;

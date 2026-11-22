@@ -55,13 +55,30 @@ pub enum ToolAccess {
     None,
 }
 
-/// What a claude process runs: its model, effort, system prompt and tools.
+/// The tool claude adds when it is given a JSON schema; the model answers by calling it.
+pub const STRUCTURED_OUTPUT_TOOL: &str = "StructuredOutput";
+
+/// A JSON schema whose root is an object, which a structured reply must match.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReplySchema(pub serde_json::Value);
+
+/// The shape of a process's reply.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReplyShape {
+    FreeText,
+    /// A JSON value matching the schema, given to claude with `--json-schema`; it comes back as the result's
+    /// `structured_output`.
+    Structured(ReplySchema),
+}
+
+/// What a claude process runs: its model, effort, system prompt, tools and the shape of its reply.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProcessProfile {
     pub model: ModelName,
     pub effort: Effort,
     pub system_prompt: SystemPrompt,
     pub tools: ToolAccess,
+    pub reply: ReplyShape,
 }
 
 impl ProcessProfile {
@@ -71,6 +88,7 @@ impl ProcessProfile {
             effort: profile.effort,
             system_prompt: profile.system_prompt.clone(),
             tools: ToolAccess::None,
+            reply: ReplyShape::FreeText,
         }
     }
 }
@@ -198,6 +216,9 @@ impl Launcher {
         if let ToolAccess::World(url) = &p.tools {
             arguments.extend(["--mcp-config".to_owned(), self.mcp_config(url)]);
             arguments.extend(["--allowedTools".to_owned(), format!("mcp__{SERVER_NAME}")]);
+        }
+        if let ReplyShape::Structured(schema) = &p.reply {
+            arguments.extend(["--json-schema".to_owned(), schema.0.to_string()]);
         }
         arguments.into_iter().map(OsString::from).collect()
     }

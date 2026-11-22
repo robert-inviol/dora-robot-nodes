@@ -4,7 +4,7 @@
 use std::fmt;
 
 use perception_wire::navigation::{MapPose, MapVersion, NavGoal, ObjectId, PlaceId, TrackId, UnixNanos};
-use world_model::{Joint, Point, RoomName, Size};
+use world_model::{Embedding, EmbeddingModel, Joint, ObjectCaption, Point, RoomName, Size};
 
 pub use perception_wire::localization::FrameId;
 pub use perception_wire::space_map::{DoorwayId, RoomId};
@@ -246,9 +246,48 @@ pub struct ObjectUpdate {
     pub crop: Option<JpegImage>,
 }
 
-/// A sentence describing an object, matched by `find`.
+/// A vision model's description of one view of an object: the view, by the keyframe it was cut from, and the model.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Caption(pub String);
+pub struct DescribedView {
+    pub caption: ObjectCaption,
+    pub view_frame: FrameId,
+    pub model: ModelName,
+}
+
+/// What an object embedding was made from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum EmbeddingSource {
+    /// The text of the object's description.
+    Description,
+    /// The image of the view that was described.
+    View,
+}
+
+impl EmbeddingSource {
+    pub const ALL: [EmbeddingSource; 2] = [EmbeddingSource::Description, EmbeddingSource::View];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EmbeddingSource::Description => "description",
+            EmbeddingSource::View => "view",
+        }
+    }
+}
+
+impl fmt::Display for EmbeddingSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// One embedding of an object, from the view cut from keyframe `view_frame` or from its description.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ObjectEmbedding {
+    pub source: EmbeddingSource,
+    pub model: EmbeddingModel,
+    pub vector: Embedding,
+    pub view_frame: FrameId,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RobotPoseSample {
@@ -296,7 +335,7 @@ pub struct PersonObservation {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentName(pub String);
 
-/// The model the agent ran when it sent a goal.
+/// The model that sent a goal or described an object.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ModelName(pub String);
 

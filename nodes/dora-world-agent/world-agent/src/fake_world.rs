@@ -10,7 +10,7 @@ use perception_wire::navigation::{GoalTarget, LookTarget, MapPose, MapVersion, O
 use crate::clock;
 use crate::room_names::{RoomNameSink, RoomNameSinkError};
 use crate::world::{
-    Change, ChangeKind, Clearance, Doorway, EntityRef, FindQuery, FoundObject, Joint, JointPosition, Landmark,
+    Change, ChangeKind, Clearance, Doorway, EntityRef, FindQuery, FoundObject, Joint, JointPosition, Landmark, MatchScores, ObjectCaption, WordShare,
     ObjectDescription, ObjectSummary, PersonTrack, LocationInterval, PlaceSummary, Point, PngImage, ReadOnlySql, Relation, RobotState,
     RoomName, RoomSummary, Route, Observation, Size, SqlRows, Timestamp, TrackLiveness, ViewKind, ViewRequest, WorldError,
     WorldModel, WorldSnapshot,
@@ -466,10 +466,12 @@ impl WorldModel for FakeWorld {
     }
 
     async fn find(&self, query: FindQuery) -> Result<Vec<FoundObject>, WorldError> {
+        if query.meaning.is_some() {
+            return Err(WorldError::Unsupported("search by meaning: its objects have no embeddings"));
+        }
         if let Some(name) = &query.room {
             self.check_room(name)?;
         }
-        let words: Vec<String> = query.text.iter().flat_map(|t| t.split_whitespace()).map(str::to_lowercase).collect();
         let robot = self.robot_point();
         let mut found: Vec<FoundObject> = self
             .objects
@@ -477,9 +479,12 @@ impl WorldModel for FakeWorld {
             .filter(|o| query.room.as_ref().is_none_or(|r| &o.summary.room == r))
             .filter(|o| query.label.as_ref().is_none_or(|l| o.summary.label.eq_ignore_ascii_case(l)))
             .filter_map(|o| {
-                let haystack = format!("{} {}", o.summary.label, o.caption).to_lowercase();
-                let hits = words.iter().filter(|w| haystack.contains(w.as_str())).count();
-                let score = if words.is_empty() { 1.0 } else { hits as f32 / words.len() as f32 };
+                let words = match &query.text {
+                    None => WordShare::ALL,
+                    Some(text) => WordShare::of_query(text, &[o.summary.label.as_str(), o.caption]),
+                };
+                let matched = MatchScores::by_words(words);
+                let score = matched.score_by_words();
                 (score > 0.0).then(|| FoundObject {
                     id: o.summary.id,
                     label: o.summary.label.clone(),
@@ -488,6 +493,7 @@ impl WorldModel for FakeWorld {
                     distance_from_robot_m: o.summary.position.distance_to(robot),
                     last_seen: o.summary.last_seen,
                     score,
+                    matched,
                 })
             })
             .collect();
@@ -501,7 +507,13 @@ impl WorldModel for FakeWorld {
         let object = self.object(id)?;
         Ok(ObjectDescription {
             summary: object.summary.clone(),
-            caption: Some(object.caption.to_owned()),
+            caption: Some(ObjectCaption {
+                name: object.summary.label.clone(),
+                category: object.summary.label.clone(),
+                description: object.caption.to_owned(),
+                colour: String::new(),
+                material: String::new(),
+            }),
             relations: object.relations.clone(),
             history: object.history.clone(),
             views: Vec::new(),

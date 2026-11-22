@@ -38,10 +38,28 @@ people tracker had not measured their velocity, and the snapshot, the digest (`s
 `TrackBounds::live` after their last recorded observation, and stays in the snapshot for `forget`. `last_seen` for a
 person gives every joint of that observation with its height above the floor of the room it is in.
 
+Each object's description is a vision model's structured description of one view, kept by
+`WorldWriter::set_description` in `object_caption` (`name`, `category`, `description`, `colour`, `material`, the
+keyframe the view was cut from, the model). Its embeddings, one of the description's text and one of the view's image,
+are kept by `WorldWriter::set_embedding` in `object_embedding`, one row per object and source, as little-endian
+float32 with their model and size. A description or embedding of a view from an earlier keyframe than the one kept
+does not replace it. Every label the object map has reported an object under, including those of objects merged into
+it, is in `object_label` (`WorldStore::object_labels`).
+
 Rooms are named by `WorldWriter::name_room`; until then a room goes by `room<N>`. The snapshot gives each room its id
 and its centroid: the centroid of its floor polygon, or the mean position of its objects for objects in a room the
 current topology no longer has. Objects with no room polygon to
 stand in go by `unmapped`.
+
+## Search
+
+`find` counts the query's words found as whole words in an object's label or description
+(`world_model::WordShare::of_query`: case ignored, words split at anything not a letter or digit, so "red" is not in
+"light-colored", "cup" not in "cupboard", and "chair" not in "armchair" or "chairs"). With a query embedding
+(`FindQuery::meaning`), every current object's stored vectors of the same model and size are compared with it by
+cosine similarity in Rust: there is no vector index, since a map holds hundreds of objects. Vectors of another model
+or size are not compared. The score and the scores behind it are in `FoundObject::matched` (see `world-agent`'s
+README for the rule).
 
 ## Geometry answers
 

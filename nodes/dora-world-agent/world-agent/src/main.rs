@@ -46,7 +46,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let world = Arc::new(FakeWorld::house());
     let (goal_sender, mut goals) = mpsc::unbounded_channel();
     let (answer_sender, mut answers) = mpsc::unbounded_channel();
-    let service = SpatialService::start(&config, world.clone(), ChannelGoalSink(goal_sender), FakeWorld::house(), answer_sender).await?;
+    let service = SpatialService::start(&config, world.clone(), ChannelGoalSink(goal_sender), FakeWorld::house(), answer_sender, None).await?;
     tokio::spawn(async move {
         loop {
             tokio::select! {

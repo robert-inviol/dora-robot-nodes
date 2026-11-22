@@ -32,6 +32,7 @@ use crate::goals::{
 };
 use crate::identity::{AgentId, AgentRegistry, Authenticated};
 use crate::model::{AnswererId, Duty};
+use crate::search::{QueryEmbedder, QueryEmbeddingError};
 use crate::world::{
     BadEntityRef, EntityRef, FindQuery, Landmark, Point, ReadOnlySql, RoomName, SqlRejected, Timestamp, ViewKind,
     ViewRequest, WorldError, WorldModel,
@@ -40,6 +41,10 @@ use crate::world::{
 /// The name of the server in `--mcp-config`; tools reach the model as `mcp__world__<tool>`.
 pub const SERVER_NAME: &str = "world";
 pub const AGENT_ID_HEADER: &str = "x-agent-id";
+
+/// The most objects one `find` returns: every object with an embedding matches a query by meaning, so the list is
+/// always cut to the best few.
+pub const MAX_FIND_LIMIT: usize = 25;
 pub const TOOL_NAMES: [&str; 10] = [
     "find",
     "describe_object",
@@ -67,6 +72,8 @@ pub enum ToolError {
     Goal(#[from] GoalBookError),
     #[error(transparent)]
     Sink(#[from] GoalSinkClosed),
+    #[error("the query text could not be embedded: {0}")]
+    Embedding(QueryEmbeddingError),
 }
 
 /// A tool's answer before it becomes MCP content.
@@ -124,7 +131,8 @@ fn non_negative(field: &'static str, value: Option<f32>, default: NonNegative) -
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct FindParams {
-    /// Free text describing the object, matched against labels and captions.
+    /// Free text describing the object, such as "red cup": matched by meaning against each object's description and
+    /// view, and by its words against labels and descriptions.
     pub text: Option<String>,
     /// An exact label, such as "chair".
     pub label: Option<String>,
@@ -133,7 +141,7 @@ pub struct FindParams {
     /// Rank by distance from this map x instead of from the robot; needs near_y_m.
     pub near_x_m: Option<f32>,
     pub near_y_m: Option<f32>,
-    /// How many to return, 5 when not given.
+    /// How many to return, best first: 5 when not given, at most 25.
     pub limit: Option<u32>,
 }
 
@@ -264,6 +272,8 @@ pub struct ToolContext<W, G> {
     pub sink: Arc<G>,
     pub goal_defaults: GoalDefaults,
     pub sql_row_limit: NonZeroUsize,
+    /// Embeds `find`'s text, so objects are found by meaning; without it `find` matches words only.
+    pub query_embedder: Option<Arc<dyn QueryEmbedder>>,
 }
 
 impl<W: WorldModel, G: GoalSink> ToolContext<W, G> {
@@ -273,8 +283,17 @@ impl<W: WorldModel, G: GoalSink> ToolContext<W, G> {
             (None, None) => None,
             _ => return Err(ToolError::BadArgument("near needs both near_x_m and near_y_m".to_owned())),
         };
-        let limit = params.limit.map(|l| NonZeroUsize::new(l as usize).ok_or_else(|| ToolError::BadArgument("limit must be at least 1".to_owned()))).transpose()?;
-        let query = FindQuery { text: params.text, label: params.label, room: params.room.map(RoomName), near, limit };
+        let limit = match params.limit {
+            None => None,
+            Some(l) if (1..=MAX_FIND_LIMIT as u32).contains(&l) => NonZeroUsize::new(l as usize),
+            Some(l) => return Err(ToolError::BadArgument(format!("limit must be from 1 to {MAX_FIND_LIMIT}, not {l}"))),
+        };
+        let text = params.text.as_deref().map(str::trim).filter(|text| !text.is_empty());
+        let meaning = match (&self.query_embedder, text) {
+            (Some(embedder), Some(text)) => Some(embedder.embed_query(text).await.map_err(ToolError::Embedding)?),
+            _ => None,
+        };
+        let query = FindQuery { text: text.map(str::to_owned), meaning, label: params.label, room: params.room.map(RoomName), near, limit };
         let stamp = self.world.stamp().await?;
         Ok(ToolAnswer::Json(stamped(stamp, "objects", self.world.find(query).await?)))
     }
@@ -290,7 +309,7 @@ impl<W: WorldModel, G: GoalSink> ToolContext<W, G> {
             serde_json::json!({
                 "id": s.id.to_string(),
                 "label": s.label,
-                "caption": description.caption,
+                "description": description.caption,
                 "room": s.room,
                 "position": s.position,
                 "size": s.size,
@@ -478,13 +497,13 @@ impl<W: WorldModel, G: GoalSink> WorldTools<W, G> {
         Self { context, tool_router: Self::tool_router() }
     }
 
-    #[tool(description = "Search objects by free text, label, room or nearness; returns ids, rooms, positions, distance from the robot and when last seen.")]
+    #[tool(description = "Search objects by what they are (free text, matched by meaning against each object's description and view, and by whole words against its label and description), label, room or nearness. Returns at most `limit` objects (5 unless given, 25 at most), best score first, with ids, rooms, positions, distance from the robot, when last seen, and the scores they matched by. Scores are relative: with text, `score` is the closer of the query's similarity to the object's description and to its view, plus 0.1 times the share of query words found. Every described object gets a similarity: unrelated objects typically score 0.5 to 0.66, a true match about 0.7 to 0.85. Compare the results with each other and check the descriptions or views (describe_object) rather than read one score as a hit.")]
     async fn find(&self, Extension(parts): Extension<http::request::Parts>, Parameters(params): Parameters<FindParams>) -> Result<CallToolResult, ErrorData> {
         caller(&parts)?;
         answer(self.context.find(params).await)
     }
 
-    #[tool(description = "An object's geometry, caption, relations to other objects, where it stood over time, and its best views as images.")]
+    #[tool(description = "An object's geometry, its description (name, category, colour, material), relations to other objects, where it stood over time, and its best views as images.")]
     async fn describe_object(&self, Extension(parts): Extension<http::request::Parts>, Parameters(params): Parameters<ObjectParams>) -> Result<CallToolResult, ErrorData> {
         caller(&parts)?;
         answer(self.context.describe_object(params).await)
@@ -630,6 +649,7 @@ mod tests {
                 deadline: Duration::from_secs(120),
             },
             sql_row_limit: NonZeroUsize::new(10).unwrap(),
+            query_embedder: None,
         };
         (Arc::new(context), receiver)
     }
@@ -672,6 +692,48 @@ mod tests {
         assert_eq!(keys, ["as_of", "map_version", "objects"]);
         assert_eq!(found["map_version"], "v412");
         assert_eq!(found["objects"][0]["id"], "o12");
+    }
+
+    struct FailingEmbedder;
+
+    impl QueryEmbedder for FailingEmbedder {
+        fn embed_query<'a>(
+            &'a self,
+            _text: &'a str,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<crate::world::QueryEmbedding, QueryEmbeddingError>> + Send + 'a>> {
+            Box::pin(async { Err("the embedding API answered 503".into()) })
+        }
+    }
+
+    fn find_text(text: &str) -> FindParams {
+        FindParams { text: Some(text.to_owned()), label: None, room: None, near_x_m: None, near_y_m: None, limit: None }
+    }
+
+    #[tokio::test]
+    async fn find_fails_when_its_query_cannot_be_embedded_rather_than_match_words_alone() {
+        let (context, _) = context();
+        let mut context = Arc::into_inner(context).unwrap();
+        context.query_embedder = Some(Arc::new(FailingEmbedder));
+        let error = context.find(find_text("sofa")).await.unwrap_err();
+        assert_eq!(error.to_string(), "the query text could not be embedded: the embedding API answered 503");
+        let by_label = json(context.find(FindParams { label: Some("sofa".to_owned()), ..find_text(" ") }).await.unwrap());
+        assert_eq!(by_label["objects"][0]["id"], "o12", "a find without text has nothing to embed");
+    }
+
+    #[tokio::test]
+    async fn find_returns_a_bounded_list() {
+        let (context, _) = context();
+        let error = context.find(FindParams { limit: Some(MAX_FIND_LIMIT as u32 + 1), ..find_text("sofa") }).await.unwrap_err();
+        assert_eq!(error.to_string(), "limit must be from 1 to 25, not 26");
+        assert!(context.find(FindParams { limit: Some(0), ..find_text("sofa") }).await.is_err());
+        assert!(context.find(FindParams { limit: Some(MAX_FIND_LIMIT as u32), ..find_text("sofa") }).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_found_object_carries_the_scores_it_matched_by() {
+        let (context, _) = context();
+        let found = json(context.find(find_text("sofa")).await.unwrap());
+        assert_eq!(found["objects"][0]["matched"], serde_json::json!({"words": 1.0, "description": null, "view": null}));
     }
 
     #[tokio::test]

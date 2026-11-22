@@ -10,7 +10,7 @@ node feeds from its inputs. It answers each `spatial_query` with several models 
 | `goal_status` | Recorded in the goal book for the digest, and in the world store (`record_goal_status`) |
 | `topology` | `set_topology`; then the rooms, with their names and objects, go to the room namer (`rooms_changed`) |
 | `occupancy_grid` | `set_occupancy_grid` |
-| `object_update` | `apply_object_update` |
+| `object_update` | `apply_object_update`; then, with `[object_descriptions]` in the settings, the update goes to `ObjectDescriptions::offer`, which describes and embeds the view it carries in the background |
 | `keyframe_pose` | `record_robot_pose` with the map pose (x, y, yaw) of a `tracking` or `relocalized` keyframe. A `lost` or `restarted` pose is dead reckoning that the store would never revise when pose graph updates move it, so it is not recorded |
 | `map_to_odom` | Kept: the latest correction places odometry-frame people tracks |
 | `people_tracks` | `record_people` with the frame's confirmed tracks that have a torso position, each with every fitted joint, carried from odometry into the map by the latest `map_to_odom` (`people::transform_people_to_map`) when it was made in the odom frame the tracks name (`odom_started_camera_ns`). A frame in the camera frame, in odometry before any correction, or in an odom frame the latest correction is not for (odometry started again; `NotTransformed::CorrectionFromAnotherOdomFrame`) records nothing; the reason is logged at warn when it first appears, and placing again at info |
@@ -28,11 +28,17 @@ the namer chooses go to `WorldWriter::name_room` on a blocking thread.
 - `world::WorldStore` is what the node needs of its world: `WorldModel` for the tools, `RoomNameSink` for the room
   namer, `ingest(StoreInput, &dyn Array)` for the inputs, `record_goal`, `rooms` for the namer, and `close`.
   `world::SqliteWorld` implements it on `world_store::WorldStore` and its `WorldWriter`.
+- `SpatialNode::start` is the composition root: it makes the Gemini embedder from the key, gives it to the `find`
+  tool as the query embedder, starts one more Claude Code client for the describer (`SpatialService::client`), and
+  starts `object_descriptions::service::ObjectDescriptions` on the world, which implements its `DescriptionStore`.
 - `node::SpatialNode` handles one input (`on_input`) or one goal the agent sent (`on_goal`); `main` runs it in the
   dora loop, and `tests/node.rs` drives the same calls without dora.
 
 `SPATIAL_AGENT_CONFIG` names the settings file (see `world-agent/spatial-agent.example.toml`); `[world_store]` holds
-the database path and, optionally, where and how often it is backed up.
+the database path and, optionally, where and how often it is backed up. `[object_descriptions]`, when given, turns on
+describing objects and searching them by meaning, and `GEMINI_API_KEY` must then be set in the node's environment,
+or the node stops at start; without the section the key is not used, objects are not described and `find` matches
+words only.
 
 ```
 cargo test -p dora-world-agent

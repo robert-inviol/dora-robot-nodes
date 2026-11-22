@@ -85,3 +85,29 @@ sql_row_limit = 200
 [world_store]
 # The dora node's world model; created on first start. Only one process may have it open. The console does not use it.
 path = "/tmp/spatial-agent-world.sqlite"
+
+# Describing objects so find can search by meaning. Without this section objects are not described and find matches
+# words of labels only. With it, every confirmed object's best view (as the object map sends it, on appearing and on a
+# clearly better view) is described by the describer model with the image and one line of facts (its size and the
+# labels it was segmented under), then the description's text and the view's image are each embedded by the Gemini
+# embedding model; find embeds its query text the same way. Two Gemini calls and one Claude call per view; people are
+# never described. The Gemini API key is read from the environment variable GEMINI_API_KEY, and the node does not
+# start without it while this section is given.
+# [object_descriptions]
+# describe_timeout_s = 60
+# # A failed call is tried again after each of these pauses, then reported.
+# retry_after_s = [10, 60, 300]
+# queue_capacity = 512
+# concurrent_objects = 2
+# person_labels = ["person", "people", "man", "woman", "child", "boy", "girl", "baby", "human"]
+#
+# [object_descriptions.describer]
+# model = "claude-haiku-5-5"
+# effort = "low"
+# system_prompt = "You describe objects a home robot has seen."
+#
+# [object_descriptions.embedding]
+# model = "gemini-embedding-2"
+# dimensions = 768
+# # Shorter than mcp_tool_timeout_s: find waits for its query's embedding.
+# request_timeout_s = 4

@@ -1,0 +1,29 @@
+[package]
+name = "object-descriptions"
+version = "0.1.0"
+description = "Describes each object's best view with Claude and embeds the description and the view with Gemini, so the spatial agent can find objects by meaning"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+readme = "README.md"
+
+[dependencies]
+perception-wire = { path = "../../dora-depth-perception/perception-wire" }
+world-agent = { path = "../world-agent" }
+world-model = { path = "../world-model" }
+world-store = { path = "../world-store" }
+thiserror.workspace = true
+base64 = "0.22"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+jpeg-encoder = "0.6"
+tempfile = "3"
+tokio = { version = "1", features = ["net"] }

@@ -54,6 +54,7 @@ async fn main() {
         ChannelGoalSink(goal_sender),
         FakeWorld::house(),
         answer_sender,
+        None,
     )
     .await
     .expect("the service starts");

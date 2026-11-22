@@ -9,6 +9,8 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use base64::Engine;
+
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
@@ -16,9 +18,9 @@ use crate::config::{ModelName, WatchdogConfig};
 use crate::identity::AgentRegistry;
 use crate::mcp::{SERVER_NAME, TOOL_NAMES};
 use crate::model::{Duty, ModelClient, ModelReply, Prompt, Spend};
-use crate::process::{AgentProcess, Launcher, ProcessEvent, SpawnError, ToolAccess};
+use crate::process::{AgentProcess, Launcher, ProcessEvent, ProcessProfile, ReplyShape, SpawnError, ToolAccess, STRUCTURED_OUTPUT_TOOL};
 use crate::protocol::{
-    ApiErrorKind, ControlRequestBody, InputMessage, MessageUuid, OutputEvent, ResultSubtype, SessionId, SystemInit,
+    ApiErrorKind, ControlRequestBody, ImageSource, InputMessage, UserInputBlock, MessageUuid, OutputEvent, ResultSubtype, SessionId, SystemInit,
     TurnResult, INTERRUPT_RECEIPT, INTERRUPT_SEND_NOW,
 };
 
@@ -54,17 +56,21 @@ enum Escalation {
     Killed,
 }
 
-fn expected_tools(tools: &ToolAccess) -> Vec<String> {
-    let mut names: Vec<String> = match tools {
+fn expected_tools(profile: &ProcessProfile) -> Vec<String> {
+    let mut names: Vec<String> = match profile.tools {
         ToolAccess::World(_) => TOOL_NAMES.iter().map(|t| format!("mcp__{SERVER_NAME}__{t}")).collect(),
         ToolAccess::None => Vec::new(),
     };
+    if let ReplyShape::Structured(_) = profile.reply {
+        names.push(STRUCTURED_OUTPUT_TOOL.to_owned());
+    }
     names.sort();
     names
 }
 
 /// Why an init event shows a process that is not set up as launched, if it is not.
-fn init_problem(init: &SystemInit, session: SessionId, tools: &ToolAccess) -> Option<String> {
+fn init_problem(init: &SystemInit, session: SessionId, profile: &ProcessProfile) -> Option<String> {
+    let tools = &profile.tools;
     let mut listed = init.tools.clone();
     listed.sort();
     let world_connected = init.mcp_servers.iter().any(|s| s.name == SERVER_NAME && s.is_connected());
@@ -72,7 +78,7 @@ fn init_problem(init: &SystemInit, session: SessionId, tools: &ToolAccess) -> Op
         Some(format!("session {} instead of {session}", init.session_id))
     } else if init.permission_mode != "dontAsk" {
         Some(format!("permission mode {}", init.permission_mode))
-    } else if listed != expected_tools(tools) {
+    } else if listed != expected_tools(profile) {
         Some(format!("tools {listed:?}"))
     } else if matches!(tools, ToolAccess::World(_)) && !world_connected {
         Some(format!("MCP servers {:?}", init.mcp_servers))
@@ -93,7 +99,7 @@ enum CallEnd {
 /// One model call on one process, from the user message to the result that names it.
 struct Call<'a> {
     process: &'a mut AgentProcess,
-    tools: &'a ToolAccess,
+    profile: &'a ProcessProfile,
     watchdog: WatchdogConfig,
     uuid: MessageUuid,
     last_event: Instant,
@@ -102,7 +108,15 @@ struct Call<'a> {
 
 impl Call<'_> {
     async fn run(mut self, prompt: Prompt) -> CallEnd {
-        if let Err(error) = self.process.write(&InputMessage::user(self.uuid, prompt.0)).await {
+        let message = match prompt.image {
+            None => InputMessage::user(self.uuid, prompt.text),
+            Some(image) => {
+                let data = base64::engine::general_purpose::STANDARD.encode(image.bytes());
+                let source = ImageSource::Base64 { media_type: image.media_type(), data };
+                InputMessage::user_blocks(self.uuid, vec![UserInputBlock::Image { source }, UserInputBlock::Text { text: prompt.text }])
+            }
+        };
+        if let Err(error) = self.process.write(&message).await {
             return CallEnd::Error(error.into());
         }
         let tick = (self.watchdog.silent_turn / 5).min(Duration::from_millis(250));
@@ -127,7 +141,7 @@ impl Call<'_> {
     fn handle(&mut self, event: ProcessEvent) -> Option<CallEnd> {
         match event {
             ProcessEvent::Output(OutputEvent::SystemInit(init)) => {
-                init_problem(&init, self.process.session, self.tools).map(|problem| CallEnd::Down(DownReason::Misconfigured(problem)))
+                init_problem(&init, self.process.session, self.profile).map(|problem| CallEnd::Down(DownReason::Misconfigured(problem)))
             }
             ProcessEvent::Output(OutputEvent::ApiRetry(retry)) => {
                 tracing::warn!(agent = %self.process.agent, ?retry, "API call retried");
@@ -160,12 +174,20 @@ impl Call<'_> {
             let message = result.result.unwrap_or_else(|| "claude gave no message".to_owned());
             return CallEnd::Error(AskError::Failed { subtype: result.subtype, message });
         }
-        let Some(text) = result.result else {
-            return CallEnd::Error(AskError::Protocol("a successful result with no text".to_owned()));
+        let (text, structured) = match (&self.profile.reply, result.result, result.structured_output) {
+            (ReplyShape::FreeText, Some(text), _) => (text, None),
+            (ReplyShape::FreeText, None, _) => {
+                return CallEnd::Error(AskError::Protocol("a successful result with no text".to_owned()));
+            }
+            (ReplyShape::Structured(_), text, Some(structured)) => (text.unwrap_or_default(), Some(structured)),
+            (ReplyShape::Structured(_), _, None) => {
+                return CallEnd::Error(AskError::Protocol("a successful result with no structured output".to_owned()));
+            }
         };
         let usage = result.usage.unwrap_or_default();
         CallEnd::Reply(ModelReply {
             text,
+            structured,
             spend: Spend { input_tokens: usage.input_tokens, output_tokens: usage.output_tokens, cost_usd: result.total_cost_usd },
         })
     }
@@ -275,7 +297,7 @@ impl ModelClient for ClaudeCodeClient {
         tracing::info!(agent = %process.agent, session = %process.session, model = %self.model(), ?duty, "model call");
         let call = Call {
             process: &mut process,
-            tools: &self.launcher.profile().tools,
+            profile: self.launcher.profile(),
             watchdog: self.watchdog,
             uuid: MessageUuid::random(),
             last_event: Instant::now(),

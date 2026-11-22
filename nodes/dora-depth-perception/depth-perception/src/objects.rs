@@ -46,7 +46,7 @@ pub struct ObjectFootprint {
 
 /// Pixels whose nearest unmasked pixel (or image edge) is more than `radius` steps away in L1 distance,
 /// the same as eroding `radius` times with a 4-connected cross.
-fn eroded(mask: &ObjectMask, radius: usize) -> Vec<usize> {
+pub fn eroded(mask: &ObjectMask, radius: usize) -> Vec<usize> {
     let (width, height) = (mask.width, mask.height);
     let Some((mut top, mut bottom, mut left, mut right)) = mask
         .pixels

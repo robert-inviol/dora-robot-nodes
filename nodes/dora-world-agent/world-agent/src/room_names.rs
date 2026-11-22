@@ -89,7 +89,7 @@ pub fn parse_room_name(reply: &str) -> Result<RoomName, NotARoomName> {
 pub fn naming_prompt(composition: &Composition, other_names: &[RoomName]) -> Prompt {
     let others: Vec<&str> = other_names.iter().map(|n| n.0.as_str()).collect();
     let others = if others.is_empty() { "none".to_owned() } else { others.join(", ") };
-    Prompt(format!("Objects in this room: {}.\nOther rooms: {others}.", composition.describe()))
+    Prompt::text(format!("Objects in this room: {}.\nOther rooms: {others}.", composition.describe()))
 }
 
 #[derive(Default)]
@@ -208,7 +208,7 @@ mod tests {
     #[test]
     fn the_prompt_counts_the_objects_and_names_the_other_rooms() {
         let prompt = naming_prompt(&Composition::of(&labels(&["chair", "table", "chair"])), &[RoomName("hallway".to_owned())]);
-        assert_eq!(prompt.0, "Objects in this room: 2 chair, 1 table.\nOther rooms: hallway.");
-        assert_eq!(naming_prompt(&Composition::of(&labels(&["bed"])), &[]).0, "Objects in this room: 1 bed.\nOther rooms: none.");
+        assert_eq!(prompt.text, "Objects in this room: 2 chair, 1 table.\nOther rooms: hallway.");
+        assert_eq!(naming_prompt(&Composition::of(&labels(&["bed"])), &[]).text, "Objects in this room: 1 bed.\nOther rooms: none.");
     }
 }

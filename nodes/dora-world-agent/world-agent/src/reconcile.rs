@@ -31,7 +31,7 @@ fn goal_text(goal: Option<GoalTarget>) -> String {
 }
 
 pub fn reconcile_prompt(digest: &Digest, question: &str, sent: Candidate, later: Candidate) -> Prompt {
-    Prompt(format!(
+    Prompt::text(format!(
         "{digest}\n\n{QUESTION_HEADING}: {question}\n\n{ANSWER_SENT_HEADING} ({}): {}\nGOAL SENT: {}\n\n{} {}\nGOAL PROPOSED: {}",
         sent.model,
         sent.text,
@@ -97,7 +97,7 @@ mod tests {
             Candidate { model: &slow, text: "In the sink, by p1.", goal: Some(GoalTarget::Place(PlaceId(1))) },
         );
         assert_eq!(
-            prompt.0,
+            prompt.text,
             "WORLD DIGEST as_of now\n\nQUESTION: Where is my mug?\n\n\
              ANSWER SENT (claude-haiku-5-5): On the table o42.\nGOAL SENT: object o42\n\n\
              LATER ANSWER (claude-opus-5-5): In the sink, by p1.\nGOAL PROPOSED: place p1"

@@ -61,9 +61,14 @@ map.
 | `world-model` | The `WorldModel` trait the tools read, and its value types |
 | `world-store` | The world model in SQLite: objects as history rows, rooms, places, events and goals |
 | `world-agent` | Question answering with Claude Code over stream-json: fan-out, reconciliation, goals, room names, the MCP tools, the settings, and the `world-agent` console against an in-memory house |
+| `object-descriptions` | Each object's best view described by Claude Haiku and embedded, with its description, by Gemini, in the background; the `find` query embedder |
 | `dora-world-agent` | The node: the dora loop, and the world store wired to the agent |
 
-`world-store`, `world-agent` and `dora-world-agent` each have a README with the detail.
+`world-store`, `world-agent`, `object-descriptions` and `dora-world-agent` each have a README with the detail.
+
+With `[object_descriptions]` in the settings (see `object-descriptions/README.md`), every object's view the object map
+sends is described and embedded, and `find` searches by meaning; the node then needs `GEMINI_API_KEY` in its
+environment. Without the section objects are not described and `find` matches words of labels and descriptions.
 
 ## Running
 

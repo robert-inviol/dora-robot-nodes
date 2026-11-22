@@ -32,7 +32,8 @@ is placed at its centroid), then its goal's target; ids the snapshot does not kn
 ## Model calls
 
 `model::ModelClient` is the one seam to whatever runs the models: `ask(duty, prompt)` with a `Duty` (answer a
-question as a given answerer, reconcile, name a room). `claude_code::ClaudeCodeClient` implements it on the Claude Code
+question as a given answerer, reconcile, name a room, describe an object). A `Prompt` is text and, for a call about
+an image, a JPEG, which goes to claude as an image content block ahead of the text block. `claude_code::ClaudeCodeClient` implements it on the Claude Code
 CLI over stream-json, so it runs on a subscription login or an API key; a Messages API backend would implement the
 same trait and call `mcp::ToolContext` itself.
 
@@ -45,7 +46,10 @@ Every process starts with `-p --input-format stream-json --output-format stream-
 --include-partial-messages --tools "" --strict-mcp-config --permission-mode dontAsk --permission-prompts none
 --setting-sources "" --disable-slash-commands --session-id <uuid>`, in the empty work directory, with tool search,
 background tasks, auto memory, CLAUDE.md files, git instructions, non-essential traffic and the auto-updater off.
-Answerers also get `--mcp-config <world server> --allowedTools mcp__world`; each process has its own agent id and
+A process whose `ProcessProfile.reply` is `ReplyShape::Structured(schema)` also gets `--json-schema <schema>`: its init
+event must then list the `StructuredOutput` tool, and a successful result must carry `structured_output`, which the
+reply returns as `ModelReply.structured`; a result without it is a protocol error. Answerers also get
+`--mcp-config <world server> --allowedTools mcp__world`; each process has its own agent id and
 bearer token, sent as `X-Agent-Id` and `Authorization` and expanded from its environment. A process may call tools
 only while it answers a question.
 
@@ -73,6 +77,7 @@ named again once more than `rename_after_change` of its objects differ from when
 | `goals` | `standoff_m`, `max_speed_m_s`, `deadline_s` when a model does not say |
 | `mcp` | `port` on 127.0.0.1 (0 takes a free one), `sql_row_limit` |
 | `world_store` | `path` of the database the dora node opens, and an optional `backup` with `path` and `every_s`; the console does not use it |
+| `object_descriptions` | Optional; without it objects are not described and `find` matches words only. `describer` (`model`, `effort`, `system_prompt`), `describe_timeout_s`, `embedding` (`model`, `dimensions` 128 to 3072, `request_timeout_s`, which must be shorter than `claude.mcp_tool_timeout_s`), `retry_after_s` (the pauses before each retry of a failed call), `queue_capacity`, `concurrent_objects`, `person_labels`. The dora node reads the Gemini API key from `GEMINI_API_KEY` and does not start without it while the section is given. See `object-descriptions` |
 
 ## Tools
 
@@ -82,8 +87,8 @@ their part of the digest with their id, such as `r3`, which answers may name.
 
 | Tool | Answer |
 |---|---|
-| `find` | Objects by free text, label, room or nearness, with distance from the robot |
-| `describe_object` | Geometry, caption, relations, where it stood over time, and its best views as images |
+| `find` | Objects by free text, label, room or nearness, with distance from the robot and the scores they matched by (see below) |
+| `describe_object` | Geometry, the description of its best view (`name`, `category`, `description`, `colour`, `material`), relations, where it stood over time, and its best views as images |
 | `clearance_between` | The narrowest gap between two objects, places or the robot, and whether the robot fits |
 | `route` | Length, places and rooms passed, narrowest clearance, estimated time |
 | `last_seen` | Where and when a person or object was last seen; for a person, the heading, the doorways ahead and every fitted joint, with its height above the floor |
@@ -92,6 +97,18 @@ their part of the digest with their id, such as `r3`, which answers may name.
 | `query_sql` | One read-only SELECT on the world store |
 | `send_goal` | A goal by object, place or track id, or a map pose: sent by the fast answerer, proposed by the others |
 | `cancel_goal` | A stop for the running goal: sent by the fast answerer, proposed by the others |
+
+`find` with text and a query embedder (`search::QueryEmbedder`, given to `SpatialService::start`) embeds the text
+and the world model ranks every object of the map by meaning: each found object carries `matched` with `words` (the
+share of the query's words found as whole words in its label or description, `world_model::WordShare::of_query`), `description` and `view` (the cosine similarity of the
+query to its description's and its view's embedding, null where not embedded yet), and `score`, the higher of the two
+similarities (0 when neither exists) plus `world_model::WORD_MATCH_WEIGHT` (0.1) times `words`. An object with no
+vector and no word in common is not found. Ties go to the nearer object. `find` returns at most `limit` objects, 5 unless the model gives one (the world store's
+`StoreConfig::find_limit`) and never more than 25 (`mcp::MAX_FIND_LIMIT`): every object with a vector matches by
+meaning, so the list is always the best few. Scores are relative; the tool's description gives the model the
+similarities measured live (unrelated about 0.5 to 0.66, a true match about 0.7 to 0.85). Without a query embedder, or without text,
+`score` is `words` and only objects holding a word are found. A query that cannot be embedded makes `find`
+fail with the reason; it never falls back to words alone.
 
 The tools read the `WorldModel` trait of the `world-model` crate (re-exported as `world_agent::world`); goals leave
 through `goals::GoalSink` with their origin: the fast answerer, or the reconciler through a revision.

@@ -5,7 +5,8 @@
 use std::fmt;
 use std::future::Future;
 
-use perception_wire::navigation::{QuestionId, RoomId};
+use perception_wire::navigation::{ObjectId, QuestionId, RoomId};
+use serde_json::Value;
 
 use crate::config::{AnswererRole, ModelName};
 
@@ -25,11 +26,52 @@ pub enum Duty {
     Answer { question: QuestionId, answerer: AnswererId, role: AnswererRole },
     Reconcile { question: QuestionId },
     NameRoom { room: RoomId },
+    DescribeObject { object: ObjectId },
 }
 
-/// The user message of one model call. Each call is a fresh session holding only this message.
+/// An image a prompt shows the model.
+#[derive(Clone, PartialEq, Eq)]
+pub enum PromptImage {
+    Jpeg(Vec<u8>),
+}
+
+impl PromptImage {
+    pub fn media_type(&self) -> &'static str {
+        match self {
+            PromptImage::Jpeg(_) => "image/jpeg",
+        }
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        match self {
+            PromptImage::Jpeg(bytes) => bytes,
+        }
+    }
+}
+
+impl fmt::Debug for PromptImage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "PromptImage({}, {} bytes)", self.media_type(), self.bytes().len())
+    }
+}
+
+/// The user message of one model call: an image, if the call is about one, then the text. Each call is a fresh
+/// session holding only this message.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Prompt(pub String);
+pub struct Prompt {
+    pub image: Option<PromptImage>,
+    pub text: String,
+}
+
+impl Prompt {
+    pub fn text(text: impl Into<String>) -> Self {
+        Self { image: None, text: text.into() }
+    }
+
+    pub fn about_image(image: PromptImage, text: impl Into<String>) -> Self {
+        Self { image: Some(image), text: text.into() }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Spend {
@@ -41,6 +83,8 @@ pub struct Spend {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ModelReply {
     pub text: String,
+    /// The reply in the shape of the client's JSON schema, for a client given one.
+    pub structured: Option<Value>,
     pub spend: Spend,
 }
 

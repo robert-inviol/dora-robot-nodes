@@ -48,6 +48,7 @@ impl Harness {
             ChannelGoalSink(goal_sender),
             FakeWorld::house_at(NOW),
             answer_sender,
+            None,
         )
         .await
         .unwrap();
@@ -345,6 +346,7 @@ async fn a_work_dir_that_is_not_empty_is_refused() {
         ChannelGoalSink(goals),
         FakeWorld::house_at(NOW),
         answers,
+        None,
     )
     .await;
     assert!(matches!(started, Err(StartError::WorkDirNotEmpty(_))));

@@ -9,6 +9,7 @@ use dora_node_api::{DoraNode, Event, MetadataParameters};
 use dora_world_agent::node::{SpatialNode, NAV_GOAL_OUTPUT, SPATIAL_ANSWER_OUTPUT};
 use dora_world_agent::world::SqliteWorld;
 use eyre::{eyre, Result, WrapErr};
+use object_descriptions::gemini::{GeminiApiKey, GEMINI_API_KEY_VARIABLE};
 use perception_wire::navigation::{encode_nav_goal, encode_spatial_answer};
 use world_agent::config::SpatialConfig;
 
@@ -24,7 +25,8 @@ async fn main() -> Result<()> {
     let config = SpatialConfig::load(&path)?;
     let world = SqliteWorld::open(&config.world_store)
         .wrap_err_with(|| format!("opening the world store at {}", config.world_store.path.display()))?;
-    let (spatial, mut outputs) = SpatialNode::start(&config, world).await?;
+    let gemini_key = GeminiApiKey::from_variable(std::env::var_os(GEMINI_API_KEY_VARIABLE));
+    let (spatial, mut outputs) = SpatialNode::start(&config, world, gemini_key).await?;
     let (mut node, mut events) = DoraNode::init_from_env()?;
     let nav_goal_output = DataId::from(NAV_GOAL_OUTPUT.to_owned());
     let answer_output = DataId::from(SPATIAL_ANSWER_OUTPUT.to_owned());

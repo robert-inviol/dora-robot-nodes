@@ -22,9 +22,11 @@ use perception_wire::space_map::{
 };
 use world_agent::clock;
 use world_agent::config::{
-    AnswererConfig, AnswererRole, AnsweringConfig, ClaudeConfig, ClaudeCredentials, CompositionChange, Effort, GoalDefaults, McpConfig, ModelName,
-    ModelProfile, RoomNamerConfig, SpatialConfig, SystemPrompt, WatchdogConfig, WorldStoreSettings,
+    AnswererConfig, AnswererRole, AnsweringConfig, ClaudeConfig, ClaudeCredentials, CompositionChange, Effort, EmbeddingConfig,
+    EmbeddingDimensions, GoalDefaults, McpConfig, ModelName, ModelProfile, ObjectDescriptionsConfig, RoomNamerConfig, SpatialConfig,
+    SystemPrompt, WatchdogConfig, WorldStoreSettings,
 };
+use world_agent::world::EmbeddingModel;
 use world_agent::world::{EntityRef, Joint, SqlValue, WorldModel};
 use world_store::StoreConfig;
 
@@ -78,6 +80,7 @@ fn config(dir: &Path) -> SpatialConfig {
         },
         mcp: McpConfig { port: 0, sql_row_limit: NonZeroUsize::new(10).unwrap() },
         world_store: WorldStoreSettings { path: dir.join("world.sqlite"), backup: None },
+        object_descriptions: None,
     }
 }
 
@@ -204,7 +207,7 @@ async fn a_question_is_answered_from_the_ingested_world_and_its_goal_is_recorded
     let mut store_config = StoreConfig::at(&config.world_store.path);
     store_config.batch_interval = Duration::from_millis(20);
     let world = SqliteWorld::open_with(store_config).unwrap();
-    let (spatial, mut outputs) = SpatialNode::start(&config, world.clone()).await.unwrap();
+    let (spatial, mut outputs) = SpatialNode::start(&config, world.clone(), None).await.unwrap();
 
     let now = clock::now();
     spatial.on_input(StoreInput::Topology.input_id(), &topology(now)).await.unwrap();
@@ -276,12 +279,34 @@ async fn an_input_that_does_not_decode_is_an_error() {
     let dir = tempfile::tempdir().unwrap();
     let config = config(dir.path());
     let world = SqliteWorld::open(&config.world_store).unwrap();
-    let (spatial, _outputs) = SpatialNode::start(&config, world).await.unwrap();
+    let (spatial, _outputs) = SpatialNode::start(&config, world, None).await.unwrap();
     let error = spatial.on_input(StoreInput::Topology.input_id(), &occupancy_grid(clock::now())).await.unwrap_err();
     assert!(format!("{error:#}").contains("decoding a topology"), "{error:#}");
     let error = spatial.on_input("keep_out", &occupancy_grid(clock::now())).await.unwrap_err();
     assert!(error.to_string().contains("unexpected input keep_out"), "{error}");
     spatial.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn object_descriptions_without_a_gemini_key_stop_the_node_at_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = config(dir.path());
+    config.object_descriptions = Some(ObjectDescriptionsConfig {
+        describer: ModelProfile { model: model("describer"), effort: Effort::Low, system_prompt: SystemPrompt("You describe objects.".to_owned()) },
+        describe_timeout: Duration::from_secs(60),
+        embedding: EmbeddingConfig {
+            model: EmbeddingModel("gemini-embedding-2".to_owned()),
+            dimensions: EmbeddingDimensions::new(768).unwrap(),
+            request_timeout: Duration::from_secs(4),
+        },
+        retry_after: vec![Duration::from_secs(10)],
+        queue_capacity: NonZeroUsize::new(8).unwrap(),
+        concurrent_objects: NonZeroUsize::new(1).unwrap(),
+        person_labels: vec!["person".to_owned()],
+    });
+    let world = SqliteWorld::open(&config.world_store).unwrap();
+    let error = SpatialNode::start(&config, world, None).await.err().expect("no key, no start");
+    assert_eq!(error.to_string(), "the settings have [object_descriptions] but GEMINI_API_KEY is not set");
 }
 
 /// The odom frame odometry started first, at camera time 0.
@@ -319,7 +344,7 @@ async fn people_in_odometry_are_transformed_once_the_localizer_sends_its_correct
     let mut store_config = StoreConfig::at(&config.world_store.path);
     store_config.batch_interval = Duration::from_millis(20);
     let world = SqliteWorld::open_with(store_config).unwrap();
-    let (spatial, _outputs) = SpatialNode::start(&config, world.clone()).await.unwrap();
+    let (spatial, _outputs) = SpatialNode::start(&config, world.clone(), None).await.unwrap();
     let now = clock::now();
     spatial.on_input(StoreInput::Topology.input_id(), &topology(now)).await.unwrap();
     let people = StoreInput::PeopleTracks.input_id();
@@ -356,7 +381,7 @@ async fn after_an_odometry_restart_people_wait_for_a_correction_in_the_new_odom_
     let mut store_config = StoreConfig::at(&config.world_store.path);
     store_config.batch_interval = Duration::from_millis(20);
     let world = SqliteWorld::open_with(store_config).unwrap();
-    let (spatial, _outputs) = SpatialNode::start(&config, world.clone()).await.unwrap();
+    let (spatial, _outputs) = SpatialNode::start(&config, world.clone(), None).await.unwrap();
     spatial.on_input(StoreInput::Topology.input_id(), &topology(clock::now())).await.unwrap();
     let correction = |odom_started: i64, x_m: f32| MapToOdom {
         map_version: VERSION,
