@@ -1,0 +1,12 @@
+[package]
+name = "dora-localizer-input-recorder"
+version = "0.1.0"
+description = "dora node that records what the map localizer node takes (keyframes, imu messages, odometry poses, calibrations) for replaying offline"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+dora-map-localizer = { path = "../dora-map-localizer" }
+dora-node-api.workspace = true
+eyre.workspace = true

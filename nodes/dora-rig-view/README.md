@@ -1,12 +1,26 @@
 # dora-rig-view
 
-A [dora](https://dora-rs.ai) node serving a live 3D page of the robot's map for people to watch: the dense map's
-surface, with every object's voxels painted on it in the object's colour; the robot and its path from odometry;
-people with their fitted skeletons; and objects as labelled boxes. Diagnostic layers, off until turned on: the
-keyframe clouds (each new view's depth as a coloured point cloud at its map pose from the localizer); and the dense
-map's rooms, doorways and places. Each toggle says on hover what it shows and who uses it, and the page remembers the
-toggles in the browser. Drag to orbit, right-drag to pan, scroll to zoom, or follow the robot. Surface faces point to
-the free side, so walls are see-through from behind.
+A [dora](https://dora-rs.ai) node serving a live 3D page of the robot's map for people to watch, on a dark
+background:
+
+- The keyframe clouds: each new view's depth as a dense coloured point cloud at its map pose from the localizer.
+- Segments: each cloud point inside an object's voxels tinted with the object's colour, blended with the point's own.
+- Each object as a box, with a floating label of its name and size in metres (length x width x height, from the
+  object's footprint and height band), and listed in the side panel with its colour and its distance from the robot;
+  clicking an object in the list flies the camera to it.
+- The robot and its path from odometry, and people with their fitted skeletons, always shown.
+- Diagnostic layers, off until turned on: the dense map's mesh, with every object's voxels painted on it in the
+  object's colour; and the dense map's rooms, doorways and places.
+
+The panel has the views "Robot view" (from the robot's pose, looking along its forward), "Behind robot" and "Top
+down", a "Follow robot" switch, a toggle per layer and a point size slider. Each toggle says on hover what it shows
+and who uses it, and the page remembers the toggles and the point size in the browser. Drag to orbit, right-drag to
+pan, scroll to zoom. Mesh faces point to the free side, so walls are see-through from behind.
+
+The segment tint is worked out in the page: the object voxels are one hash of cube keys to object ids, and a cloud is
+tinted again when it arrives, when its pose moves, when the segments are turned on or off, and when an object's
+voxels change, then only the clouds whose box reaches the cubes that changed. The tinting runs a few clouds each frame,
+so the robot and the people keep moving while it catches up.
 
 A page gets the whole scene once when it connects, then only what changes, over one WebSocket:
 
@@ -15,7 +29,7 @@ A page gets the whole scene once when it connects, then only what changes, over 
 | Surface blocks: each changed block's whole surface, gzip | with each of the dense map's surface messages, at most 5 a second | 1-2 KB a block; a 6 x 5 m room is about 500 blocks |
 | The whole scene again, starting with a reset, as a page that connects gets it | when a snapshot repairs the surface, or a new run of the dense map replaces it | as a connecting page's |
 | Surface stream counts: gaps in the dense map's surface sequence and snapshots taken | when either changes | about 50 B |
-| A keyframe's cloud, in its own floor frame, gzip | once per keyframe from a new view, only to a page that shows the clouds | about 20 KB at 320x240 px, roughly 300 KB at 1280x720 px with the default stride |
+| A keyframe's cloud, in its own floor frame, gzip | once per keyframe that sees space no drawn cloud holds, only to a page that shows the clouds | 9 B a point before gzip; one point for each map voxel the keyframe is first to see |
 | A cloud's space carving: the indices of the points removed | when a registered keyframe's depth removes points, only to a page that shows the clouds | 4 B a point, gzip |
 | A keyframe's pose | when the localizer sends it, and again whenever a pose graph optimization moves it | about 100 B |
 | The robot | with every odometry pose, 30 a second on the rig | about 100 B |
@@ -26,7 +40,7 @@ A page gets the whole scene once when it connects, then only what changes, over 
 Every vertex of a mesh block is sent as millimetres from its block's corner. A vertex is painted with an object's
 colour when its own voxel of the object grid, or one beside it, holds a point of the object.
 
-A page asks for the keyframe clouds with `{"clouds": true}` when its clouds layer is turned on, gets the clouds so
+A page asks for the keyframe clouds with `{"clouds": true}` when its clouds layer is on (it is unless turned off), gets the clouds so
 far, and stops them with `{"clouds": false}`. The clouds so far go out between the scene's updates, which go first,
 so the robot and the people keep moving while they come.
 
@@ -34,6 +48,10 @@ A keyframe's cloud is drawn only for a new view (`src/clouds.rs`): one cloud per
 the map, as its keyframe pose's `selection` says. A keyframe it did not select (`not_selected`, localized near the map
 keyframe it names) is a repeat view: its cloud is not kept or sent. So a still camera draws one cloud, and a keyframe a second from the same place changes nothing on
 the page but what its depth carves away. A keyframe waits for its map pose before it is drawn or not.
+
+Voxel thinning: a drawn cloud keeps only its points in map voxels no drawn cloud holds, one a voxel, at the map pose
+it is placed with. A surface seen from many keyframes is drawn once, and a keyframe that sees no new space draws no
+cloud. A voxel is free again when its point is carved away or its cloud is dropped.
 
 Space carving: the depth of every registered keyframe, repeat views included, votes on each point of every drawn
 cloud but its own. Depth more than 10 cm beyond the point saw through it; depth within 10 cm of it saw it again. A
@@ -112,15 +130,23 @@ surface message it cannot draw, or the background thread falling 64 messages beh
 |---|---|
 | `RIG_VIEW_ADDRESS` | IP address the page is served on, such as `127.0.0.1` or one of the server's own; required |
 | `RIG_VIEW_PORT` | Port of the page; required |
-| `RIG_VIEW_STRIDE_PX` | Every n-th depth pixel each way becomes a point; default 4 |
+| `RIG_VIEW_STRIDE_PX` | Every n-th depth pixel each way becomes a point; default 2 |
 | `RIG_VIEW_MAX_RANGE_M` | Depth beyond this is left out of the clouds; default 5, at most 32 |
+| `RIG_VIEW_CLOUD_VOXEL_M` | Side of the map voxels the drawn clouds share, one point drawn in each; default 0.02 |
 | `RIG_VIEW_MAX_KEYFRAMES` | The newest this many clouds of new views are kept; default 600 |
+
+The drawn clouds share a grid of map voxels with one point in each, so the points a page draws grow with the space
+seen, not with the keyframes: about 2,500 points for each square metre of surface at the default voxel, at 18 B a
+point in the page and 15 B a point on the graphics card. The node keeps 10 B a point and the encoded cloud, and each
+registered keyframe's space carving visits every point of every cloud kept.
 
 It runs as the `rig_view` node of the spatial server's dataflow,
 `nodes/dora-depth-perception/examples/spatial-server-dataflow.yml`.
 
 Build with `cargo build --release` here (on strixen). `cargo run --release --example demo -- 8094` serves the page, on
-every interface, fed by a synthetic robot driving a circle in a room with a chair, with odometry and people at 30 Hz: its keyframes are fused by the dense map itself, which
-sends the surface and the topology, the chair's voxels paint the surface, a person walks along a wall, the first
+every interface, fed by a synthetic robot driving a circle in a room with a chair and a sofa, with odometry and people
+at 30 Hz: its 1280x720 keyframes become the clouds, and smaller renders of them are fused by the dense map itself,
+which sends the surface and the topology; the chair's and the sofa's voxels tint the clouds and paint the mesh; a
+person walks along a wall, the first
 surface message after 10 s is lost on its way so that the rig view asks for a snapshot and the snapshot repairs the
 surface, and after 20 s a loop closure moves every keyframe 5 cm and the dense map rebuilds.

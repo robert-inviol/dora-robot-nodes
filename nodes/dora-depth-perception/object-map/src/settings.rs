@@ -38,7 +38,8 @@ pub struct DetectionSettings {
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AssociationSettings {
-    /// A detection is of an object when at least this fraction of its voxels touch the object's voxels.
+    /// A detection is of an object when at least this fraction of its voxels touch the object's voxels and, unless
+    /// their labels agree, this fraction of the object's touch its own.
     pub min_overlap: f32,
 }
 
@@ -54,7 +55,8 @@ pub struct ConfirmationSettings {
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MergeSettings {
-    /// Two objects with agreeing labels are one when this fraction of the smaller one's voxels touch the larger.
+    /// Two objects are one when this fraction of the smaller one's voxels touch the larger and, unless their labels
+    /// agree, this fraction of the larger one's touch the smaller.
     pub min_overlap: f32,
     /// Captured time between merge passes.
     pub interval_s: f64,

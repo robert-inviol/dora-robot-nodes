@@ -501,17 +501,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "dora-delta2a-lidar"
-version = "0.1.0"
-dependencies = [
- "delta2a",
- "dora-node-api",
- "eyre",
- "serialport",
- "wire-schemas",
-]
-
-[[package]]
 name = "dora-message"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -557,6 +546,18 @@ dependencies = [
  "shared_memory_extended",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "dora-serial-lidar"
+version = "0.1.0"
+dependencies = [
+ "delta2a",
+ "dora-node-api",
+ "eyre",
+ "ld06",
+ "serialport",
+ "wire-schemas",
 ]
 
 [[package]]
@@ -943,6 +944,10 @@ name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
+
+[[package]]
+name = "ld06"
+version = "0.1.0"
 
 [[package]]
 name = "lexical-core"

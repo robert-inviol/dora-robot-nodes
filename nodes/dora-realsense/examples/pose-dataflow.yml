@@ -1,10 +1,11 @@
 # On the camera's machine, everything the spatial server needs from it: the D455 through YOLOv8 pose on the Hailo-8,
 # odometry from its depth and IMU, the people placed in 3D in the odom frame, keyframes, and posed depth frames (depth
 # at its exact odometry pose, ten a second), published on rig/people_tracks, rig/odom_pose, rig/keyframe, rig/imu,
-# rig/calibration and rig/posed_depth. Paths are relative to this file. Build
+# rig/calibration and rig/posed_depth. It also runs the LD06 lidar, whose scans stay on this machine. Paths are
+# relative to this file. Build
 # `cargo build --release -p dora-realsense -p dora-keyframe-selector -p dora-posed-depth` in dora-realsense,
 # `cargo build --release -p dora-depth-inertial-odometry` in dora-depth-perception, and `cargo build --release` in
-# dora-people-3d and dora-zenoh-bridge; the pose node needs the Pi's hailo-all and python3-gi. Hold the camera still
+# dora-people-3d and dora-zenoh-bridge, and run `build-for-pi.sh` in dora-serial-lidar; the pose node needs the Pi's hailo-all and python3-gi. Hold the camera still
 # from the start until the odometry node logs that it started.
 nodes:
   # The only node that opens the D455.
@@ -97,6 +98,10 @@ nodes:
       person_poses:
         source: pose/person_poses
         queue_size: 30
+      # Travel since the last keyframe calls for the next; only the latest pose matters.
+      odom_pose:
+        source: odometry/odom_pose
+        queue_size: 1
     outputs:
       - request_color
       - imu
@@ -125,6 +130,19 @@ nodes:
       - posed_depth
 
   # The people, the odometry, the keyframes and the posed depth frames to the spatial server, which connects here.
+  # The LD06 lidar above the camera: one scan per turn of its head. The binary comes from
+  # nodes/dora-serial-lidar/build-for-pi.sh.
+  - id: lidar
+    path: ../../dora-serial-lidar/dist/dora-serial-lidar
+    env:
+      LIDAR_MODEL: ld06
+      LIDAR_SERIAL_DEVICE: /dev/serial/by-path/platform-xhci-hcd.1-usb-0:2:1.0-port0
+    inputs:
+      # Each tick reads the bytes that have arrived, so ticks must be much shorter than a turn of the head.
+      tick: dora/timer/millis/20
+    outputs:
+      - scan
+
   - id: bridge
     path: ../../dora-zenoh-bridge/target/release/dora-zenoh-bridge
     env:

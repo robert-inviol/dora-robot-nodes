@@ -1,7 +1,8 @@
-//! dora node: selects keyframes from dora-realsense's frames. It follows the camera's `imu` and `depth`, selects a frame
-//! at least once a second and sooner when the camera turns, asks the camera for that frame's colour, and sends an
-//! `imu` message with every sample since the previous keyframe, then the `keyframe`: depth aligned to colour with the
-//! people of the pose model's `person_poses` cut out, the colour as JPEG, and the gravity estimate.
+//! dora node: selects keyframes from dora-realsense's frames. It follows the camera's `imu` and `depth` and the
+//! odometry's `odom_pose`, selects a frame at least once a second and sooner when the camera turns or travels, asks
+//! the camera for that frame's colour, and sends an `imu` message with every sample since the previous keyframe, then
+//! the `keyframe`: depth aligned to colour with the people of the pose model's `person_poses` cut out, the colour as
+//! JPEG, and the gravity estimate.
 
 use std::fs::File;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -16,6 +17,7 @@ use dora_node_api::{DoraNode, Event, MetadataParameters, Parameter};
 use eyre::{bail, eyre, Context, Result};
 use glam::Vec3;
 use perception_wire::camera::{decode_camera_calibration, CameraCalibration};
+use perception_wire::odometry::decode_odom_pose;
 use perception_wire::people::decode_person_poses;
 use perception_wire::{decode_imu, encode_imu, encode_keyframe};
 use rgbd_keyframes::KeyframeSettings;
@@ -26,6 +28,7 @@ const DEPTH_INPUT: &str = "depth";
 const COLOR_INPUT: &str = "color";
 const CALIBRATION_INPUT: &str = "calibration";
 const PERSON_POSES_INPUT: &str = "person_poses";
+const ODOM_POSE_INPUT: &str = "odom_pose";
 const REQUEST_COLOR_OUTPUT: &str = "request_color";
 const IMU_OUTPUT: &str = "imu";
 const KEYFRAME_OUTPUT: &str = "keyframe";
@@ -157,6 +160,7 @@ fn main() -> Result<()> {
                         }
                     }
                 }
+                ODOM_POSE_INPUT => assembler.add_odom_pose(&decode_odom_pose(data.as_ref()).wrap_err("reading an odom pose")?),
                 DEPTH_INPUT => {
                     let parameters = &metadata.parameters;
                     let frame_id = integer(parameters, DEPTH_INPUT, "frame_id")? as u64;

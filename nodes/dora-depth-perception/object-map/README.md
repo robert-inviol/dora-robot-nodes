@@ -7,9 +7,11 @@ Each keyframe arrives with its instance masks and its pose from the localizer (`
 1. `depth-perception`'s `object_footprint` erodes the mask, keeps the depth band of the object's own surface and
    fits the footprint rectangle and height band; the mask's points inside that rectangle and band are moved into
    the map with the keyframe pose and counted in 5 cm voxels (`detection`).
-2. The detection belongs to the object whose label agrees (`label`: same words, ignoring case and spacing) and whose
-   voxels it touches most, if at least `association.min_overlap` of its voxels touch (one voxel of slack, `voxels`).
-   Otherwise it starts a candidate.
+2. The detection belongs to the object it shares the most space with: at least `association.min_overlap` of its
+   voxels touch the object's (one voxel of slack, `voxels`) and, unless their labels agree (`label`: same words,
+   ignoring case and spacing), as much of the object's touch its own. So a "throw pillow" where a "cushion" is known
+   is that cushion, a part of a sofa seen as "sofa" is that sofa, and a cushion on a sofa is not the sofa. Otherwise
+   it starts a candidate. An object's label is the one with the most detection score behind it (`LabelVotes`).
 
 Then, per keyframe, in order (`map`):
 
@@ -20,8 +22,9 @@ Then, per keyframe, in order (`map`):
 - **Confirmation.** A candidate observed in `confirmation.observations` keyframes within `window_s` `appeared`. If an
   object with an agreeing label disappeared within `absence.moved_window_s`, the candidate takes its id and the
   object `moved`.
-- **Merging**, every `merge.interval_s` of capture time: confirmed objects whose labels agree, where the smaller one's
-  voxels touch the larger by `merge.min_overlap`, merge into the older id (`merged` with `merged_into`).
+- **Merging**, every `merge.interval_s` of capture time: confirmed objects where the smaller one's voxels touch the
+  larger by `merge.min_overlap` and, unless their labels agree, the larger one's touch the smaller as much, merge
+  into the older id (`merged` with `merged_into`); their label votes add up.
 - **Updates** for every confirmed object observed or merged into.
 
 The best view of each object is the mask with the highest score times area; its bounding box is cut from the colour

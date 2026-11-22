@@ -4,7 +4,10 @@
 //! 1. observations: each detection is matched to an object or starts a candidate;
 //! 2. absences: confirmed objects not observed are checked against the measured depth and may disappear;
 //! 3. confirmation: candidates seen often enough become objects, or turn out to be a disappeared object, moved;
-//! 4. merging, every so often: confirmed objects with agreeing labels that overlap become one.
+//! 4. merging, every so often: confirmed objects that overlap become one.
+//!
+//! Where an object is decides which object it is; what it was called is voted on (`LabelVotes`). Two things with
+//! different names stay apart only while one is much smaller than the other, as a cushion on a sofa is.
 
 use std::collections::BTreeSet;
 
@@ -18,7 +21,7 @@ use tracing::{debug, info};
 use crate::crop::RgbImage;
 use crate::detection::{detect, Detection, FrameGeometry};
 use crate::evidence::{judge, CameraView, Verdict};
-use crate::label::Label;
+use crate::label::{Label, LabelVotes};
 use crate::settings::ObjectMapSettings;
 use crate::voxels::{VoxelGrid, VoxelSet};
 use crate::{elapsed, ObservedFrame};
@@ -39,8 +42,8 @@ struct BestView {
 struct MapObject {
     id: ObjectId,
     standing: Standing,
-    /// The label of the best-scoring detection.
-    label: Label,
+    labels: LabelVotes,
+    /// The best detection score.
     score: f32,
     voxels: VoxelSet,
     /// Keyframes the object was detected in.
@@ -55,6 +58,10 @@ struct MapObject {
 }
 
 impl MapObject {
+    fn label(&self) -> &Label {
+        self.labels.winner()
+    }
+
     fn is_confirmed(&self) -> bool {
         self.standing == Standing::Confirmed
     }
@@ -71,10 +78,8 @@ impl MapObject {
             self.last_observation_frame = frame_id;
         }
         self.misses_in_a_row = 0;
-        if detection.score > self.score {
-            self.score = detection.score;
-            self.label = detection.label.clone();
-        }
+        self.labels.add(&detection.label, detection.score);
+        self.score = self.score.max(detection.score);
     }
 
     fn absorb_object(&mut self, other: MapObject) {
@@ -83,10 +88,8 @@ impl MapObject {
         self.misses += other.misses;
         self.misses_in_a_row = self.misses_in_a_row.min(other.misses_in_a_row);
         self.last_observation_frame = self.last_observation_frame.max(other.last_observation_frame);
-        if other.score > self.score {
-            self.score = other.score;
-            self.label = other.label;
-        }
+        self.labels.absorb(other.labels);
+        self.score = self.score.max(other.score);
         let other_view_is_better = match (&self.best_view, &other.best_view) {
             (_, None) => false,
             (None, Some(_)) => true,
@@ -111,7 +114,7 @@ impl MapObject {
             kind,
             object_id: self.id,
             merged_into: None,
-            label: self.label.text().to_owned(),
+            label: self.label().text().to_owned(),
             score: self.score,
             confidence: self.confidence(),
             seen_count: self.observations,
@@ -218,29 +221,30 @@ impl ObjectMap {
         Ok(updates)
     }
 
-    /// The object a detection is of: among objects whose label agrees, the one the detection's voxels touch most,
-    /// if they touch it enough.
+    /// The object a detection is of: the one it shares the most space with, if that is enough. The detection's voxels
+    /// must touch the object's. When their labels differ, the object's must touch the detection's as much: a detection
+    /// named like the object may be a partial view of it, and one named otherwise must be about the same size.
     fn best_match(&self, detection: &Detection, frame_id: u64) -> Option<usize> {
+        let min_overlap = self.settings.association.min_overlap;
         let best = self
             .objects
             .iter()
             .enumerate()
-            .filter(|(_, object)| object.label.agrees_with(&detection.label))
-            .map(|(at, object)| (at, detection.voxels.fraction_touching(&object.voxels)))
+            .filter_map(|(at, object)| {
+                let of_detection = detection.voxels.fraction_touching(&object.voxels);
+                let of_object = object.voxels.fraction_touching(&detection.voxels);
+                let same_size = of_object >= min_overlap;
+                (of_detection >= min_overlap && (same_size || object.label().agrees_with(&detection.label))).then_some((at, of_detection.min(of_object)))
+            })
             .max_by(|a, b| a.1.total_cmp(&b.1));
         let label = &detection.label;
-        let min_overlap = self.settings.association.min_overlap;
         match best {
-            Some((at, overlap)) if overlap >= min_overlap => {
-                debug!(frame_id, %label, object = %self.objects[at].id, overlap, "detection matched an object");
+            Some((at, shared)) => {
+                debug!(frame_id, %label, object = %self.objects[at].id, object_label = %self.objects[at].label(), shared, "detection matched an object");
                 Some(at)
             }
-            Some((at, overlap)) => {
-                debug!(frame_id, %label, nearest = %self.objects[at].id, overlap, min_overlap, "detection overlaps no object enough");
-                None
-            }
             None => {
-                debug!(frame_id, %label, "detection has no object with an agreeing label");
+                debug!(frame_id, %label, min_overlap, "detection shares too little space with every object");
                 None
             }
         }
@@ -253,7 +257,7 @@ impl ObjectMap {
         self.objects.push(MapObject {
             id,
             standing: Standing::Candidate { first_seen: stamp.captured },
-            label: detection.label.clone(),
+            labels: LabelVotes::of(detection.label.clone(), detection.score),
             score: detection.score,
             voxels: detection.voxels.clone(),
             observations: 1,
@@ -307,7 +311,7 @@ impl ObjectMap {
                     info!(
                         frame_id = stamp.frame_id,
                         object = %object.id,
-                        label = %object.label,
+                        label = %object.label(),
                         misses_in_a_row = object.misses_in_a_row,
                         ?votes,
                         "camera sees past where the object should be"
@@ -323,9 +327,9 @@ impl ObjectMap {
         }
         for at in gone.into_iter().rev() {
             let mut object = self.objects.remove(at);
-            info!(frame_id = stamp.frame_id, object = %object.id, label = %object.label, "object disappeared");
+            info!(frame_id = stamp.frame_id, object = %object.id, label = %object.label(), "object disappeared");
             updates.push(object.report(ObjectUpdateKind::Disappeared, stamp, self.grid));
-            self.departed.push(Departed { id: object.id, label: object.label, at: stamp.captured });
+            self.departed.push(Departed { id: object.id, label: object.label().clone(), at: stamp.captured });
         }
     }
 
@@ -338,7 +342,7 @@ impl ObjectMap {
         let window = self.settings.confirmation.window();
         self.objects.retain(|object| match object.standing {
             Standing::Candidate { first_seen } if elapsed(first_seen, now) > window => {
-                debug!(candidate = %object.id, label = %object.label, observations = object.observations, "candidate dropped: not confirmed in time");
+                debug!(candidate = %object.id, label = %object.label(), observations = object.observations, "candidate dropped: not confirmed in time");
                 false
             }
             _ => true,
@@ -354,7 +358,7 @@ impl ObjectMap {
             if object.is_confirmed() || object.observations < self.settings.confirmation.observations {
                 continue;
             }
-            let returning = self.departed.iter().enumerate().filter(|(_, d)| d.label.agrees_with(&object.label)).max_by_key(|(_, d)| d.at);
+            let returning = self.departed.iter().enumerate().filter(|(_, d)| d.label.agrees_with(object.label())).max_by_key(|(_, d)| d.at);
             let candidate = object.id;
             let kind = match returning.map(|(index, _)| index) {
                 Some(index) => {
@@ -385,8 +389,7 @@ impl ObjectMap {
         announced
     }
 
-    /// Every merge interval, merges confirmed objects with agreeing labels whose voxels overlap enough into the
-    /// older of the two. Returns the ids that absorbed another object.
+    /// Every merge interval, merges confirmed objects whose voxels overlap enough into the older of the two. Returns the ids that absorbed another object.
     fn merge_if_due(&mut self, stamp: FrameStamp, updates: &mut Vec<ObjectUpdate>) -> BTreeSet<ObjectId> {
         let mut survivors = BTreeSet::new();
         if self.last_merge_at.is_some_and(|last| elapsed(last, stamp.captured) < self.settings.merge.interval()) {
@@ -397,7 +400,7 @@ impl ObjectMap {
             let mut absorbed = self.objects.remove(younger);
             let older = if younger < older { older - 1 } else { older };
             let into = self.objects[older].id;
-            info!(frame_id = stamp.frame_id, object = %absorbed.id, into = %into, label = %absorbed.label, overlap, "objects merged");
+            info!(frame_id = stamp.frame_id, object = %absorbed.id, into = %into, label = %absorbed.label(), overlap, "objects merged");
             updates.push(ObjectUpdate { merged_into: Some(into), ..absorbed.report(ObjectUpdateKind::Merged, stamp, self.grid) });
             survivors.remove(&absorbed.id);
             survivors.insert(into);
@@ -406,19 +409,18 @@ impl ObjectMap {
         survivors
     }
 
-    /// Two confirmed objects with agreeing labels where the smaller one's voxels touch the larger enough, as
-    /// (older, younger, overlap); the older has the lower id.
+    /// Two confirmed objects where the smaller one's voxels touch the larger enough and, when their labels differ, the
+    /// larger one's touch the smaller as much, as (older, younger, overlap); the older has the lower id.
     fn mergeable_pair(&self) -> Option<(usize, usize, f32)> {
         let confirmed: Vec<usize> = (0..self.objects.len()).filter(|&at| self.objects[at].is_confirmed()).collect();
         for (k, &a) in confirmed.iter().enumerate() {
             for &b in &confirmed[k + 1..] {
                 let (first, second) = (&self.objects[a], &self.objects[b]);
-                if !first.label.agrees_with(&second.label) {
-                    continue;
-                }
                 let (smaller, larger) = if first.voxels.len() <= second.voxels.len() { (first, second) } else { (second, first) };
+                let min_overlap = self.settings.merge.min_overlap;
                 let overlap = smaller.voxels.fraction_touching(&larger.voxels);
-                if overlap >= self.settings.merge.min_overlap {
+                let same_size = || larger.voxels.fraction_touching(&smaller.voxels) >= min_overlap;
+                if overlap >= min_overlap && (first.label().agrees_with(second.label()) || same_size()) {
                     let (older, younger) = if first.id < second.id { (a, b) } else { (b, a) };
                     return Some((older, younger, overlap));
                 }
@@ -433,6 +435,7 @@ mod tests {
     use glam::IVec3;
 
     use super::*;
+    use crate::crop::PixelBox;
 
     const SECOND_NS: i64 = 1_000_000_000;
 
@@ -444,7 +447,7 @@ mod tests {
         MapObject {
             id: ObjectId(id),
             standing: Standing::Confirmed,
-            label: Label::new(label),
+            labels: LabelVotes::of(Label::new(label), 0.5 + id as f32 / 100.0),
             score: 0.5 + id as f32 / 100.0,
             voxels,
             observations,
@@ -480,16 +483,60 @@ mod tests {
         let survivor = &map.objects[0];
         assert_eq!(survivor.observations, 6);
         assert_eq!(survivor.voxels.len(), block(IVec3::ZERO).len() + 6 * 4, "the union of both");
-        assert_eq!(survivor.label.text(), "Sofa", "the label of the better score");
+        assert_eq!(survivor.label().text(), "sofa", "the survivor's spelling of the label both carry");
+        assert_eq!(survivor.score, 0.55, "the better score");
     }
 
     #[test]
-    fn overlapping_objects_with_different_labels_stay_apart() {
-        let mut map = map_of(vec![confirmed(1, "sofa", block(IVec3::ZERO), 3), confirmed(2, "cushion", block(IVec3::ZERO), 3)]);
+    fn objects_in_the_same_place_with_different_labels_merge_under_the_label_with_more_score() {
+        let mut map = map_of(vec![confirmed(1, "pillow", block(IVec3::ZERO), 3), confirmed(2, "cushion", block(IVec3::X), 3)]);
         let mut updates = Vec::new();
         map.merge_if_due(stamp(100), &mut updates);
-        assert!(updates.is_empty());
+        assert_eq!(updates.iter().map(|u| (u.object_id, u.merged_into)).collect::<Vec<_>>(), vec![(ObjectId(2), Some(ObjectId(1)))]);
+        assert_eq!(map.objects[0].label().text(), "cushion");
+    }
+
+    /// A cushion's worth of cells on top of `block(IVec3::ZERO)`.
+    fn small_block_on_top() -> VoxelSet {
+        (0..3).flat_map(|x| (0..3).flat_map(move |y| (4..6).map(move |z| IVec3::new(x, y, z)))).collect()
+    }
+
+    #[test]
+    fn a_small_object_on_a_large_one_with_another_label_stays_apart() {
+        let mut map = map_of(vec![confirmed(1, "sofa", block(IVec3::ZERO), 3), confirmed(2, "cushion", small_block_on_top(), 3)]);
+        let mut updates = Vec::new();
+        map.merge_if_due(stamp(100), &mut updates);
+        assert!(updates.is_empty(), "{updates:#?}");
         assert_eq!(map.confirmed_ids().len(), 2);
+    }
+
+    fn detection(label: &str, voxels: VoxelSet) -> Detection {
+        let mask_box = PixelBox::around(4, [0usize, 5].into_iter()).expect("two pixels");
+        Detection { instance_index: 0, label: Label::new(label), score: 0.8, voxels, mask_box, mask_pixels: 2 }
+    }
+
+    #[test]
+    fn a_detection_in_an_objects_place_is_that_object_whatever_it_is_called() {
+        let map = map_of(vec![confirmed(1, "sofa", block(IVec3::new(40, 0, 0)), 3), confirmed(2, "cushion", block(IVec3::ZERO), 3)]);
+        assert_eq!(map.best_match(&detection("throw pillow", block(IVec3::X)), 7), Some(1));
+    }
+
+    #[test]
+    fn a_small_detection_on_a_large_object_with_another_label_is_not_that_object() {
+        let map = map_of(vec![confirmed(1, "sofa", block(IVec3::ZERO), 3)]);
+        assert_eq!(map.best_match(&detection("cushion", small_block_on_top()), 7), None);
+    }
+
+    #[test]
+    fn a_partial_view_of_an_object_under_its_own_label_is_that_object() {
+        let map = map_of(vec![confirmed(1, "sofa", block(IVec3::ZERO), 3)]);
+        assert_eq!(map.best_match(&detection("sofa", small_block_on_top()), 7), Some(0));
+    }
+
+    #[test]
+    fn of_two_objects_a_detection_touches_it_is_the_one_it_shares_more_space_with() {
+        let map = map_of(vec![confirmed(1, "sofa", block(IVec3::ZERO), 3), confirmed(2, "cushion", small_block_on_top(), 3)]);
+        assert_eq!(map.best_match(&detection("cushion", small_block_on_top()), 7), Some(1));
     }
 
     #[test]

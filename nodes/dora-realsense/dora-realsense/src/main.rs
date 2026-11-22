@@ -36,7 +36,7 @@ use rgbd_frames::camera_clock::{CameraClock, CameraStream, CounterReading};
 use rgbd_frames::frameset::{frameset_disposition, FramesetDisposition};
 use rgbd_frames::imu_calibration::ImuCalibration;
 use rgbd_frames::letterbox::Letterbox;
-use rgbd_keyframes::GravityEstimate;
+use rgbd_keyframes::GravityFilter;
 use shared_memory_outputs::SharedMemoryOutputs;
 
 const MODEL_INPUT_OUTPUT: &str = "model_input";
@@ -64,7 +64,9 @@ const GYRO_HZ: usize = 400;
 const MOTION_QUEUE_CAPACITY: usize = ACCEL_HZ + GYRO_HZ;
 /// `calibration` goes out with the first frame and then once a second, so a node that starts late still gets it.
 const CALIBRATION_EVERY_FRAMES: u64 = VIDEO_FPS as u64;
-const GRAVITY_TIME_CONSTANT: Duration = Duration::from_millis(500);
+/// How slowly the gravity estimate follows the accelerometer: long enough to average away the pushes of a hand-held
+/// or driven camera, short enough to correct the gyro's drift.
+const GRAVITY_TIME_CONSTANT: Duration = Duration::from_secs(3);
 const FRAME_WAIT: Duration = Duration::from_secs(2);
 /// The most shared-memory samples of one output its receivers may hold unreleased: four seconds of frames, several
 /// times what the dataflow's receivers and dora's region cache keep at once.
@@ -84,6 +86,11 @@ fn first_depth_reading(frames: &CompositeFrame) -> Result<CounterReading> {
     let depth = frames.frames_of_type::<DepthFrame>().into_iter().next().ok_or_else(|| eyre!("the first frameset has no depth frame"))?;
     FrameSequence::new("depth").is_new(&depth)?;
     CounterReading::from_librealsense_ms(depth.timestamp()).wrap_err_with(|| format!("depth frame {}", depth.frame_number()))
+}
+
+/// A camera time in nanoseconds as a duration since the camera clock's zero, which every reading is after.
+fn camera_time(camera_ns: i64) -> Result<Duration> {
+    u64::try_from(camera_ns).map(Duration::from_nanos).map_err(|_| eyre!("camera time {camera_ns} ns is before the camera clock's zero"))
 }
 
 /// The pixels of a video frame, which librealsense packs row by row with no padding for these formats.
@@ -309,8 +316,7 @@ fn stream_video(
     motion_finished: impl Fn() -> bool,
 ) -> Result<()> {
     let output = |name: &str| DataId::from(name.to_owned());
-    let mut gravity = GravityEstimate::new(GRAVITY_TIME_CONSTANT);
-    let mut last_accel_ns: Option<i64> = None;
+    let mut gravity = GravityFilter::new(GRAVITY_TIME_CONSTANT);
     let (mut depth_frames, mut color_frames) = (FrameSequence::new("depth"), FrameSequence::new("colour"));
     let mut outputs = SharedMemoryOutputs::new(node, UNRELEASED_SAMPLES_LIMIT)?;
     let mut frame_id = 0u64;
@@ -361,14 +367,19 @@ fn stream_video(
         drop(motion_samples);
         let start_ns = *session_start_ns.get_or_insert(depth_camera_ns);
         for (t, sample) in delivered.accel.into_iter().filter(|(t, _)| *t >= start_ns) {
-            gravity.add(sample, Duration::from_nanos(last_accel_ns.map_or(0, |last| (t - last).max(0) as u64)));
-            last_accel_ns = Some(t);
+            gravity.add_accel(camera_time(t)?, sample).wrap_err("gravity estimate")?;
             pending.accel_camera_ns.push(t);
             pending.accel_m_s2.push(sample);
         }
         for (t, sample) in delivered.gyro.into_iter().filter(|(t, _)| *t >= start_ns) {
+            gravity.add_gyro(camera_time(t)?, sample).wrap_err("gravity estimate")?;
             pending.gyro_camera_ns.push(t);
             pending.gyro_rad_s.push(sample);
+        }
+        let had_gravity = gravity.specific_force().is_some();
+        gravity.advance_to(camera_time(depth_camera_ns)?);
+        if let (false, Some(specific_force)) = (had_gravity, gravity.specific_force()) {
+            eprintln!("[realsense] frame {frame_id}: the IMU was at rest; gravity estimate starts at specific force {specific_force}");
         }
 
         // The imu message goes first, so a consumer has the samples before the frame they lead up to.

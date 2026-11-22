@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Rig View</title>
 <style>
-  :root { --bg: #111418; --panel: rgba(20, 24, 30, 0.9); --text: #e6e9ee; --muted: #9aa3ad; --line: #2c333c;
+  :root { --bg: #111418; --panel: rgba(20, 24, 30, 0.88); --text: #e6e9ee; --muted: #9aa3ad; --line: #2c333c;
           --accent: #4fa3ff; --warn: #f0b35a; --bad: #ef6b6b; }
   html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text); font: 13px/1.4 system-ui, sans-serif; overflow: hidden; }
   #view { position: fixed; inset: 0; }
@@ -15,6 +15,7 @@
   #link { width: 8px; height: 8px; border-radius: 50%; background: var(--bad); }
   #link.up { background: #5bd17a; }
   .row { display: flex; align-items: center; gap: 8px; margin: 5px 0; }
+  .row.buttons { flex-wrap: wrap; gap: 6px; }
   .row label { flex: 1; }
   button { background: #1f2630; color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 5px 9px; cursor: pointer; font: inherit; }
   button:hover { border-color: var(--accent); }
@@ -26,6 +27,11 @@
   .help { color: var(--muted); font-size: 12px; margin: 8px 0 0; }
   .help kbd { background: #222a33; border: 1px solid var(--line); border-radius: 3px; padding: 0 4px; font-size: 11px; }
   .section { border-top: 1px solid var(--line); margin-top: 8px; padding-top: 6px; }
+  #object-list:not(:empty) { border-top: 1px solid var(--line); margin-top: 8px; padding-top: 6px; }
+  .obj { display: flex; align-items: center; gap: 6px; padding: 3px 4px; border-radius: 4px; cursor: pointer; }
+  .obj:hover { background: #1f2630; }
+  .swatch { width: 10px; height: 10px; border-radius: 2px; flex: none; }
+  .obj .dims { margin-left: auto; color: var(--muted); font-variant-numeric: tabular-nums; font-size: 11px; }
   .tag { position: absolute; padding: 1px 5px; border-radius: 3px; font-size: 11px; color: #fff; white-space: nowrap;
          pointer-events: none; transform: translate(-50%, -100%); }
   #toggle { display: none; }
@@ -45,27 +51,27 @@
   <h1><span id="link"></span>Rig view</h1>
   <div class="stats" id="stats">connecting</div>
   <div id="notices"></div>
-  <div class="row"><button id="top">Top down</button><button id="behind">Behind robot</button></div>
+  <div class="row buttons"><button id="robot-view">Robot view</button><button id="behind">Behind robot</button><button id="top">Top down</button></div>
   <div class="row"><label for="follow">Follow robot</label><input type="checkbox" id="follow"></div>
   <div class="section">
-    <div class="row" title="The dense map's surface, fused from every depth frame: what the robot knows of the room's shape."><label for="surface">Surface</label><input type="checkbox" id="surface" data-default="on"></div>
-    <div class="row" title="Each object the object map found, painted on the surface in its colour."><label for="painted">Objects on the surface</label><input type="checkbox" id="painted" data-default="on"></div>
-    <div class="row" title="The robot from odometry, carried into the map by the localizer's map_to_odom."><label for="robot">Robot</label><input type="checkbox" id="robot" data-default="on"></div>
-    <div class="row" title="Where the robot has been."><label for="path">Robot path</label><input type="checkbox" id="path" data-default="on"></div>
-    <div class="row" title="Each tracked person's fitted skeleton, as the world store records it."><label for="people">People</label><input type="checkbox" id="people" data-default="on"></div>
-    <div class="row" title="Each object the object map found, as a labelled box; the spatial agent answers questions about them."><label for="objects">Objects</label><input type="checkbox" id="objects" data-default="on"></div>
-    <div class="row" title="Text labels on people, objects and rooms."><label for="labels">Labels</label><input type="checkbox" id="labels" data-default="on"></div>
+    <div class="row" title="Each keyframe's depth as a coloured point cloud at its map pose from the localizer, one point in each map voxel; points a later view saw through are carved away."><label for="clouds">Point clouds</label><input type="checkbox" id="clouds" data-default="on"></div>
+    <div class="row" title="Cloud points inside an object's voxels, tinted with the object's colour."><label for="segments">Segments</label><input type="checkbox" id="segments" data-default="on"></div>
+    <div class="row" title="Each object the object map found, as a box; the spatial agent answers questions about them."><label for="objects">Boxes</label><input type="checkbox" id="objects" data-default="on"></div>
+    <div class="row" title="Text labels on objects, people and rooms."><label for="labels">Labels</label><input type="checkbox" id="labels" data-default="on"></div>
+    <div class="row"><label for="size">Point size</label><input type="range" id="size" min="1" max="8" value="2"></div>
   </div>
   <div class="section">
     <div class="stats">Diagnostic layers</div>
-    <div class="row" title="Each keyframe's depth as a coloured point cloud at its map pose from the localizer, one per new view; for checking the localizer against the surface."><label for="clouds">Keyframe clouds</label><input type="checkbox" id="clouds" data-default="off"></div>
+    <div class="row" title="The dense map's surface, fused from every depth frame: what the robot knows of the room's shape."><label for="mesh">Mesh</label><input type="checkbox" id="mesh" data-default="off"></div>
+    <div class="row" title="Each object the object map found, painted on the mesh in its colour."><label for="painted">Objects on the mesh</label><input type="checkbox" id="painted" data-default="on"></div>
     <div class="row" title="Rooms the dense map cut its free space into, as floor outlines. The spatial agent names rooms with them; the ids are renumbered when the cut changes."><label for="rooms">Rooms</label><input type="checkbox" id="rooms" data-default="off"></div>
     <div class="row" title="Doorways between the dense map's rooms: narrow gaps in the free space. Used by the spatial agent for paths between rooms."><label for="doorways">Doorways</label><input type="checkbox" id="doorways" data-default="off"></div>
     <div class="row" title="Places: points in free space joined into a graph, which the spatial agent uses for navigation goals and for where things are."><label for="places">Places</label><input type="checkbox" id="places" data-default="off"></div>
-    <div class="row"><label for="size">Point size</label><input type="range" id="size" min="1" max="8" value="2"></div>
   </div>
   <div class="help">Drag to orbit, right-drag to pan, scroll to zoom.<br>
-    <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> move, <kbd>Q</kbd><kbd>E</kbd> down/up, hold <kbd>Shift</kbd> for faster.</div>
+    <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> move, <kbd>Q</kbd><kbd>E</kbd> down/up, hold <kbd>Shift</kbd> for faster.
+    Click an object to fly to it.</div>
+  <div id="object-list"></div>
 </div>
 <script type="importmap">
 { "imports": {
@@ -84,6 +90,11 @@ const SPACE_CARVING_MESSAGE = 3;
 const SURFACE_MESSAGE = 2;
 const MOVE_SPEED_M_PER_S = 1.5;
 const PATH_POINTS = 4000;
+const ROBOT_ARROW_M = 0.45;
+// A segment point's colour is this much the object's colour, the rest the point's own.
+const SEGMENT_TINT = 0.6;
+// Tinting clouds stops for the frame once it has taken this long, so the robot and the people keep moving.
+const TINT_BUDGET_MS = 6;
 // COCO-17: 0 nose, 1-4 eyes and ears, 5-6 shoulders, 7-8 elbows, 9-10 wrists, 11-12 hips, 13-14 knees, 15-16 ankles.
 // The fitted skeleton has no face joints.
 const BONES = [[5, 6], [5, 7], [7, 9], [6, 8], [8, 10], [5, 11], [6, 12], [11, 12], [11, 13], [13, 15], [12, 14], [14, 16]];
@@ -104,7 +115,7 @@ scene.add(new THREE.GridHelper(20, 20, 0x2c333c, 0x1c2128).rotateX(Math.PI / 2))
 scene.add(new THREE.AxesHelper(0.5));
 
 const layers = {};
-for (const name of ["surface", "clouds", "robot", "path", "people", "objects", "rooms", "doorways", "places"]) {
+for (const name of ["mesh", "clouds", "robot", "path", "people", "objects", "rooms", "doorways", "places"]) {
   layers[name] = new THREE.Group();
   scene.add(layers[name]);
 }
@@ -114,7 +125,8 @@ sun.position.set(3, 2, 6);
 scene.add(sun);
 const pointMaterial = new THREE.PointsMaterial({ size: 2, sizeAttenuation: false, vertexColors: true });
 
-// Tags are HTML labels pinned to points in the scene; each layer owns its own.
+// Tags are HTML labels pinned to points in the scene. A tag of a layer shows only with its layer; one of no layer
+// shows whenever the labels do.
 const tagLayer = document.getElementById("tags");
 const tags = new Map();
 function setTag(key, text, color, anchor, layer) {
@@ -140,9 +152,45 @@ function dispose(group) {
   }
 }
 
+// Object voxels, shared by the mesh painting and the cloud tint: cube (x, y, z) spans [x, x + 1) * objectVoxelM
+// along x, and likewise along y and z. A cube's key packs its three indices into one number, exact for indices
+// within +-65536 of the origin.
+const VOXEL_INDEX_OFFSET = 65536, VOXEL_INDEX_SPAN = 131072;
+const voxelKey = (x, y, z) => ((x + VOXEL_INDEX_OFFSET) * VOXEL_INDEX_SPAN + (y + VOXEL_INDEX_OFFSET)) * VOXEL_INDEX_SPAN + (z + VOXEL_INDEX_OFFSET);
+const objectCells = new Map();
+const objectVoxels = new Map();
+let objectVoxelM = 0.05;
+// The smallest and largest cube index along each axis over every object's voxels, or null with none.
+let objectBounds = null;
+function voxelBounds(voxels) {
+  if (!voxels.length) return null;
+  const min = [...voxels[0]], max = [...voxels[0]];
+  for (const v of voxels) for (let i = 0; i < 3; i++) { min[i] = Math.min(min[i], v[i]); max[i] = Math.max(max[i], v[i]); }
+  return { min, max };
+}
+function boundsBox(bounds) {
+  return new THREE.Box3(new THREE.Vector3(...bounds.min).multiplyScalar(objectVoxelM),
+    new THREE.Vector3(...bounds.max).addScalar(1).multiplyScalar(objectVoxelM));
+}
+const objectBytes = new Map();
+function objectRgb(objectId) {
+  let rgb = objectBytes.get(objectId);
+  if (!rgb) {
+    const color = hue(objectId);
+    rgb = [color.r * 255, color.g * 255, color.b * 255];
+    objectBytes.set(objectId, rgb);
+  }
+  return rgb;
+}
+
 // Keyframe clouds, each in its own floor frame, at its map pose. A pose can arrive before its cloud is decoded.
+// Each cloud keeps its own colours (`photo`) and draws them with the segments tinted in.
 const clouds = new Map();
 const poses = new Map();
+let cloudPoints = 0;
+let segmentsShown = true;
+// Clouds whose tint is out of date, tinted a few each frame.
+const tintQueue = new Set();
 function poseCloud(frameId) {
   const cloud = clouds.get(frameId), pose = poses.get(frameId);
   if (!cloud) return;
@@ -150,6 +198,8 @@ function poseCloud(frameId) {
   if (pose) {
     cloud.position.set(pose.pose.x_m, pose.pose.y_m, pose.pose.z_m);
     cloud.rotation.set(0, 0, pose.pose.yaw_rad);
+    cloud.updateMatrix();
+    tintQueue.add(frameId);
   }
 }
 async function addCloud(compressed, generation) {
@@ -160,16 +210,19 @@ async function addCloud(compressed, generation) {
   const count = body.getUint32(8, true);
   const positions = new Float32Array(count * 3);
   for (let i = 0; i < count * 3; i++) positions[i] = body.getInt16(12 + 2 * i, true) / 1000;
-  const colors = new Uint8Array(body.buffer, body.byteOffset + 12 + 6 * count, 3 * count);
+  const photo = new Uint8Array(body.buffer, body.byteOffset + 12 + 6 * count, 3 * count).slice();
   const geometry = new THREE.BufferGeometry();
   geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
-  geometry.setAttribute("color", new THREE.BufferAttribute(colors, 3, true));
+  geometry.setAttribute("color", new THREE.BufferAttribute(photo.slice(), 3, true));
   // Bounds from the whole cloud, before carving leaves points that are not numbers.
   geometry.computeBoundingSphere();
+  geometry.computeBoundingBox();
   const points = new THREE.Points(geometry, pointMaterial);
   points.frustumCulled = false;
+  points.userData = { photo, tinted: false };
   removeCloud(frameId);
   clouds.set(frameId, points);
+  cloudPoints += count;
   layers.clouds.add(points);
   poseCloud(frameId);
 }
@@ -189,27 +242,84 @@ function removeCloud(frameId) {
   const cloud = clouds.get(frameId);
   if (!cloud) return;
   layers.clouds.remove(cloud);
+  cloudPoints -= cloud.userData.photo.length / 3;
   cloud.geometry.dispose();
   clouds.delete(frameId);
+  tintQueue.delete(frameId);
+}
+// The map-frame box round a cloud at its pose.
+function cloudBox(cloud) {
+  return cloud.geometry.boundingBox.clone().applyMatrix4(cloud.matrix);
+}
+// Sets each point of a cloud inside an object's voxels to its own colour blended with the object's, and every
+// other point to its own colour.
+function tintCloud(cloud) {
+  const { photo } = cloud.userData;
+  const colors = cloud.geometry.getAttribute("color");
+  const out = colors.array;
+  const bounds = segmentsShown ? objectBounds : null;
+  if (!bounds || !cloudBox(cloud).intersectsBox(boundsBox(bounds))) {
+    if (cloud.userData.tinted) {
+      out.set(photo);
+      colors.needsUpdate = true;
+      cloud.userData.tinted = false;
+    }
+    return;
+  }
+  out.set(photo);
+  const positions = cloud.geometry.getAttribute("position").array;
+  const cos = Math.cos(cloud.rotation.z), sin = Math.sin(cloud.rotation.z);
+  const { x: tx, y: ty, z: tz } = cloud.position;
+  const perM = 1 / objectVoxelM;
+  const [minX, minY, minZ] = bounds.min, [maxX, maxY, maxZ] = bounds.max;
+  let tinted = false;
+  for (let i = 0; i < positions.length; i += 3) {
+    const x = positions[i], y = positions[i + 1];
+    const vx = Math.floor((cos * x - sin * y + tx) * perM);
+    const vy = Math.floor((sin * x + cos * y + ty) * perM);
+    const vz = Math.floor((positions[i + 2] + tz) * perM);
+    // A carved point is not a number, and fails every comparison.
+    if (!(vx >= minX && vx <= maxX && vy >= minY && vy <= maxY && vz >= minZ && vz <= maxZ)) continue;
+    const owner = objectCells.get(voxelKey(vx, vy, vz));
+    if (owner === undefined) continue;
+    const rgb = objectRgb(owner);
+    for (let c = 0; c < 3; c++) out[i + c] = SEGMENT_TINT * rgb[c] + (1 - SEGMENT_TINT) * photo[i + c];
+    tinted = true;
+  }
+  colors.needsUpdate = true;
+  cloud.userData.tinted = tinted;
+}
+function tintQueuedClouds() {
+  const started = performance.now();
+  for (const frameId of tintQueue) {
+    tintQueue.delete(frameId);
+    tintCloud(clouds.get(frameId));
+    if (performance.now() - started > TINT_BUDGET_MS) return;
+  }
+}
+function retintAllClouds() {
+  for (const frameId of clouds.keys()) tintQueue.add(frameId);
+}
+// Queues the clouds that reach into these cubes.
+function retintCloudsIn(bounds) {
+  if (!bounds) return;
+  const box = boundsBox(bounds);
+  for (const [frameId, cloud] of clouds) if (cloudBox(cloud).intersectsBox(box)) tintQueue.add(frameId);
 }
 
-// The dense map's surface, one mesh per block. Faces point to the free side, so walls are see-through from behind.
+// The dense map's mesh, one mesh per block. Faces point to the free side, so walls are see-through from behind.
 // Vertices inside an object's voxels take the object's colour.
 const surfaceMaterial = new THREE.MeshLambertMaterial({ vertexColors: true });
 const blocks = new Map();
 let blockM = 0.4;
 const SURFACE_LOW = new THREE.Color(0x8a8f96), SURFACE_HIGH = new THREE.Color(0xd9dde2);
-const objectCells = new Map();
-const objectVoxels = new Map();
-let objectVoxelM = 0.05;
 let painted = true;
-const cellKey = (x, y, z) => `${x},${y},${z}`;
 function objectAt(p) {
   const c = [0, 1, 2].map(i => Math.floor(p[i] / objectVoxelM));
-  const own = objectCells.get(cellKey(...c));
+  const own = objectCells.get(voxelKey(...c));
   if (own !== undefined) return own;
   for (const [dx, dy, dz] of [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]]) {
-    const near = objectCells.get(cellKey(c[0] + dx, c[1] + dy, c[2] + dz));
+    const near = objectCells.get(voxelKey(c[0] + dx, c[1] + dy, c[2] + dz));
     if (near !== undefined) return near;
   }
   return undefined;
@@ -230,7 +340,7 @@ function colourBlock(mesh) {
 function removeBlock(key) {
   const mesh = blocks.get(key);
   if (!mesh) return;
-  layers.surface.remove(mesh);
+  layers.mesh.remove(mesh);
   mesh.geometry.dispose();
   blocks.delete(key);
 }
@@ -264,7 +374,7 @@ async function addSurface(compressed, generation, resets) {
     const mesh = new THREE.Mesh(geometry, surfaceMaterial);
     colourBlock(mesh);
     blocks.set(key, mesh);
-    layers.surface.add(mesh);
+    layers.mesh.add(mesh);
   }
 }
 // The blocks whose vertices can fall in or next to these object voxels.
@@ -280,19 +390,21 @@ function blocksNear(voxels) {
 }
 function setObjectVoxels(objectId, voxelM, voxels) {
   const before = objectVoxels.get(objectId) || [];
-  for (const v of before) if (objectCells.get(cellKey(...v)) === objectId) objectCells.delete(cellKey(...v));
+  for (const v of before) if (objectCells.get(voxelKey(...v)) === objectId) objectCells.delete(voxelKey(...v));
   objectVoxelM = voxelM;
-  for (const v of voxels) objectCells.set(cellKey(...v), objectId);
+  for (const v of voxels) objectCells.set(voxelKey(...v), objectId);
   if (voxels.length) objectVoxels.set(objectId, voxels); else objectVoxels.delete(objectId);
+  objectBounds = voxelBounds([...objectVoxels.values()].flat());
   for (const key of new Set([...blocksNear(before), ...blocksNear(voxels)])) {
     const mesh = blocks.get(key);
     if (mesh) colourBlock(mesh);
   }
+  retintCloudsIn(voxelBounds([...before, ...voxels]));
 }
 
 // The robot: the IMU body, whose z axis is the camera's forward.
 const robot = new THREE.Group();
-robot.add(new THREE.ArrowHelper(new THREE.Vector3(0, 0, 1), new THREE.Vector3(), 0.45, 0x4fa3ff, 0.12, 0.08));
+robot.add(new THREE.ArrowHelper(new THREE.Vector3(0, 0, 1), new THREE.Vector3(), ROBOT_ARROW_M, 0x4fa3ff, 0.12, 0.08));
 robot.add(new THREE.Mesh(new THREE.BoxGeometry(0.12, 0.03, 0.03), new THREE.MeshBasicMaterial({ color: 0x4fa3ff })));
 robot.visible = false;
 layers.robot.add(robot);
@@ -349,15 +461,21 @@ function setPeople(update) {
     const above = SHOULDERS.map(j => track.joints[j]).find(Boolean) || track.torso;
     if (above) {
       const anchor = new THREE.Vector3(...above).add(new THREE.Vector3(0, 0, 0.35));
-      setTag(`person:${track.track_id}`, `person ${track.track_id}${track.state === "lost" ? " (lost)" : ""}`, css(color), anchor, "people");
+      setTag(`person:${track.track_id}`, `person ${track.track_id}${track.state === "lost" ? " (lost)" : ""}`, css(color), anchor, null);
     }
   }
 }
 
-// Objects: a box from the footprint and height band, with a label.
+// Objects: a box from the footprint and height band, a label with the object's size, and a row in the object list.
 const objects = new Map();
+const objectList = document.getElementById("object-list");
+// Length, width and height in metres: the footprint's longer side, its shorter side, and the height band.
+function objectSize(update) {
+  const side = (a, b) => Math.hypot(b[0] - a[0], b[1] - a[1]);
+  const [first, second] = [side(update.footprint[0], update.footprint[1]), side(update.footprint[1], update.footprint[2])];
+  return [Math.max(first, second), Math.min(first, second), update.top_m - update.bottom_m];
+}
 function setObject(update) {
-  removeBox(update.object_id);
   // Null voxels are the ones already drawn.
   if (update.voxels) setObjectVoxels(update.object_id, update.voxel_m, update.voxels);
   const color = hue(update.object_id);
@@ -369,18 +487,46 @@ function setObject(update) {
     lines.push(bottom[k], bottom[n], top[k], top[n], bottom[k], top[k]);
   }
   const box = new THREE.LineSegments(new THREE.BufferGeometry().setFromPoints(lines), new THREE.LineBasicMaterial({ color }));
-  objects.set(update.object_id, box);
   layers.objects.add(box);
+  const size = objectSize(update);
+  const sizeText = `${size.map(s => s.toFixed(2)).join("x")} m`;
   const anchor = top.reduce((a, p) => a.add(p), new THREE.Vector3()).multiplyScalar(0.25);
-  setTag(`object:${update.object_id}`, `${update.label} ${Math.round(update.confidence * 100)}%`, css(color), anchor, "objects");
+  setTag(`object:${update.object_id}`, `${update.label} ${sizeText}`, css(color), anchor, null);
+  const held = objects.get(update.object_id);
+  if (held) { layers.objects.remove(held.box); held.box.geometry.dispose(); held.box.material.dispose(); }
+  const row = held?.row ?? objectRow(update.object_id);
+  row.swatch.style.background = css(color);
+  row.name.textContent = update.label;
+  row.el.title = `${Math.round(update.confidence * 100)}% confident, ${sizeText}`;
+  objects.set(update.object_id, { box, row, centre: new THREE.Vector3(...update.centre), size });
+  showDistance(objects.get(update.object_id));
 }
-function removeBox(objectId) {
-  const box = objects.get(objectId);
-  if (box) { layers.objects.remove(box); box.geometry.dispose(); box.material.dispose(); objects.delete(objectId); }
-  dropTags(`object:${objectId}`);
+function objectRow(objectId) {
+  const el = document.createElement("div");
+  el.className = "obj";
+  const swatch = document.createElement("span");
+  swatch.className = "swatch";
+  const name = document.createElement("span");
+  const distance = document.createElement("span");
+  distance.className = "dims";
+  el.append(swatch, name, distance);
+  el.onclick = () => flyToObject(objectId);
+  objectList.appendChild(el);
+  return { el, swatch, name, distance };
+}
+function showDistance(object) {
+  object.row.distance.textContent = robot.visible ? `${robot.position.distanceTo(object.centre).toFixed(1)} m` : "";
 }
 function removeObject(objectId) {
-  removeBox(objectId);
+  const held = objects.get(objectId);
+  if (held) {
+    layers.objects.remove(held.box);
+    held.box.geometry.dispose();
+    held.box.material.dispose();
+    held.row.el.remove();
+    objects.delete(objectId);
+  }
+  dropTags(`object:${objectId}`);
   if (objectVoxels.has(objectId)) setObjectVoxels(objectId, objectVoxelM, []);
 }
 
@@ -433,13 +579,15 @@ function setNotice(update) {
 }
 
 // Forgets everything drawn but the keyframe clouds and their poses, which come apart from the scene and are cleared
-// when a connection opens.
+// when a connection opens; the clouds lose their tint until the objects come again.
 function reset() {
   connection.resets++;
   for (const key of [...blocks.keys()]) removeBlock(key);
   objectCells.clear();
   objectVoxels.clear();
+  objectBounds = null;
   for (const objectId of [...objects.keys()]) removeObject(objectId);
+  retintAllClouds();
   dispose(layers.people);
   dispose(layers.rooms);
   dispose(layers.places);
@@ -530,9 +678,11 @@ setInterval(() => {
   connection.rateBytes = connection.bytes - lastBytes;
   lastBytes = connection.bytes;
   const status = connection.closedBecause ? `${connection.closedBecause}; retrying` :
-    `${blocks.size} surface blocks, ${clouds.size} keyframes, ${objects.size} objects\n` +
+    `${clouds.size} clouds, ${(cloudPoints / 1e6).toFixed(1)} M points, ${objects.size} objects\n` +
+    `${blocks.size} mesh blocks\n` +
     `${(connection.bytes / 1e6).toFixed(1)} MB in, ${(connection.rateBytes * 8 / 1000).toFixed(0)} kbit/s`;
   document.getElementById("stats").textContent = status;
+  objects.forEach(showDistance);
 }, 1000);
 
 // The page's own health, so a slow link or a slow server shows: people frames and surface messages a second over
@@ -567,11 +717,30 @@ function topDown() {
   controls.target.copy(centre);
   controls.update();
 }
+// From the robot's pose looking along its forward; the eye sits at the tip of the robot's arrow, so the arrow does
+// not cover the view.
+function robotView() {
+  if (!robot.visible) return;
+  const forward = new THREE.Vector3(0, 0, 1).applyQuaternion(robot.quaternion);
+  camera.position.copy(robot.position).addScaledVector(forward, ROBOT_ARROW_M);
+  controls.target.copy(camera.position).addScaledVector(forward, 2);
+  controls.update();
+}
 function behindRobot() {
   if (!robot.visible) return;
   const forward = new THREE.Vector3(0, 0, 1).applyQuaternion(robot.quaternion).setZ(0).normalize();
   controls.target.copy(robot.position).addScaledVector(forward, 1.5);
   camera.position.copy(robot.position).addScaledVector(forward, -2).add(new THREE.Vector3(0, 0, 1.2));
+  controls.update();
+}
+// Looks at the object from the side the camera is on now, far enough back to see all of it.
+function flyToObject(objectId) {
+  const object = objects.get(objectId);
+  if (!object) return;
+  const reach = Math.max(1.2, object.size[0] * 1.8);
+  const offset = camera.position.clone().sub(controls.target).normalize().multiplyScalar(reach);
+  controls.target.copy(object.centre);
+  camera.position.copy(object.centre).add(offset);
   controls.update();
 }
 function followRobot() {
@@ -585,27 +754,33 @@ function followRobot() {
   followHas = true;
 }
 
-// Each toggle shows its layer; the page remembers the toggles in this browser. Storage that is not there, as in a
-// private window, leaves every toggle at its default.
-const TOGGLES_KEY = "rig-view-toggles";
-function rememberedToggles() {
+// Each toggle shows its layer, and the slider sets the point size; the page remembers both in this browser. Storage
+// that is not there, as in a private window, leaves every control at its default.
+const CONTROLS_KEY = "rig-view-controls";
+const toggleInputs = [...document.querySelectorAll("input[data-default]")];
+const sizeInput = document.getElementById("size");
+function rememberedControls() {
   try {
-    return JSON.parse(localStorage.getItem(TOGGLES_KEY) ?? "{}");
+    return JSON.parse(localStorage.getItem(CONTROLS_KEY) ?? "{}");
   } catch (e) {
-    console.warn(`the remembered toggles are not read: ${e}`);
+    console.warn(`the remembered controls are not read: ${e}`);
     return {};
   }
 }
-function rememberToggles() {
-  const states = Object.fromEntries([...document.querySelectorAll("input[data-default]")].map(input => [input.id, input.checked]));
+function rememberControls() {
+  const saved = {
+    toggles: Object.fromEntries(toggleInputs.map(input => [input.id, input.checked])),
+    pointSize: Number(sizeInput.value),
+  };
   try {
-    localStorage.setItem(TOGGLES_KEY, JSON.stringify(states));
+    localStorage.setItem(CONTROLS_KEY, JSON.stringify(saved));
   } catch (e) {
-    console.warn(`the toggles are not remembered: ${e}`);
+    console.warn(`the controls are not remembered: ${e}`);
   }
 }
 const SHOW_TOGGLE = {
   painted: on => { painted = on; blocks.forEach(colourBlock); },
+  segments: on => { segmentsShown = on; retintAllClouds(); },
   // The server sends the clouds only while they are shown; turning them on asks for the ones so far.
   clouds: on => {
     layers.clouds.visible = on;
@@ -614,15 +789,19 @@ const SHOW_TOGGLE = {
   },
   labels: on => (tagLayer.style.display = on ? "" : "none"),
 };
-const remembered = rememberedToggles();
-for (const input of document.querySelectorAll("input[data-default]")) {
-  input.checked = typeof remembered[input.id] === "boolean" ? remembered[input.id] : input.dataset.default === "on";
+const remembered = rememberedControls();
+const rememberedToggles = remembered.toggles ?? {};
+for (const input of toggleInputs) {
+  input.checked = typeof rememberedToggles[input.id] === "boolean" ? rememberedToggles[input.id] : input.dataset.default === "on";
   const show = SHOW_TOGGLE[input.id] ?? (on => (layers[input.id].visible = on));
   show(input.checked);
-  input.onchange = () => { show(input.checked); rememberToggles(); };
+  input.onchange = () => { show(input.checked); rememberControls(); };
 }
-document.getElementById("size").oninput = e => (pointMaterial.size = Number(e.target.value));
+if (Number.isFinite(remembered.pointSize)) sizeInput.value = remembered.pointSize;
+pointMaterial.size = Number(sizeInput.value);
+sizeInput.oninput = () => { pointMaterial.size = Number(sizeInput.value); rememberControls(); };
 document.getElementById("top").onclick = topDown;
+document.getElementById("robot-view").onclick = robotView;
 document.getElementById("behind").onclick = behindRobot;
 document.getElementById("toggle").onclick = () => document.getElementById("panel").classList.toggle("collapsed");
 
@@ -655,7 +834,8 @@ function placeTags() {
   const p = new THREE.Vector3();
   for (const tag of tags.values()) {
     p.copy(tag.anchor).project(camera);
-    const visible = layers[tag.layer].visible && p.z > -1 && p.z < 1 && Math.abs(p.x) < 1.1 && Math.abs(p.y) < 1.1;
+    const shown = tag.layer === null || layers[tag.layer].visible;
+    const visible = shown && p.z > -1 && p.z < 1 && Math.abs(p.x) < 1.1 && Math.abs(p.y) < 1.1;
     tag.el.style.display = visible ? "" : "none";
     if (visible) {
       tag.el.style.left = `${(p.x + 1) / 2 * w}px`;
@@ -679,6 +859,7 @@ renderer.setAnimationLoop(() => {
   moveFromKeys(clock.getDelta());
   followRobot();
   controls.update();
+  tintQueuedClouds();
   renderer.render(scene, camera);
   placeTags();
 });

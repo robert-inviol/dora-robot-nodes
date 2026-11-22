@@ -20,11 +20,15 @@ pub fn driver_status_fields() -> Fields {
     Fields::from(vec![field("armed", DataType::Boolean), field("left_pct", DataType::Int8), field("right_pct", DataType::Int8)])
 }
 
-/// The bearings and ranges run in step, one item per reading; only a range can be null.
+/// The lists run in step, one item per reading; only a range can be null, and the intensity list is null as a
+/// whole for a lidar that does not report one. The reading times are unix nanoseconds on the host's clock.
 pub fn scan_fields() -> Fields {
     Fields::from(vec![
         field("spin_rev_per_s", DataType::Float32),
+        field("first_reading_unix_ns", DataType::Int64),
+        field("last_reading_unix_ns", DataType::Int64),
         field("bearing_deg", items(DataType::Float32)),
         field("range_m", list_of(DataType::Float32, true)),
+        field("intensity", items(DataType::UInt8)),
     ])
 }

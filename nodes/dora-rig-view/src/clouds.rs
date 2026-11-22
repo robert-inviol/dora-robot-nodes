@@ -11,7 +11,13 @@
 //! have seen it, counting the view it came from as one that saw it, so whatever has moved away since, such as a
 //! person who walked through, is removed after two views, while depth noise, which sees through a point now and
 //! then but sees it most of the time, removes nothing. A removed point stays removed.
+//!
+//! Voxel thinning: the drawn clouds share a grid of map voxels, and one point is drawn in each. A cloud keeps only
+//! its points in voxels no drawn cloud holds, at the map pose it is placed with, so a surface seen from many
+//! keyframes is drawn once and the points drawn grow with the space seen, not with the keyframes. A keyframe with
+//! no such point draws no cloud. A voxel is free again when its point is carved away or its cloud is dropped.
 
+use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::Write;
 
@@ -20,7 +26,7 @@ use depth_perception::{CameraIntrinsics, FloorFrame};
 use dora_node_api::arrow::buffer::ScalarBuffer;
 use flate2::write::GzEncoder;
 use flate2::Compression;
-use glam::{Mat3, Vec3};
+use glam::{IVec3, Mat3, Vec3};
 use perception_wire::localization::{FrameId, KeyframePose, KeyframeSelection, UpdatedKeyframePose, Pose4Dof, Tracking};
 use perception_wire::Keyframe;
 
@@ -166,24 +172,20 @@ enum Sighting {
     Nothing,
 }
 
-/// A keyframe's cloud, encoded, with the depth it carves with: everything about a keyframe that needs no other
-/// keyframe, so it is worked out before the store is touched.
+/// A keyframe's cloud with the depth it carves with: everything about a keyframe that needs no other keyframe, so
+/// it is worked out before the store is touched.
 pub struct PreparedKeyframe {
-    frame_id: FrameId,
-    positions_mm: Vec<[i16; 3]>,
-    encoded: Bytes,
+    cloud: KeyframeCloud,
     view: DepthView,
 }
 
 impl PreparedKeyframe {
     pub fn of(keyframe: &Keyframe, settings: &CloudSettings) -> Result<PreparedKeyframe, CloudError> {
-        let cloud = KeyframeCloud::from_keyframe(keyframe, settings)?;
-        let encoded = cloud.encode();
-        Ok(PreparedKeyframe { frame_id: cloud.frame_id, positions_mm: cloud.positions_mm, encoded, view: DepthView::of(keyframe) })
+        Ok(PreparedKeyframe { cloud: KeyframeCloud::from_keyframe(keyframe, settings)?, view: DepthView::of(keyframe) })
     }
 
     pub fn frame_id(&self) -> FrameId {
-        self.frame_id
+        self.cloud.frame_id
     }
 }
 
@@ -257,12 +259,35 @@ impl KeptCloud {
     }
 }
 
+fn metres(position_mm: &[i16; 3]) -> Vec3 {
+    Vec3::new(position_mm[0] as f32, position_mm[1] as f32, position_mm[2] as f32) * 0.001
+}
+
+/// The map voxel each point of a cloud at a map pose falls in.
+struct MapVoxels {
+    turn: Mat3,
+    shift: Vec3,
+    voxel_m: f32,
+}
+
+impl MapVoxels {
+    fn of(at: &KeyframeMapPose, voxel_m: f32) -> MapVoxels {
+        MapVoxels { turn: Mat3::from_rotation_z(at.pose.yaw_rad), shift: at.translation(), voxel_m }
+    }
+
+    fn voxel(&self, position_mm: &[i16; 3]) -> IVec3 {
+        ((self.turn * metres(position_mm) + self.shift) / self.voxel_m).floor().as_ivec3()
+    }
+}
+
 pub struct CloudStore {
     settings: CloudSettings,
     max_keyframes: usize,
     /// The drawn clouds, oldest first.
     order: VecDeque<FrameId>,
     clouds: HashMap<FrameId, KeptCloud>,
+    /// The drawn cloud that holds each map voxel's one point.
+    voxel_holders: HashMap<IVec3, FrameId>,
     /// Poses of keyframes with no drawn cloud: those still to come, and those placed without one.
     other_poses: KeyframeMapPoses,
     awaiting_pose: VecDeque<PreparedKeyframe>,
@@ -276,6 +301,7 @@ impl CloudStore {
             max_keyframes,
             order: VecDeque::new(),
             clouds: HashMap::new(),
+            voxel_holders: HashMap::new(),
             other_poses: KeyframeMapPoses::new(max_keyframes),
             awaiting_pose: VecDeque::new(),
             repeat_views: 0,
@@ -332,8 +358,8 @@ impl CloudStore {
 
     /// Takes a prepared keyframe: placed at once when its map pose has come, else held until it does.
     pub fn on_keyframe(&mut self, prepared: PreparedKeyframe) -> Vec<Outgoing> {
-        if let Some(map_pose) = self.other_poses.get(prepared.frame_id).copied() {
-            self.other_poses.remove(prepared.frame_id);
+        if let Some(map_pose) = self.other_poses.get(prepared.frame_id()).copied() {
+            self.other_poses.remove(prepared.frame_id());
             return self.place(prepared, map_pose);
         }
         self.awaiting_pose.push_back(prepared);
@@ -349,7 +375,7 @@ impl CloudStore {
             cloud.map_pose = map_pose;
             return vec![map_pose_update(frame_id, &map_pose)];
         }
-        if let Some(at) = self.awaiting_pose.iter().position(|waiting| waiting.frame_id == frame_id) {
+        if let Some(at) = self.awaiting_pose.iter().position(|waiting| waiting.frame_id() == frame_id) {
             let prepared = self.awaiting_pose.remove(at).expect("found above");
             return self.place(prepared, map_pose);
         }
@@ -357,27 +383,49 @@ impl CloudStore {
         Vec::new()
     }
 
-    /// A keyframe at its map pose: its depth votes on the drawn clouds when it is registered, and its cloud is drawn
-    /// when the localizer selected it into the map.
+    /// A keyframe at its map pose: its depth votes on the drawn clouds when it is registered, and its points in map
+    /// voxels no drawn cloud holds are drawn when the localizer selected it into the map.
     fn place(&mut self, prepared: PreparedKeyframe, map_pose: KeyframeMapPose) -> Vec<Outgoing> {
-        let PreparedKeyframe { frame_id, positions_mm, encoded, view } = prepared;
+        let PreparedKeyframe { cloud, view } = prepared;
+        let frame_id = cloud.frame_id;
         let mut out = if map_pose.standing.carves() { self.space_carve(&view, &map_pose) } else { Vec::new() };
         if !map_pose.new_view() {
             self.repeat_views += matches!(map_pose.selection, KeyframeSelection::NotSelected { .. }) as u64;
             self.other_poses.insert(frame_id, map_pose);
             return out;
         }
+        let cloud = self.thinned_to_free_voxels(cloud, &map_pose);
+        if cloud.positions_mm.is_empty() {
+            self.other_poses.insert(frame_id, map_pose);
+            return out;
+        }
+        let encoded = cloud.encode();
         out.push(Outgoing::binary(Layer::Clouds, encoded.clone()));
         out.push(map_pose_update(frame_id, &map_pose));
-        let votes = vec![Votes::OWN_VIEW; positions_mm.len()];
-        self.clouds.insert(frame_id, KeptCloud { map_pose, positions_mm, votes, encoded });
+        let votes = vec![Votes::OWN_VIEW; cloud.positions_mm.len()];
+        self.clouds.insert(frame_id, KeptCloud { map_pose, positions_mm: cloud.positions_mm, votes, encoded });
         self.order.push_back(frame_id);
         while self.order.len() > self.max_keyframes {
             let dropped = self.order.pop_front().expect("over the limit");
             self.clouds.remove(&dropped);
+            self.voxel_holders.retain(|_, holder| *holder != dropped);
             out.push(Outgoing::json(Layer::Clouds, &Update::KeyframeDropped { frame_id: dropped.0 }));
         }
         out
+    }
+
+    /// The cloud's points in map voxels no drawn cloud holds, one a voxel; the cloud holds those voxels from now.
+    fn thinned_to_free_voxels(&mut self, cloud: KeyframeCloud, at: &KeyframeMapPose) -> KeyframeCloud {
+        let voxels = MapVoxels::of(at, self.settings.voxel_m);
+        let mut thinned = KeyframeCloud { frame_id: cloud.frame_id, positions_mm: Vec::new(), colors: Vec::new() };
+        for (position, color) in cloud.positions_mm.iter().zip(&cloud.colors) {
+            if let Entry::Vacant(free) = self.voxel_holders.entry(voxels.voxel(position)) {
+                free.insert(cloud.frame_id);
+                thinned.positions_mm.push(*position);
+                thinned.colors.push(*color);
+            }
+        }
+        thinned
     }
 
     /// One registered view's votes on every other drawn cloud, and the points they newly remove.
@@ -395,8 +443,7 @@ impl CloudStore {
                 if votes.removed() {
                     continue;
                 }
-                let point = Vec3::new(position[0] as f32, position[1] as f32, position[2] as f32) * 0.001;
-                match view.sighting(turn * point + shift, &self.settings) {
+                match view.sighting(turn * metres(position) + shift, &self.settings) {
                     Sighting::SeenThrough => votes.seen_through = votes.seen_through.saturating_add(1),
                     Sighting::Seen => votes.seen = votes.seen.saturating_add(1),
                     Sighting::Nothing => continue,
@@ -406,6 +453,14 @@ impl CloudStore {
                 }
             }
             if !newly.is_empty() {
+                let voxels = MapVoxels::of(&map_pose, self.settings.voxel_m);
+                for &removed in &newly {
+                    if let Entry::Occupied(held) = self.voxel_holders.entry(voxels.voxel(&cloud.positions_mm[removed as usize])) {
+                        if held.get() == frame_id {
+                            held.remove();
+                        }
+                    }
+                }
                 out.push(Outgoing::binary(Layer::Clouds, encode_space_carving(*frame_id, &newly)));
             }
         }
@@ -570,6 +625,41 @@ mod tests {
         };
         assert_eq!((5..=8).map(|frame_id| removed_after(&mut store, frame_id)).collect::<Vec<_>>(), [0, 0, 0, 0]);
         assert!(removed_after(&mut store, 9) > 0, "seen in 4 views, seen through in 5");
+    }
+
+    fn points_drawn(store: &CloudStore) -> usize {
+        store.clouds.values().map(|cloud| cloud.positions_mm.len()).sum()
+    }
+
+    #[test]
+    fn a_surface_seen_again_from_a_selected_keyframe_adds_no_points() {
+        let mut store = store();
+        view(&mut store, &wall(1), level(0.0, 0.0));
+        let once = points_drawn(&store);
+        assert!(once > 0);
+        let again = view(&mut store, &wall(2), level(0.0, 0.0));
+        assert_eq!((clouds_sent(&again), store.len(), points_drawn(&store)), (0, 1, once), "the same wall from the same place");
+    }
+
+    #[test]
+    fn a_keyframe_draws_only_its_points_in_space_no_cloud_has_drawn() {
+        let mut store = CloudStore::new(CloudSettings { voxel_m: 0.5, ..CloudSettings::DEFAULT }, 10);
+        view(&mut store, &wall(1), level(0.0, 0.0));
+        let once = points_drawn(&store);
+        let beside = view(&mut store, &wall(2), level(0.5, 0.0));
+        assert_eq!(clouds_sent(&beside), 1);
+        let added = points_drawn(&store) - once;
+        assert!(added > 0 && added < once, "only the strip of wall the first view did not reach: {added} of {once}");
+    }
+
+    #[test]
+    fn dropping_the_oldest_cloud_frees_its_space_for_a_later_keyframe() {
+        let mut store = CloudStore::new(CloudSettings::DEFAULT, 1);
+        view(&mut store, &wall(1), level(0.0, 0.0));
+        let once = points_drawn(&store);
+        view(&mut store, &wall(2), level(40.0, 0.0));
+        view(&mut store, &wall(3), level(0.0, 0.0));
+        assert_eq!((store.len(), points_drawn(&store)), (1, once), "the first wall is drawn again once its cloud was dropped");
     }
 
     #[test]

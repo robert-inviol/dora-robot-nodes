@@ -27,10 +27,12 @@ pub struct CloudSettings {
     pub max_range_m: f32,
     /// A later keyframe whose depth lies this much beyond a cloud's point saw through it, and removes it.
     pub space_carving_margin_m: f32,
+    /// The side of the map voxels the drawn clouds share: one point is drawn in each.
+    pub voxel_m: f32,
 }
 
 impl CloudSettings {
-    pub const DEFAULT: CloudSettings = CloudSettings { stride_px: 4, min_range_m: 0.4, max_range_m: 5.0, space_carving_margin_m: 0.1 };
+    pub const DEFAULT: CloudSettings = CloudSettings { stride_px: 2, min_range_m: 0.4, max_range_m: 5.0, space_carving_margin_m: 0.1, voxel_m: 0.02 };
 
     pub fn checked(self) -> Result<CloudSettings, CloudError> {
         if self.stride_px == 0 {
@@ -41,6 +43,9 @@ impl CloudSettings {
         }
         if !(self.space_carving_margin_m.is_finite() && self.space_carving_margin_m > 0.0) {
             return Err(CloudError::SpaceCarvingMargin(self.space_carving_margin_m));
+        }
+        if !(self.voxel_m.is_finite() && self.voxel_m > 0.0) {
+            return Err(CloudError::Voxel(self.voxel_m));
         }
         Ok(self)
     }
@@ -54,6 +59,8 @@ pub enum CloudError {
     Range { min_m: f32, max_m: f32 },
     #[error("the carving margin {0} m must be above 0")]
     SpaceCarvingMargin(f32),
+    #[error("the cloud voxel {0} m must be above 0")]
+    Voxel(f32),
     #[error("keyframe {frame_id}'s colour image does not decode: {source}")]
     Jpeg { frame_id: u64, source: jpeg_decoder::Error },
     #[error("keyframe {frame_id}'s colour image is {jpeg_width}x{jpeg_height}, its depth {depth_width}x{depth_height}")]
@@ -208,5 +215,6 @@ pub(crate) mod tests {
         assert!(matches!(CloudSettings { stride_px: 0, ..CloudSettings::DEFAULT }.checked(), Err(CloudError::ZeroStride)));
         let far = CloudSettings { max_range_m: 40.0, ..CloudSettings::DEFAULT };
         assert!(matches!(far.checked(), Err(CloudError::Range { .. })));
+        assert!(matches!(CloudSettings { voxel_m: 0.0, ..CloudSettings::DEFAULT }.checked(), Err(CloudError::Voxel(_))));
     }
 }

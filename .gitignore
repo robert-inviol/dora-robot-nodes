@@ -3,8 +3,8 @@ __pycache__/
 .venv/
 out/
 hailort.log
-nodes/dora-delta2a-lidar/target/
-nodes/dora-delta2a-lidar/dist/
+nodes/dora-serial-lidar/target/
+nodes/dora-serial-lidar/dist/
 nodes/dora-depth-perception/target/
 nodes/dora-zenoh-bridge/target/
 nodes/dora-world-agent/target/

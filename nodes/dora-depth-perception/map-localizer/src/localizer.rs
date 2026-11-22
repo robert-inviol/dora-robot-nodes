@@ -21,6 +21,13 @@
 //! reported restarted. Until a loop closure ties such a run to the map, tracking registers only against the run's own
 //! keyframes.
 //!
+//! With an odometry step (`LocalizerInput::odometry_step`), the camera's motion since the previous keyframe is known
+//! apart from registration. The step seeds tracking, and carries the pose of a keyframe that does not register. Such
+//! a keyframe, when it has enough points and is beyond keyframe selection of every map keyframe, joins the map at
+//! once at its carried pose by a dead-reckoning edge and is reported restarted; tracking goes on against the whole
+//! map, so a view of space not yet in the map adds that space instead of losing the camera. A lost keyframe's pose
+//! is carried too, and the next keyframe is tracked from it.
+//!
 //! A keyframe whose turn is refused (`RelativeYawPrior::Refused`) is lost without any registration, and the
 //! heading stays unknown: dead reckoning stops, and the following keyframes are only relocalized against
 //! the map, over every heading, until one matches.
@@ -225,6 +232,8 @@ pub struct GraphSettings {
     pub loop_sigma: EdgeSigma,
     /// Per lost keyframe bridged by a dead-reckoning edge.
     pub dead_reckoning_sigma: EdgeSigma,
+    /// Per keyframe bridged by a dead-reckoning edge whose motion is the odometry step.
+    pub odometry_step_sigma: EdgeSigma,
 }
 
 impl Default for GraphSettings {
@@ -237,6 +246,7 @@ impl Default for GraphSettings {
             odometry_sigma: EdgeSigma { xy_m: 0.02, z_m: 0.01, yaw_rad: 0.5f32.to_radians() },
             loop_sigma: EdgeSigma { xy_m: 0.03, z_m: 0.02, yaw_rad: 1.0f32.to_radians() },
             dead_reckoning_sigma: EdgeSigma { xy_m: 0.5, z_m: 0.1, yaw_rad: 2.0f32.to_radians() },
+            odometry_step_sigma: EdgeSigma { xy_m: 0.05, z_m: 0.03, yaw_rad: 1.0f32.to_radians() },
         }
     }
 }
@@ -258,6 +268,9 @@ pub struct LocalizerInput {
     pub captured: UnixNanos,
     pub cloud: Vec<Vec3>,
     pub yaw_prior: RelativeYawPrior,
+    /// The camera's floor frame at this keyframe in its floor frame at the previous keyframe given to the localizer,
+    /// by odometry; `None` when odometry does not cover both.
+    pub odometry_step: Option<Pose>,
 }
 
 /// Where one keyframe's localization spent its time.
@@ -552,7 +565,15 @@ impl Localizer {
     fn place(&mut self, input: &LocalizerInput, timings: &mut StageTimings) -> KeyframeEstimate {
         let previous = self.latest_pose();
         let seed = self.seed(input.yaw_prior, previous);
-        let dead_reckoned = Pose { yaw_rad: seed.gyro_yaw().unwrap_or(previous.yaw_rad), translation: previous.translation };
+        // The previous pose moved by the odometry step; without a known heading the step has no direction.
+        let carried = match self.latest {
+            Latest::InMap { .. } | Latest::Lost { .. } => input.odometry_step.map(|step| previous.compose(&step)),
+            Latest::Nothing | Latest::HeadingUnknown { .. } => None,
+        };
+        let dead_reckoned = Pose {
+            yaw_rad: seed.gyro_yaw().or(carried.map(|pose| pose.yaw_rad)).unwrap_or(previous.yaw_rad),
+            translation: carried.map_or(previous.translation, |pose| pose.translation),
+        };
         let enough_points = input.cloud.len() >= self.settings.tracking.min_points;
         let estimate = |localizer: &Localizer, pose, tracking, selection, registration, submap, loop_closed, optimization| KeyframeEstimate {
             frame_id: input.frame_id,
@@ -589,26 +610,41 @@ impl Localizer {
 
         let mut attempted = None;
         let mut submap = Vec::new();
-        if let (Latest::InMap { node: last, .. }, true) = (self.latest, enough_points) {
-            let tracked = self.track(input, previous, seed, timings);
+        // The latest keyframe's map keyframe when it was placed in the map; a lost one is tracked from only when
+        // odometry carried its pose here.
+        let tracked_from = match self.latest {
+            Latest::InMap { node, .. } => Some(Some(node)),
+            Latest::Lost { .. } if carried.is_some() => Some(None),
+            Latest::Lost { .. } | Latest::Nothing | Latest::HeadingUnknown { .. } => None,
+        };
+        if let (Some(last), true) = (tracked_from, enough_points) {
+            let tracked = self.track(input, previous, seed, carried, timings);
             attempted = tracked.registration;
             submap = tracked.submap.iter().map(|&node| self.keyframes[node.0].frame_id).collect();
             if let Some(found) = tracked.accepted {
                 self.last_step = Some(found.pose.relative_to(&previous));
+                let tracking = if last.is_some() { Tracking::Tracking } else { Tracking::Relocalized };
                 if let Some(reference) = self.reference_keyframe(&tracked.submap, found.pose) {
                     let reference = self.follow(input, reference, found.pose);
                     let selection = KeyframeSelection::NotSelected { reference };
-                    return estimate(self, found.pose, Tracking::Tracking, selection, Some(found), submap, false, None);
+                    return estimate(self, found.pose, tracking, selection, Some(found), submap, false, None);
                 }
                 let node = self.add_keyframe(input, found.pose);
-                self.add_edge(last, node, EdgeKind::Odometry, self.settings.graph.odometry_sigma);
+                match last {
+                    Some(last) => self.add_edge(last, node, EdgeKind::Odometry, self.settings.graph.odometry_sigma),
+                    // After lost keyframes the registration itself ties the keyframe to the map keyframe nearest it.
+                    None => {
+                        let anchor = self.near(0..node.0, found.pose.translation, f32::INFINITY, 1)[0];
+                        self.add_edge(anchor, node, EdgeKind::LoopClosure, self.settings.graph.loop_sigma);
+                    }
+                }
                 self.latest = Latest::InMap { node, offset: Pose::IDENTITY };
                 let started = Instant::now();
                 let loop_closed = self.close_loop(input, node, matches!(seed, Seed::Gyro { .. }));
                 timings.loop_closure = started.elapsed();
                 let optimization = self.optimize_if_due(input.captured, loop_closed, timings);
                 let pose = self.graph.pose(node);
-                return estimate(self, pose, Tracking::Tracking, KeyframeSelection::Selected, Some(found), submap, loop_closed, optimization);
+                return estimate(self, pose, tracking, KeyframeSelection::Selected, Some(found), submap, loop_closed, optimization);
             }
         }
 
@@ -643,6 +679,21 @@ impl Localizer {
             Latest::Lost { lost_in_a_row, .. } => lost_in_a_row + 1,
             Latest::InMap { .. } | Latest::Nothing | Latest::HeadingUnknown { .. } => 1,
         };
+        if carried.is_some() && enough_points && self.is_beyond_keyframe_selection(dead_reckoned) {
+            let anchor = match self.latest {
+                Latest::InMap { node, .. } => node,
+                Latest::Lost { .. } | Latest::Nothing | Latest::HeadingUnknown { .. } => NodeIndex(self.graph.len() - 1),
+            };
+            let node = self.add_keyframe(input, dead_reckoned);
+            let per_keyframe = self.settings.graph.odometry_step_sigma;
+            let scale = (lost_in_a_row as f32).sqrt();
+            let sigma = EdgeSigma { xy_m: per_keyframe.xy_m * scale, z_m: per_keyframe.z_m * scale, yaw_rad: per_keyframe.yaw_rad * scale };
+            self.add_edge(anchor, node, EdgeKind::DeadReckoning, sigma);
+            self.latest = Latest::InMap { node, offset: Pose::IDENTITY };
+            let optimization = self.optimize_if_due(input.captured, false, timings);
+            let pose = self.graph.pose(node);
+            return estimate(self, pose, Tracking::Restarted, KeyframeSelection::Selected, attempted, submap, false, optimization);
+        }
         if enough_points && lost_in_a_row > self.settings.relocalize.restart_after_lost {
             let anchor = NodeIndex(self.graph.len() - 1);
             let node = self.add_keyframe(input, dead_reckoned);
@@ -660,6 +711,13 @@ impl Localizer {
         estimate(self, dead_reckoned, Tracking::Lost, KeyframeSelection::NotLocalized, attempted, submap, false, None)
     }
 
+    /// Whether no map keyframe is within keyframe selection of `pose`.
+    fn is_beyond_keyframe_selection(&self, pose: Pose) -> bool {
+        let submap = &self.settings.submap;
+        let near = self.near(0..self.graph.len(), pose.translation, submap.radius_m, submap.max_keyframes);
+        self.reference_keyframe(&near, pose).is_none()
+    }
+
     fn walking_step(&self, pose: Pose, previous: Pose) -> bool {
         let step = pose.relative_to(&previous);
         step.translation.length() <= self.settings.tracking.max_step_m && step.yaw_rad.abs().to_degrees() <= self.settings.tracking.max_step_turn_deg
@@ -675,10 +733,11 @@ impl Localizer {
         }
     }
 
-    /// Registers against the map keyframes nearest the seed from `previous`, the latest keyframe's pose.
-    fn track(&mut self, input: &LocalizerInput, previous: Pose, seed: Seed, timings: &mut StageTimings) -> Attempt {
+    /// Registers against the map keyframes nearest the seed from `previous`, the latest keyframe's pose: `carried`,
+    /// that pose moved by the odometry step, or without one the pose moved by the step before.
+    fn track(&mut self, input: &LocalizerInput, previous: Pose, seed: Seed, carried: Option<Pose>, timings: &mut StageTimings) -> Attempt {
         let settings = &self.settings;
-        let moving_on = self.last_step.map_or(previous, |step| previous.compose(&step));
+        let moving_on = carried.or(self.last_step.map(|step| previous.compose(&step))).unwrap_or(previous);
         let gyro_yaw = seed.gyro_yaw();
         let seeds: Vec<Pose> = match seed {
             Seed::Unknown => return Attempt::failed(None),
@@ -892,7 +951,63 @@ mod tests {
     }
 
     fn input(k: u64, cloud: Vec<Vec3>, yaw_prior: RelativeYawPrior) -> LocalizerInput {
-        LocalizerInput { frame_id: FrameId(k), captured: UnixNanos(k as i64 * 500_000_000), cloud, yaw_prior }
+        LocalizerInput { frame_id: FrameId(k), captured: UnixNanos(k as i64 * 500_000_000), cloud, yaw_prior, odometry_step: None }
+    }
+
+    /// The first keyframe at the origin, then a keyframe with no points whose odometry step is 0.4 m ahead.
+    fn localizer_carried_through_an_empty_keyframe() -> (Localizer, KeyframeEstimate) {
+        let mut localizer = Localizer::new(LocalizerSettings::default());
+        localizer.localize(input(0, view(Pose::IDENTITY), RelativeYawPrior::GyroTurn { turn_rad: 0.0 }));
+        let step = Pose { yaw_rad: 0.0, translation: Vec3::new(0.0, 0.4, 0.0) };
+        let blank = localizer.localize(LocalizerInput { odometry_step: Some(step), ..input(1, Vec::new(), RelativeYawPrior::GyroTurn { turn_rad: 0.0 }) });
+        (localizer, blank)
+    }
+
+    #[test]
+    fn a_lost_keyframe_is_carried_by_the_odometry_step_and_the_next_one_tracks_from_there() {
+        let (mut localizer, blank) = localizer_carried_through_an_empty_keyframe();
+        assert_eq!(blank.tracking, Tracking::Lost);
+        assert!((blank.pose.translation - Vec3::new(0.0, 0.4, 0.0)).length() < 1e-6, "{:?}", blank.pose);
+        let on = Pose { yaw_rad: 0.0, translation: Vec3::new(0.0, 0.8, 0.0) };
+        let step = Pose { yaw_rad: 0.0, translation: Vec3::new(0.0, 0.4, 0.0) };
+        let found = localizer.localize(LocalizerInput { odometry_step: Some(step), ..input(2, view(on), RelativeYawPrior::GyroTurn { turn_rad: 0.0 }) });
+        assert_eq!((found.tracking, found.selection), (Tracking::Relocalized, KeyframeSelection::Selected));
+        assert!((found.pose.translation - on.translation).length() < 0.01, "{:?}", found.pose);
+        assert!(!found.submap.is_empty(), "tracked against the map, not searched for");
+    }
+
+    /// Points of a wall no map keyframe has seen, in the frame of a camera 1.5 m short of it.
+    fn unseen_wall() -> Vec<Vec3> {
+        (0..40).flat_map(|x| (0..30).map(move |z| Vec3::new(-1.0 + x as f32 * 0.05, 1.5, -0.5 + z as f32 * 0.05))).collect()
+    }
+
+    #[test]
+    fn a_view_of_space_not_in_the_map_joins_it_at_the_pose_odometry_carried() {
+        let mut localizer = Localizer::new(LocalizerSettings::default());
+        localizer.localize(input(0, view(Pose::IDENTITY), RelativeYawPrior::GyroTurn { turn_rad: 0.0 }));
+        // Stepped 8 m out of the room: nothing of the map is in view.
+        let step = Pose { yaw_rad: 0.0, translation: Vec3::new(0.0, 8.0, 0.0) };
+        let outside = localizer.localize(LocalizerInput { odometry_step: Some(step), ..input(1, unseen_wall(), RelativeYawPrior::GyroTurn { turn_rad: 0.0 }) });
+        assert_eq!((outside.tracking, outside.selection), (Tracking::Restarted, KeyframeSelection::Selected));
+        assert!((outside.pose.translation - step.translation).length() < 1e-6, "{:?}", outside.pose);
+        assert_eq!(localizer.graph().len(), 2);
+        // The next keyframe, a little further on, registers against the keyframe just added.
+        let nudge = Pose { yaw_rad: 0.0, translation: Vec3::new(0.0, 0.2, 0.0) };
+        let nearer_wall: Vec<Vec3> = unseen_wall().into_iter().map(|p| p - nudge.translation).collect();
+        let next = localizer.localize(LocalizerInput { odometry_step: Some(nudge), ..input(2, nearer_wall, RelativeYawPrior::GyroTurn { turn_rad: 0.0 }) });
+        assert_eq!(next.tracking, Tracking::Tracking);
+        assert!((next.pose.translation.y - 8.2).abs() < 0.02, "{:?}", next.pose);
+    }
+
+    #[test]
+    fn a_keyframe_that_does_not_register_within_keyframe_selection_of_the_map_stays_out_of_it() {
+        let mut localizer = Localizer::new(LocalizerSettings::default());
+        localizer.localize(input(0, view(Pose::IDENTITY), RelativeYawPrior::GyroTurn { turn_rad: 0.0 }));
+        let step = Pose { yaw_rad: 0.0, translation: Vec3::new(0.0, 0.03, 0.0) };
+        // The unseen wall where the room has open floor: it matches nothing.
+        let odd = localizer.localize(LocalizerInput { odometry_step: Some(step), ..input(1, unseen_wall(), RelativeYawPrior::GyroTurn { turn_rad: 0.0 }) });
+        assert_eq!((odd.tracking, odd.selection), (Tracking::Lost, KeyframeSelection::NotLocalized));
+        assert_eq!(localizer.graph().len(), 1);
     }
 
     #[test]

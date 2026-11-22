@@ -22,6 +22,11 @@ pose at the keyframe's camera time, interpolated between the two odometry poses 
 reached that time. The correction averages the latest `window_keyframes` joined keyframes, each at its current
 optimized map pose, and its spread gives the sigmas, never below the `min_sigma_*` settings.
 
+Odometry also gives the localizer each keyframe's odometry step, the camera's motion since the previous keyframe
+(see map-localizer's README for its use), when odometry has reached the keyframe's camera time and both keyframes are
+in one odom frame. Each `keyframe localized` log line has the step's length (`odometry_step_m`) or why there was none
+(`no_odometry_step`).
+
 Odometry gives the IMU body's pose; the keyframe's floor frame is the colour camera's. The colour camera's
 extrinsics on the IMU, where its optical centre sits and how its axes turn into the IMU's, come from the camera's
 `calibration` message (its `depth_to_imu` after the inverse of `depth_to_color`). Odometry poses before the first
@@ -79,3 +84,13 @@ cargo test --release -p map-localizer -p dora-map-localizer
 
 `replay-dataflow.yml` wires the node to `dora-keyframe-replay` playing a keyframe recording with its IMU
 recording.
+
+## Recording and replaying the node's inputs
+
+`dora-localizer-input-recorder` records the node's four inputs as they arrive, wired beside the localizer with queues
+that drop nothing; `RECORDINGS_DIRECTORY` names where its recordings go. The `replay_inputs` example runs the node's
+handling over a recording, in the order the messages arrived, and writes one row per localized keyframe:
+
+```
+cargo run --release -p dora-map-localizer --example replay_inputs -- <recording directory> <settings.toml> <keyframes.csv>
+```

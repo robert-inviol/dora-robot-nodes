@@ -29,6 +29,7 @@ const ADDRESS_VARIABLE: &str = "RIG_VIEW_ADDRESS";
 const PORT_VARIABLE: &str = "RIG_VIEW_PORT";
 const STRIDE_VARIABLE: &str = "RIG_VIEW_STRIDE_PX";
 const MAX_RANGE_VARIABLE: &str = "RIG_VIEW_MAX_RANGE_M";
+const VOXEL_VARIABLE: &str = "RIG_VIEW_CLOUD_VOXEL_M";
 const MAX_KEYFRAMES_VARIABLE: &str = "RIG_VIEW_MAX_KEYFRAMES";
 const SNAPSHOT_REQUEST_OUTPUT: &str = "mesh_snapshot_request";
 
@@ -54,6 +55,7 @@ fn settings() -> Result<RigViewSettings> {
     let cloud = CloudSettings {
         stride_px: optional(STRIDE_VARIABLE, defaults.cloud.stride_px)?,
         max_range_m: optional(MAX_RANGE_VARIABLE, defaults.cloud.max_range_m)?,
+        voxel_m: optional(VOXEL_VARIABLE, defaults.cloud.voxel_m)?,
         ..defaults.cloud
     }
     .checked()?;

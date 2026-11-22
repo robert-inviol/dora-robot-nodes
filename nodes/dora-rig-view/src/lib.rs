@@ -1,6 +1,7 @@
-//! A live 3D page of the robot's map for people to watch: the dense map's surface with the objects painted on it,
-//! keyframe clouds at their map poses from the localizer, the robot from odometry, people with their skeletons, and rooms. The
-//! page gets the scene once when it connects, then only what changes.
+//! A live 3D page of the robot's map for people to watch: keyframe clouds at their map poses from the localizer, tinted
+//! where the objects are, the objects with their labels and sizes, the robot from odometry, people with their
+//! skeletons, and, as diagnostic layers, the dense map's mesh and rooms. The page gets the scene once when it
+//! connects, then only what changes.
 
 pub mod cloud;
 pub mod clouds;

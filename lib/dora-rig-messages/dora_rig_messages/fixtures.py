@@ -75,13 +75,26 @@ EXAMPLES: dict[str, Message] = {
     "pilot_status_nobody_locked": PilotStatus(DriveMode.MANUAL, locked_id=None),
     "driver_status": DriverStatus(armed=True, left_pct=35, right_pct=-12),
     "scan": Scan(
-        spin_rev_per_s=8.0,
+        spin_rev_per_s=10.0,
+        first_reading_unix_ns=1_762_560_000_100_000_000,
+        last_reading_unix_ns=1_762_560_000_197_500_000,
         readings=(
             RangeReading(bearing_deg=0.0, range_m=0.5),
             RangeReading(bearing_deg=90.0, range_m=None),
             RangeReading(bearing_deg=180.0, range_m=3.25),
             RangeReading(bearing_deg=292.5, range_m=11.75),
         ),
+        intensities=(212, 0, 87, 9),
+    ),
+    "scan_without_intensity": Scan(
+        spin_rev_per_s=8.0,
+        first_reading_unix_ns=1_762_560_000_100_000_000,
+        last_reading_unix_ns=1_762_560_000_225_000_000,
+        readings=(
+            RangeReading(bearing_deg=0.0, range_m=0.5),
+            RangeReading(bearing_deg=90.0, range_m=None),
+        ),
+        intensities=None,
     ),
     "keyframe": Keyframe(
         frame_id=42,

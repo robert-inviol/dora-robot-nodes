@@ -15,7 +15,7 @@ one node without the rest.
 | [`dora-people-3d`](nodes/dora-people-3d) | The pose model's people placed in 3D with depth, smoothed and followed as tracks, in Rust |
 | [`dora-person-follower`](nodes/dora-person-follower) | Decides where the robot goes: the operator's joystick, or towards one tracked person. Publishes a drive demand and knows nothing about the robot underneath |
 | [`dora-teleop`](nodes/dora-teleop) | A control page for a phone or laptop: joystick, follow toggle, stop button, the live video with the tracker's boxes, and the map |
-| [`dora-delta2a-lidar`](nodes/dora-delta2a-lidar) | The 3irobotics Delta-2A lidar, in Rust: decodes its serial stream and publishes each turn of the head as one scan |
+| [`dora-serial-lidar`](nodes/dora-serial-lidar) | A low-cost 2D lidar on a serial port (LDRobot LD06 or 3irobotics Delta-2A), in Rust: decodes its stream and publishes each turn of the head as one scan |
 | [`dora-scan-view`](nodes/dora-scan-view) | A top-down map page of a lidar scan |
 | [`dora-zenoh-bridge`](nodes/dora-zenoh-bridge) | Carries messages between dataflows on different machines over Zenoh, as zstd-compressed Arrow IPC. Rust |
 | [`dora-scene-concepts`](nodes/dora-scene-concepts) | Asks Claude which object types a keyframe shows, and streams the names out as they come |
@@ -35,7 +35,7 @@ one node without the rest.
             dora-teleop (control page) -----------------+ <----------+
                  ^  map
                  |
- lidar -> dora-delta2a-lidar --- scan ---> dora-scan-view
+ lidar -> dora-serial-lidar --- scan ---> dora-scan-view
 ```
 
 The follower's output is a drive demand: a forward share and a turn share of full power, whose
@@ -79,7 +79,7 @@ pip install "git+https://github.com/robert-inviol/dora-robot-nodes#subdirectory=
 Each installs a command named after the package, which is what a dataflow's `path:` points at;
 every node's README has the snippet. `dora-hailo-perception` also needs the Hailo and camera
 packages from the Raspberry Pi's apt, listed in its README. The lidar node is built with
-`nodes/dora-delta2a-lidar/build-for-pi.sh`, which cross-compiles a static binary for the Pi.
+`nodes/dora-serial-lidar/build-for-pi.sh`, which cross-compiles a static binary for the Pi.
 
 Tested with dora 0.3.13 on a Raspberry Pi 5, Debian 12, HailoRT 4.20.
 
@@ -88,7 +88,7 @@ Tested with dora 0.3.13 on a Raspberry Pi 5, Debian 12, HailoRT 4.20.
 ```bash
 uv sync
 uv run pytest
-cargo test --manifest-path nodes/dora-delta2a-lidar/Cargo.toml
+cargo test --manifest-path nodes/dora-serial-lidar/Cargo.toml
 (cd nodes/dora-depth-perception && cargo test --workspace)
 (cd nodes/dora-world-agent && cargo test)
 cargo test --manifest-path nodes/dora-realsense/Cargo.toml

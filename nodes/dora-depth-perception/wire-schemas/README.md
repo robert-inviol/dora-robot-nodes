@@ -6,7 +6,7 @@ only, so dora-zenoh-bridge can use it without perception-wire's dependencies.
 
 - Each module (`perception`, `camera`, `localization`, `navigation`, `objects`, `odometry`, `people`, `posed_depth`,
   `space_map`, `robot`) gives the `Fields` of its messages and of the structs inside them. perception-wire encodes and
-  decodes with these; dora-delta2a-lidar writes its `scan` with them.
+  decodes with these; dora-serial-lidar writes its `scan` with them.
 - `WIRE_TYPES` lists every message type by name; `WireTypeTable` finds one by fingerprint or by Arrow type. Messages
   of one Arrow type share an entry: the bridge cannot tell them apart and need not, since it decodes them alike.
 - `fingerprint` is the first 8 bytes of the SHA-256 of `canonical_encoding`, an ASCII spelling of the whole type

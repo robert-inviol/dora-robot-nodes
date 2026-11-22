@@ -57,8 +57,9 @@ camera: dora-realsense (the only node that opens the D455; every stamp on the ca
  |                                    -> bridge
  '- depth, imu, calibration, color (only the frames it names on request_color)
                                 -> keyframes (dora-keyframe-selector: keyframe selection, at least one a second and
-                                   sooner on a 10 degree turn; people cut out of the aligned depth, the colour left
-                                   as it is) -> keyframe, imu (one per keyframe) -> bridge
+                                   sooner on a 10 degree turn or 10 cm of travel by odom_pose; people cut out of
+                                   the aligned depth, the colour left as it is) -> keyframe, imu (one per keyframe)
+                                   -> bridge
 bridge: listens on :7447; publishes rig/people_tracks, rig/odom_pose, rig/keyframe, rig/imu, rig/calibration and
         rig/posed_depth
 ```
@@ -193,9 +194,11 @@ from the shoulders, then the hips (`world-store/src/geometry.rs`).
 
 dora-map-localizer registers each keyframe against the map, keeps the map keyframes in a 4-DoF pose graph, and
 joins each registered keyframe (tracking or relocalized) to the odometry pose at its camera time to send
-`map_to_odom` (see its README). A keyframe that starts a new run after tracking was lost is reported `restarted`:
-it is in the map, joined only by a dead-reckoning edge, and later pose graph updates move it; it does not feed
-`map_to_odom`. Each `odom_pose` carries `odom_started_camera_ns`, which names its odom frame. A later value means
+`map_to_odom` (see its README). The odometry's motion between two keyframes seeds the later one's registration; a
+keyframe that does not register, in space the map does not hold, joins the map at the pose that motion carries it
+to. Such a keyframe, like one that starts a new run after tracking was lost without odometry, is reported
+`restarted`: it is in the map, joined only by a dead-reckoning edge, and later pose graph updates move it; it does
+not feed `map_to_odom`. Each `odom_pose` carries `odom_started_camera_ns`, which names its odom frame. A later value means
 odometry started again in a new frame: the localizer drops the old frame's poses and correction and re-anchors from
 the next keyframe in the new frame. A start that goes back, or a camera time that goes back, stops the node.
 
@@ -304,6 +307,8 @@ Odometry, in order:
 - Degenerate direction: the direction of travel a cloud constrains least (`degenerate_direction` on `odom_pose`).
 - Extrinsics: where a sensor sits on the body (`SensorExtrinsics`, `CameraExtrinsics`); intrinsics are its lens.
 - Specific force: what the accelerometer measures; at rest, the reaction to gravity (`specific_force`).
+- Gravity filter: the camera's estimate of up that every `specific_force` it sends carries, turned by the gyro and
+  pulled towards the accelerometer's direction with a 3 s time constant (`rgbd_keyframes::GravityFilter`).
 - Keyframe selection: choosing which frames become keyframes (`dora-keyframe-selector`), and on the server whether a
   registered keyframe joins the map (`KeyframeSelection`).
 - Pose graph optimization: the solve that moves map keyframes after loop closures (`PoseGraphOptimization`); a pose

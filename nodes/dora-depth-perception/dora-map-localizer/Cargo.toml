@@ -21,3 +21,4 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 depth-perception = { path = "../depth-perception" }
+rgbd-keyframes = { path = "../../dora-realsense/rgbd-keyframes" }

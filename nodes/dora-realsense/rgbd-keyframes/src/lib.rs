@@ -1,8 +1,12 @@
 //! Which camera frames are worth sending on as keyframes, and which way is up.
 
+pub mod gravity;
+
 use std::time::Duration;
 
 use glam::Vec3;
+
+pub use gravity::{GravityFilter, GravityFilterError, ImuStream, STANDARD_GRAVITY_M_S2};
 
 #[derive(Clone, Debug)]
 pub struct KeyframeSettings {
@@ -12,6 +16,8 @@ pub struct KeyframeSettings {
     pub min_interval: Duration,
     /// Turning this far since the last keyframe calls for a new one.
     pub turn_threshold_rad: f32,
+    /// Moving this far from where the last keyframe was taken calls for a new one.
+    pub travel_threshold_m: f32,
 }
 
 impl Default for KeyframeSettings {
@@ -20,6 +26,7 @@ impl Default for KeyframeSettings {
             max_interval: Duration::from_secs(1),
             min_interval: Duration::from_millis(200),
             turn_threshold_rad: 10f32.to_radians(),
+            travel_threshold_m: 0.10,
         }
     }
 }
@@ -30,11 +37,17 @@ pub struct KeyframeSelector {
     settings: KeyframeSettings,
     last_keyframe: Option<Duration>,
     turned_rad: f32,
+    travelled_m: f32,
 }
 
 impl KeyframeSelector {
     pub fn new(settings: KeyframeSettings) -> KeyframeSelector {
-        KeyframeSelector { settings, last_keyframe: None, turned_rad: 0.0 }
+        KeyframeSelector { settings, last_keyframe: None, turned_rad: 0.0, travelled_m: 0.0 }
+    }
+
+    /// Sets how far the camera now is from where the last keyframe was taken.
+    pub fn set_travel(&mut self, travelled_m: f32) {
+        self.travelled_m = travelled_m;
     }
 
     /// Adds one gyro reading held for `held`.
@@ -49,40 +62,16 @@ impl KeyframeSelector {
             Some(last) => {
                 let since = now.saturating_sub(last);
                 since >= self.settings.max_interval
-                    || (since >= self.settings.min_interval && self.turned_rad >= self.settings.turn_threshold_rad)
+                    || (since >= self.settings.min_interval
+                        && (self.turned_rad >= self.settings.turn_threshold_rad || self.travelled_m >= self.settings.travel_threshold_m))
             }
         };
         if due {
             self.last_keyframe = Some(now);
             self.turned_rad = 0.0;
+            self.travelled_m = 0.0;
         }
         due
-    }
-}
-
-/// The accelerometer smoothed over a time constant, so the specific force at rest, the reaction to gravity, stands out from shakes.
-#[derive(Clone, Debug)]
-pub struct GravityEstimate {
-    time_constant: Duration,
-    specific_force: Option<Vec3>,
-}
-
-impl GravityEstimate {
-    pub fn new(time_constant: Duration) -> GravityEstimate {
-        GravityEstimate { time_constant, specific_force: None }
-    }
-
-    pub fn add(&mut self, acceleration_m_s2: Vec3, since_last: Duration) {
-        let weight = (since_last.as_secs_f32() / self.time_constant.as_secs_f32()).min(1.0);
-        self.specific_force = Some(match self.specific_force {
-            None => acceleration_m_s2,
-            Some(previous) => previous.lerp(acceleration_m_s2, weight),
-        });
-    }
-
-    /// The specific force (at rest, the reaction to gravity) in the accelerometer's frame, once any reading has arrived.
-    pub fn specific_force(&self) -> Option<Vec3> {
-        self.specific_force
     }
 }
 
@@ -116,23 +105,30 @@ mod tests {
     }
 
     #[test]
+    fn travelling_past_the_threshold_brings_the_next_keyframe_forward() {
+        let mut selector = KeyframeSelector::new(KeyframeSettings::default());
+        assert!(selector.take(ms(0)));
+        selector.set_travel(0.12);
+        assert!(!selector.take(ms(150)), "the minimum interval has not passed");
+        assert!(selector.take(ms(250)));
+        assert!(!selector.take(ms(500)), "a keyframe starts the travel again from where it was taken");
+    }
+
+    #[test]
+    fn a_short_move_waits_for_the_max_interval() {
+        let mut selector = KeyframeSelector::new(KeyframeSettings::default());
+        assert!(selector.take(ms(0)));
+        selector.set_travel(0.08);
+        assert!(!selector.take(ms(600)));
+        assert!(selector.take(ms(1000)));
+    }
+
+    #[test]
     fn a_small_turn_waits_for_the_max_interval() {
         let mut selector = KeyframeSelector::new(KeyframeSettings::default());
         assert!(selector.take(ms(0)));
         selector.add_rotation(Vec3::new(0.0, 0.0, 0.1), ms(500));
         assert!(!selector.take(ms(600)));
         assert!(selector.take(ms(1000)));
-    }
-
-    #[test]
-    fn gravity_settles_on_the_steady_reading_through_a_shake() {
-        let mut gravity = GravityEstimate::new(ms(500));
-        gravity.add(Vec3::new(0.0, -9.8, 0.0), ms(5));
-        for k in 0..400 {
-            let shake = if k % 2 == 0 { 2.0 } else { -2.0 };
-            gravity.add(Vec3::new(shake, -9.8, 0.0), ms(5));
-        }
-        let specific_force = gravity.specific_force().unwrap();
-        assert!(specific_force.x.abs() < 0.1 && (specific_force.y + 9.8).abs() < 0.01, "{specific_force}");
     }
 }

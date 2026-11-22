@@ -1,9 +1,9 @@
-//! The rig view fed by a synthetic robot driving a circle in a 6 x 5 m room with a chair, for looking at the page
-//! without the rig. A keyframe a second is rendered from the room and fused by the dense map itself, which sends the
-//! mesh blocks and the topology, and each keyframe's planes and room are found as the plane_segmentation node finds them.
-//! The robot's odometry and the people frames go at 30 Hz, as on the rig; a person walks along the far wall, in the
-//! depth too, so later keyframes carve the clouds where they were; the chair is an object whose voxels paint the surface. After 20 s a loop closure moves every
-//! keyframe 5 cm and the dense map rebuilds. The first surface message after 10 s is lost on its way, as a full
+//! The rig view fed by a synthetic robot driving a circle in a 6 x 5 m room with a chair and a sofa, for looking at
+//! the page without the rig. A keyframe a second is rendered from the room at the rig's 1280x720 for the rig view, and
+//! at 320x240 for the dense map itself, which fuses it and sends the mesh blocks and the topology. The robot's odometry
+//! and the people frames go at 30 Hz, as on the rig; a person walks along the far wall, in the depth too, so later
+//! keyframes carve the clouds where they were. The chair and the sofa are objects whose voxels tint the clouds and
+//! paint the mesh. After 20 s a loop closure moves every keyframe 5 cm and the dense map rebuilds. The first surface message after 10 s is lost on its way, as a full
 //! dora queue would lose it: the rig view sees the gap, asks the dense map for a snapshot, and the snapshot repairs
 //! the surface. `cargo run --release --example demo -- 8094`, then open http://localhost:8094.
 
@@ -25,19 +25,41 @@ use perception_wire::people::{Keypoint, PeopleTracks, PersonTrack, PixelBox, Poi
 use perception_wire::Keyframe;
 
 const ROOM: Vec3 = Vec3::new(6.0, 5.0, 2.6);
-const CHAIR_MIN: Vec3 = Vec3::new(4.95, 0.55, 0.0);
-const CHAIR_MAX: Vec3 = Vec3::new(5.45, 1.05, 0.9);
+const CHAIR: Furniture =
+    Furniture { object_id: 12, label: "chair", low: Vec3::new(4.95, 0.55, 0.0), high: Vec3::new(5.45, 1.05, 0.9), rgb: [150, 45, 40] };
+const SOFA: Furniture =
+    Furniture { object_id: 14, label: "sofa", low: Vec3::new(0.05, 1.5, 0.0), high: Vec3::new(0.6, 3.2, 0.5), rgb: [70, 80, 120] };
 const CAMERA_HEIGHT_M: f32 = 1.0;
-const WIDTH: usize = 320;
-const HEIGHT: usize = 240;
-// About the D455's field of view, 90 by 70 degrees, so that the floor is in view.
-const INTRINSICS: CameraIntrinsics = CameraIntrinsics { fx: 160.0, fy: 170.0, ppx: 160.0, ppy: 120.0 };
+/// The keyframes the rig view gets: the rig's colour image size, and about the D455's field of view, 90 by 70
+/// degrees, so that the floor is in view.
+const KEYFRAME_CAMERA: DemoCamera =
+    DemoCamera { width: 1280, height: 720, intrinsics: CameraIntrinsics { fx: 640.0, fy: 514.0, ppx: 640.0, ppy: 360.0 } };
+/// The keyframes the dense map fuses: the same view, smaller, so that fusing keeps up with the 30 Hz frames.
+const FUSED_CAMERA: DemoCamera =
+    DemoCamera { width: 320, height: 240, intrinsics: CameraIntrinsics { fx: 160.0, fy: 170.0, ppx: 160.0, ppy: 120.0 } };
 const KEYFRAMES: u64 = 40;
 const OBJECT_VOXEL_M: f32 = 0.05;
 /// The rig's frame rate: odometry and people frames come this often.
 const FRAMES_PER_S: u64 = 30;
 /// The first surface message from this tick on is lost before the rig view sees it.
 const LOST_SURFACE_TICK: u64 = 10 * FRAMES_PER_S;
+
+/// An image size and the lens that fills it.
+#[derive(Clone, Copy)]
+struct DemoCamera {
+    width: usize,
+    height: usize,
+    intrinsics: CameraIntrinsics,
+}
+
+/// A box of furniture standing in the room, which the object map reports as an object.
+struct Furniture {
+    object_id: u64,
+    label: &'static str,
+    low: Vec3,
+    high: Vec3,
+    rgb: [u8; 3],
+}
 
 /// The robot at time `t_s`: on a 1.5 m circle round the room's middle, facing along the circle.
 fn robot_at(t_s: f32) -> (Vec3, f32) {
@@ -87,16 +109,17 @@ fn room_colour(hit: Vec3) -> [u8; 3] {
     }
 }
 
-/// Depth and colour seen from a level camera at `position` turned by `yaw` (forward along map +y at yaw 0), with
-/// the person where they are at `t_s`.
-fn render(frame_id: u64, position: Vec3, yaw: f32, t_s: f32) -> Keyframe {
+/// Depth and colour seen through `lens` from a level camera at `position` turned by `yaw` (forward along map +y at
+/// yaw 0), with the person where they are at `t_s`.
+fn render(lens: DemoCamera, frame_id: u64, position: Vec3, yaw: f32, t_s: f32) -> Keyframe {
     let (person_low, person_high) = person_box(t_s);
     let turn = Quat::from_rotation_z(yaw);
-    let mut depth_mm = vec![0u16; WIDTH * HEIGHT];
-    let mut rgb = vec![0u8; WIDTH * HEIGHT * 3];
-    for row in 0..HEIGHT {
-        for column in 0..WIDTH {
-            let camera = INTRINSICS.deproject(column as f32, row as f32, 1.0);
+    let DemoCamera { width, height, intrinsics } = lens;
+    let mut depth_mm = vec![0u16; width * height];
+    let mut rgb = vec![0u8; width * height * 3];
+    for row in 0..height {
+        for column in 0..width {
+            let camera = intrinsics.deproject(column as f32, row as f32, 1.0);
             let direction = turn * Vec3::new(camera.x, camera.z, -camera.y);
             let room_t = (0..3)
                 .filter_map(|axis| {
@@ -105,30 +128,29 @@ fn render(frame_id: u64, position: Vec3, yaw: f32, t_s: f32) -> Keyframe {
                 })
                 .filter(|t| *t > 0.0)
                 .fold(f32::INFINITY, f32::min);
-            let chair_t = box_hit(position, direction, CHAIR_MIN, CHAIR_MAX).unwrap_or(f32::INFINITY);
-            let person_t = box_hit(position, direction, person_low, person_high).unwrap_or(f32::INFINITY);
-            let (t, color) = if person_t < room_t.min(chair_t) {
-                (person_t, [40, 120, 60])
-            } else if chair_t < room_t {
-                (chair_t, [150, 45, 40])
-            } else {
-                (room_t, room_colour(position + direction * room_t))
-            };
-            let pixel = row * WIDTH + column;
+            let mut nearest = (room_t, room_colour(position + direction * room_t));
+            let boxes = [(CHAIR.low, CHAIR.high, CHAIR.rgb), (SOFA.low, SOFA.high, SOFA.rgb), (person_low, person_high, [40, 120, 60])];
+            for (low, high, color) in boxes {
+                if let Some(t) = box_hit(position, direction, low, high).filter(|t| *t < nearest.0) {
+                    nearest = (t, color);
+                }
+            }
+            let (t, color) = nearest;
+            let pixel = row * width + column;
             depth_mm[pixel] = (t * 1000.0) as u16;
             rgb[pixel * 3..pixel * 3 + 3].copy_from_slice(&color);
         }
     }
     let mut jpeg = Vec::new();
     jpeg_encoder::Encoder::new(&mut jpeg, 85)
-        .encode(&rgb, WIDTH as u16, HEIGHT as u16, jpeg_encoder::ColorType::Rgb)
+        .encode(&rgb, width as u16, height as u16, jpeg_encoder::ColorType::Rgb)
         .expect("encoding to memory");
     Keyframe {
         frame_id,
         captured_unix_ns: frame_id as i64,
-        width: WIDTH,
-        height: HEIGHT,
-        intrinsics: INTRINSICS,
+        width,
+        height,
+        intrinsics,
         specific_force: Vec3::new(0.0, -9.8, 0.0),
         depth_mm: depth_mm.into(),
         color_jpeg: jpeg,
@@ -149,8 +171,8 @@ fn person_at(t_s: f32, frame_id: u64, captured_camera_ns: i64) -> PeopleTracks {
     PeopleTracks {
         frame_id,
         captured_camera_ns,
-        width: WIDTH as u16,
-        height: HEIGHT as u16,
+        width: KEYFRAME_CAMERA.width as u16,
+        height: KEYFRAME_CAMERA.height as u16,
         position_frame: PositionFrame::Odom { odom_started: CameraNanos(0) },
         specific_force: None,
         tracks: vec![PersonTrack {
@@ -167,26 +189,28 @@ fn person_at(t_s: f32, frame_id: u64, captured_camera_ns: i64) -> PeopleTracks {
     }
 }
 
-/// The chair as the object map reports it: the cubes its seen surface falls in.
-fn chair() -> ObjectUpdate {
-    let low = (CHAIR_MIN / OBJECT_VOXEL_M).floor().as_ivec3();
-    let high = (CHAIR_MAX / OBJECT_VOXEL_M).ceil().as_ivec3() - IVec3::ONE;
+/// A piece of furniture as the object map reports it: every cube within half a cube of the box's sides and top, so
+/// that the points seen on its faces fall in them.
+fn object_update(furniture: &Furniture) -> ObjectUpdate {
+    let half_cube = 0.5 * OBJECT_VOXEL_M;
+    let low = ((furniture.low - Vec3::new(half_cube, half_cube, 0.0)) / OBJECT_VOXEL_M).floor().as_ivec3();
+    let high = ((furniture.high + Vec3::splat(half_cube)) / OBJECT_VOXEL_M).floor().as_ivec3();
     let mut voxels = Vec::new();
     for x in low.x..=high.x {
         for y in low.y..=high.y {
             for z in low.z..=high.z {
-                if x == low.x || x == high.x || y == low.y || y == high.y || z == high.z {
-                    voxels.push(IVec3::new(x, y, z));
-                }
+                voxels.push(IVec3::new(x, y, z));
             }
         }
     }
+    let (low, high) = (furniture.low, furniture.high);
+    let size = high - low;
     let corner = |x: f32, y: f32| Vec2::new(x, y);
     ObjectUpdate {
         kind: ObjectUpdateKind::Appeared,
-        object_id: ObjectId(12),
+        object_id: ObjectId(furniture.object_id),
         merged_into: None,
-        label: "chair".into(),
+        label: furniture.label.into(),
         score: 0.8,
         confidence: 0.9,
         seen_count: 5,
@@ -194,17 +218,12 @@ fn chair() -> ObjectUpdate {
         captured: UnixNanos(1),
         map_version: MapVersion(1),
         extent: ObjectExtent {
-            centre_m: (CHAIR_MIN + CHAIR_MAX) / 2.0,
-            footprint_m: [
-                corner(CHAIR_MIN.x, CHAIR_MIN.y),
-                corner(CHAIR_MAX.x, CHAIR_MIN.y),
-                corner(CHAIR_MAX.x, CHAIR_MAX.y),
-                corner(CHAIR_MIN.x, CHAIR_MAX.y),
-            ],
-            long_m: 0.5,
-            short_m: 0.5,
-            height_m: CHAIR_MAX.z,
-            top_m: CHAIR_MAX.z,
+            centre_m: (low + high) / 2.0,
+            footprint_m: [corner(low.x, low.y), corner(high.x, low.y), corner(high.x, high.y), corner(low.x, high.y)],
+            long_m: size.x.max(size.y),
+            short_m: size.x.min(size.y),
+            height_m: size.z,
+            top_m: high.z,
         },
         crop_jpeg: None,
         voxel_m: OBJECT_VOXEL_M,
@@ -285,7 +304,8 @@ async fn main() -> eyre::Result<()> {
         sigma_yaw_rad: 0.01,
     };
     demo.send(RigInput::MapToOdom(identity), 0)?;
-    demo.send(RigInput::ObjectUpdate(chair()), 0)?;
+    demo.send(RigInput::ObjectUpdate(object_update(&CHAIR)), 0)?;
+    demo.send(RigInput::ObjectUpdate(object_update(&SOFA)), 0)?;
     let mut keyframes: Vec<(u64, Pose4Dof)> = Vec::new();
     let mut frames = tokio::time::interval(Duration::from_nanos(1_000_000_000 / FRAMES_PER_S));
     frames.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -299,9 +319,9 @@ async fn main() -> eyre::Result<()> {
         let (position, yaw) = robot_at(t_s);
         if tick % FRAMES_PER_S == 0 && (keyframes.len() as u64) < KEYFRAMES {
             let frame_id = tick / FRAMES_PER_S + 1;
-            let keyframe = render(frame_id, position, yaw, t_s);
+            let keyframe = render(KEYFRAME_CAMERA, frame_id, position, yaw, t_s);
             let pose = wire_pose(frame_id, Pose4Dof { x_m: position.x, y_m: position.y, z_m: position.z, yaw_rad: yaw }, 1);
-            demo.mapper.on_keyframe(DepthKeyframe::from_wire(&keyframe));
+            demo.mapper.on_keyframe(DepthKeyframe::from_wire(&render(FUSED_CAMERA, frame_id, position, yaw, t_s)));
             demo.mapper.on_keyframe_pose(DenseKeyframePose::from(&pose));
             demo.send(RigInput::Keyframe(keyframe), tick)?;
             demo.send(RigInput::KeyframePose(pose), tick)?;

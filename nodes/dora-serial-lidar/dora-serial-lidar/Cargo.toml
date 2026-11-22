@@ -1,7 +1,7 @@
 [package]
-name = "dora-delta2a-lidar"
+name = "dora-serial-lidar"
 version = "0.1.0"
-description = "dora node that publishes Delta-2A lidar revolutions"
+description = "dora node that publishes each turn of a serial lidar (LD06 or Delta-2A) as a scan"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -9,6 +9,7 @@ readme = "../README.md"
 
 [dependencies]
 delta2a = { path = "../delta2a" }
+ld06 = { path = "../ld06" }
 # The node API has to match the version of the dora CLI that runs the dataflow.
 dora-node-api = { version = "=0.3.13", default-features = false }
 eyre = "0.6"

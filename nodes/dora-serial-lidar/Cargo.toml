@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["delta2a", "dora-delta2a-lidar"]
+members = ["delta2a", "ld06", "dora-serial-lidar"]
 
 [workspace.package]
 edition = "2021"

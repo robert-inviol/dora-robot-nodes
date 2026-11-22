@@ -44,6 +44,32 @@ def test_a_scan_whose_bearings_and_ranges_are_out_of_step_is_rejected():
         Scan.from_arrow(out_of_step)
 
 
+def _scan_row(**overrides) -> dict:
+    row = {
+        "spin_rev_per_s": 10.0,
+        "first_reading_unix_ns": 1_000,
+        "last_reading_unix_ns": 2_000,
+        "bearing_deg": [0.0, 90.0],
+        "range_m": [1.5, None],
+        "intensity": [200, 0],
+    }
+    return row | overrides
+
+
+def test_a_scan_whose_intensities_are_out_of_step_with_its_readings_is_rejected():
+    out_of_step = pa.array([_scan_row(intensity=[200])], type=SCAN_TYPE)
+
+    with pytest.raises(ValueError, match="1 intensities for 2 readings"):
+        Scan.from_arrow(out_of_step)
+
+
+def test_a_scan_whose_last_reading_comes_before_its_first_is_rejected():
+    backwards = pa.array([_scan_row(first_reading_unix_ns=2_000, last_reading_unix_ns=1_000)], type=SCAN_TYPE)
+
+    with pytest.raises(ValueError, match="before its first"):
+        Scan.from_arrow(backwards)
+
+
 def test_a_wish_within_the_cap_is_scaled_by_the_cap():
     assert DriveDemand.limited(forward=1.0, turn=0.0, cap=PowerCap(20)) == DriveDemand(0.2, 0.0)
 

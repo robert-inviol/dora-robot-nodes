@@ -1,8 +1,9 @@
 //! Persistent objects built from SAM 3 masks: matching, confirmation, merging and negative evidence.
 //!
 //! Each keyframe's masks are lifted into the map with the keyframe's pose and voxelised. A detection belongs to
-//! the existing object with the same label whose voxels it overlaps most; otherwise it starts a candidate, which
-//! becomes an object after enough observations. Objects that overlap and share a label are merged. Where the camera
+//! the existing object it shares the most space with, whatever either is called; otherwise it starts a candidate,
+//! which becomes an object after enough observations. An object's label is the one with the most detection score
+//! behind it. Objects that overlap are merged. Where the camera
 //! sees clearly past an object's surface, often enough, the object has gone; if one with its label turns up
 //! elsewhere soon after, it has moved.
 

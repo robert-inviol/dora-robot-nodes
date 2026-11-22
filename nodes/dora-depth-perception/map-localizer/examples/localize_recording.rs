@@ -56,6 +56,7 @@ fn main() -> eyre::Result<()> {
             captured: UnixNanos(keyframe.captured_unix_ns),
             cloud,
             yaw_prior,
+            odometry_step: None,
         });
         times_ms.push(started.elapsed().as_secs_f64() * 1e3);
         states.push(estimate.tracking);

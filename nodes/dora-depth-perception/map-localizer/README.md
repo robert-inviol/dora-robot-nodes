@@ -46,6 +46,13 @@ trials, the refinement, loop closure, relocalization and pose graph optimization
   (`KeyframeSelection::Selected`) but not registered against the map, and later loop closures pull its run into
   place, moving its pose. The keyframes tracked after it, until a loop closure ties the run to the map, are
   reported `tracking`.
+
+With an odometry step (`LocalizerInput::odometry_step`: the camera's motion since the previous keyframe, by
+odometry) the step seeds tracking in place of the step before, and carries the pose of a keyframe that does not
+register. Such a keyframe with enough points, beyond keyframe selection of every map keyframe, joins the map at once
+at its carried pose by a dead-reckoning edge (`graph.odometry_step_sigma`) and is reported `restarted`; tracking goes
+on against the whole map. So a view of space the map does not hold adds that space. One within keyframe selection of
+the map is `lost` at its carried pose, and the next keyframe is tracked from there and reported `relocalized`.
 - `lost`: not registered; the pose is the last position turned by the gyro and the keyframe stays out of the
   map.
 

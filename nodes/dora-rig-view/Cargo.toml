@@ -1,7 +1,7 @@
 [package]
 name = "dora-rig-view"
 version = "0.1.0"
-description = "dora node serving a live 3D page of the robot's map: keyframe clouds, the robot, people, objects and rooms, sent to browsers as small updates"
+description = "dora node serving a live 3D page of the robot's map: keyframe clouds tinted by object, labelled objects, the robot, people and rooms, sent to browsers as small updates"
 edition = "2021"
 rust-version = "1.85"
 license = "MIT"

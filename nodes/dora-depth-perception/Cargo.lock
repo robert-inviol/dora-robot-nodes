@@ -718,6 +718,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "dora-localizer-input-recorder"
+version = "0.1.0"
+dependencies = [
+ "dora-map-localizer",
+ "dora-node-api",
+ "eyre",
+]
+
+[[package]]
 name = "dora-map-localizer"
 version = "0.1.0"
 dependencies = [
@@ -727,6 +736,7 @@ dependencies = [
  "glam",
  "map-localizer",
  "perception-wire",
+ "rgbd-keyframes",
  "room-map",
  "serde",
  "thiserror 2.0.21",

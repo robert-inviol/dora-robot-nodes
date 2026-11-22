@@ -14,6 +14,7 @@ use glam::Vec3;
 use dora_depth_inertial_odometry::people_mask::{MaskSettings, WrongImageSize};
 use perception_wire::camera::CameraCalibration;
 use perception_wire::localization::CameraNanos;
+use perception_wire::odometry::OdomPose;
 use perception_wire::people::PersonPoses;
 use perception_wire::{Imu, Keyframe};
 use rgbd_keyframes::{KeyframeSelector, KeyframeSettings};
@@ -59,8 +60,16 @@ struct Samples {
     gyro: Vec<(i64, Vec3)>,
 }
 
+/// Where the camera is in one odom frame, against where it was when the last keyframe was taken.
+struct Travel {
+    odom_started_camera_ns: i64,
+    at_last_keyframe_m: Vec3,
+    latest_m: Vec3,
+}
+
 pub struct KeyframeAssembler {
     selector: KeyframeSelector,
+    travel: Option<Travel>,
     first_camera_ns: Option<i64>,
     last_gyro_ns: Option<i64>,
     samples: Samples,
@@ -78,6 +87,7 @@ impl KeyframeAssembler {
     pub fn new(settings: KeyframeSettings) -> KeyframeAssembler {
         KeyframeAssembler {
             selector: KeyframeSelector::new(settings),
+            travel: None,
             first_camera_ns: None,
             last_gyro_ns: None,
             samples: Samples::default(),
@@ -102,6 +112,23 @@ impl KeyframeAssembler {
         self.samples.accel.extend(imu.accel_camera_ns.iter().copied().zip(imu.accel_m_s2.iter().copied()));
     }
 
+    /// Adds the odometry's latest pose, so that travel calls for a keyframe. A pose in a new odom frame starts the
+    /// travel again from there: positions in different odom frames do not compare.
+    pub fn add_odom_pose(&mut self, pose: &OdomPose) {
+        match self.travel.as_mut() {
+            Some(travel) if travel.odom_started_camera_ns == pose.odom_started_camera_ns => travel.latest_m = pose.position_m,
+            _ => {
+                self.travel = Some(Travel {
+                    odom_started_camera_ns: pose.odom_started_camera_ns,
+                    at_last_keyframe_m: pose.position_m,
+                    latest_m: pose.position_m,
+                })
+            }
+        }
+        let travel = self.travel.as_ref().expect("just set");
+        self.selector.set_travel(travel.latest_m.distance(travel.at_last_keyframe_m));
+    }
+
     /// Adds one depth frame. Returns true when it is selected, and its colour should be fetched. Frames before the
     /// camera has a gravity estimate, or before the pose model's first person poses, are never selected.
     pub fn add_depth(&mut self, frame_id: u64, camera_ns: i64, captured_unix_ns: i64, specific_force: Option<Vec3>, depth_mm: &[u16]) -> bool {
@@ -112,6 +139,9 @@ impl KeyframeAssembler {
         }
         if !self.selector.take(Duration::from_nanos((camera_ns - first).max(0) as u64)) {
             return false;
+        }
+        if let Some(travel) = self.travel.as_mut() {
+            travel.at_last_keyframe_m = travel.latest_m;
         }
         self.held.insert(frame_id, Held { camera_ns, captured_unix_ns, specific_force, depth_mm: depth_mm.to_vec(), color_jpeg: None });
         true
@@ -225,6 +255,52 @@ mod tests {
                 assembler.add_depth(frame, frame as i64 * FRAME_NS, 0, Some(Vec3::new(0.0, -9.8, 0.0)), &depth)
             })
             .collect()
+    }
+
+    /// The odometry's pose at `position_m` in the odom frame started at `odom_started_camera_ns`.
+    fn odom_pose(odom_started_camera_ns: i64, position_m: Vec3) -> OdomPose {
+        OdomPose {
+            camera_ns: 0,
+            odom_started_camera_ns,
+            depth_frame_id: 0,
+            position_m,
+            orientation: glam::Quat::IDENTITY,
+            velocity_m_s: Vec3::ZERO,
+            position_sigma_m: Vec3::ZERO,
+            tilt_sigma_rad: 0.0,
+            heading_sigma_rad: 0.0,
+            corrected: true,
+            matched_points: 100,
+            degenerate: None,
+        }
+    }
+
+    /// Feeds frames `range` with the camera moving `step_m` along x each frame, and returns the ones selected.
+    fn run_moving(assembler: &mut KeyframeAssembler, frames: std::ops::Range<u64>, odom_started_camera_ns: i64, step_m: f32) -> Vec<u64> {
+        let depth = [1000u16; 12];
+        frames
+            .filter(|&frame| {
+                assembler.add_imu(&imu(frame, 0.0));
+                assembler.add_odom_pose(&odom_pose(odom_started_camera_ns, Vec3::new(frame as f32 * step_m, 0.0, 0.0)));
+                assembler.add_depth(frame, frame as i64 * FRAME_NS, 0, Some(Vec3::new(0.0, -9.8, 0.0)), &depth)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_moving_camera_gives_a_keyframe_every_ten_centimetres() {
+        // 1.1 cm a frame passes 10 cm on the tenth frame after a keyframe.
+        assert_eq!(run_moving(&mut assembler(), 0..35, 1, 0.011), vec![0, 10, 20, 30]);
+    }
+
+    #[test]
+    fn a_new_odom_frame_starts_the_travel_again() {
+        let mut assembler = assembler();
+        assert_eq!(run_moving(&mut assembler, 0..8, 1, 0.01), vec![0]);
+        // The new frame's positions start 5 m away, which is not travel.
+        assembler.add_odom_pose(&odom_pose(2, Vec3::new(5.0, 0.0, 0.0)));
+        let depth = [1000u16; 12];
+        assert!(!assembler.add_depth(8, 8 * FRAME_NS, 0, Some(Vec3::new(0.0, -9.8, 0.0)), &depth));
     }
 
     #[test]

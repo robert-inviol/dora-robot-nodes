@@ -34,7 +34,7 @@ The node links librealsense2, so it builds only on the camera's machine: `cargo 
 | Output | What it carries |
 |---|---|
 | `model_input` | The colour image shrunk by a whole factor (2 for 720p into 640), each pixel the average of its block, centred on a grey (114) square: the input a YOLO model takes. Raw `rgb8` bytes. Metadata: `encoding`, `width`, `height`, `frame_id`, `camera_ns` (the colour frame's capture time), `source_width`, `source_height`, `shrink`, `pad_x`, `pad_y`; a point at (x, y) in the square is at ((x - pad_x) * shrink, (y - pad_y) * shrink) in the colour image |
-| `depth` | Raw depth, not aligned to colour: `u16` millimetres, row major, 0 where the sensor has no reading. Metadata: `encoding` (`mono16`), `width`, `height`, `frame_id`, `camera_ns` (the depth frame's capture time), and `specific_force` (three floats, the accelerometer smoothed over half a second, in the accelerometer's axes: `calibration`'s `depth_to_imu` rotation takes depth-camera directions into them) once it has settled |
+| `depth` | Raw depth, not aligned to colour: `u16` millimetres, row major, 0 where the sensor has no reading. Metadata: `encoding` (`mono16`), `width`, `height`, `frame_id`, `camera_ns` (the depth frame's capture time), and `specific_force` (three floats: up in the accelerometer's axes, the specific force the IMU would read at rest, at standard gravity's size; `calibration`'s `depth_to_imu` rotation takes depth-camera directions into those axes) once the IMU has been at rest for a second. It comes from a complementary filter (`rgbd_keyframes::GravityFilter`): every gyro sample turns up, so it follows the camera's turns without lag, and every accelerometer sample pulls it towards the accelerometer's direction with a 3 s time constant (`GRAVITY_TIME_CONSTANT`), which averages away a hand-held or driven camera's pushes and corrects the gyro's drift (its bias is not estimated). The filter starts from the mean accelerometer direction over a second at rest, by the odometry's static-initialization rules. A motion sample not newer than the one before it in its stream, a gyro silent for more than 100 ms, or one stream waiting more than a second for the other stops the node |
 | `color` | The full colour image, raw `rgb8` bytes, with the same metadata as `depth` less gravity; `camera_ns` is the colour frame's capture time |
 | `imu` | The `imu` message of `dora-rig-messages`: every accelerometer and gyro sample since the previous frame, each with its own camera time, corrected with the IMU calibration. Its `frame_id` and `keyframe_camera_ns` are the frame these samples lead up to; it goes out before that frame |
 | `calibration` | The `camera_calibration` message of `dora-rig-messages`: colour and depth intrinsics, and the depth-to-colour and depth-to-IMU transforms. Sent with the first frame and then once a second |
@@ -62,8 +62,8 @@ read them. `frame_id` counts frames from 0 and is the same across every output o
 | `MODEL_INPUT_SIZE` | Optional: the side of the square `model_input`, default 640 |
 
 `dora-keyframe-selector`, in this workspace, selects keyframes from this node's frames without librealsense. It follows
-`imu` and `depth`, selects a frame at least once a second and sooner when the camera turns 10 degrees (never closer
-than 200 ms), and asks for that frame's colour on `request_color`. It then sends the `imu` and `keyframe` messages of
+`imu` and `depth`, selects a frame at least once a second and sooner when the camera turns 10 degrees or the
+odometry's `odom_pose` says it has travelled 10 cm (never closer than 200 ms), and asks for that frame's colour on `request_color`. It then sends the `imu` and `keyframe` messages of
 `dora-rig-messages`: an `imu` message with every sample since the previous keyframe, up to and including the first
 gyro sample at or after the keyframe's time (so the gyro covers its whole span; that sample comes with the next
 frame's imu, about 33 ms later), then the keyframe. The keyframe
@@ -103,7 +103,8 @@ YOLOv8 pose on a Hailo-8 (`dora-hailo-perception`'s `dora-hailo-pose`), odometry
 (`dora-depth-inertial-odometry`), the people placed in 3D in the odom frame (`dora-people-3d`), keyframes
 (`dora-keyframe-selector`) and posed depth frames (`dora-posed-depth`). It publishes `rig/people_tracks`,
 `rig/odom_pose`, `rig/keyframe`, `rig/imu`, `rig/calibration` and `rig/posed_depth` over `dora-zenoh-bridge`; only
-`rig/posed_depth` and `rig/people_tracks` may lose a message to a newer one.
+`rig/posed_depth` and `rig/people_tracks` may lose a message to a newer one. It also runs the LD06 lidar
+(`dora-serial-lidar`), whose `scan` stays on the camera's machine.
 
 On a Raspberry Pi 5 the node uses about 40% of one core with `model_input`, `depth`, `imu`, `calibration` and
 `color` on request listed; shrinking one frame into the model input takes about 5.3 ms. The keyframe selector uses

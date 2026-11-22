@@ -69,6 +69,7 @@ fn localize(name: &'static str, walk: &SyntheticWalk, settings: LocalizerSetting
             captured: UnixNanos(keyframe.captured_unix_ns),
             cloud,
             yaw_prior: heading.yaw_prior,
+            odometry_step: None,
         });
         timed.push(Timed { estimate, cloud: cloud_time, cloud_points, total: started.elapsed() });
         std::thread::sleep(gap);

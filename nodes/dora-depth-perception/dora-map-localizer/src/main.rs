@@ -87,6 +87,8 @@ fn send(node: &mut DoraNode, outputs: &Outputs, handled: Handled, started: Insta
         let work = handled.keyframe_work.expect("a keyframe estimate comes with the node's work on it");
         let stages = estimate.timings;
         let localized = started.elapsed();
+        let odometry_step_m = work.odometry_step.as_ref().ok().map(|step| step.translation.length());
+        let no_odometry_step = work.odometry_step.as_ref().err().map(ToString::to_string);
         tracing::info!(
             frame_id = estimate.frame_id.0,
             tracking = estimate.tracking.wire_name(),
@@ -97,6 +99,8 @@ fn send(node: &mut DoraNode, outputs: &Outputs, handled: Handled, started: Insta
             y_m = estimate.pose.translation.y,
             yaw_deg = estimate.pose.yaw_rad.to_degrees(),
             submap = estimate.submap.len(),
+            ?odometry_step_m,
+            ?no_odometry_step,
             cloud_points = work.cloud_points,
             cloud_ms = ms(work.cloud),
             tracking_target_ms = ms(stages.tracking_target),

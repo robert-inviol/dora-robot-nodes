@@ -92,8 +92,8 @@
     "canonical": "struct<frame_id!:u64,camera_ns!:i64,odom_started_camera_ns!:i64,intrinsics!:struct<width!:u16,height!:u16,fx!:f32,fy!:f32,ppx!:f32,ppy!:f32>,camera_position_m!:list<item!:f32>,camera_orientation_xyzw!:list<item!:f32>,depth_mm!:list<item!:u16>>"
   },
   "scan": {
-    "fingerprint": "039cfa54bbbb30f1",
-    "canonical": "struct<spin_rev_per_s?:f32,bearing_deg?:list<item!:f32>,range_m?:list<item?:f32>>"
+    "fingerprint": "36b5aeb197b6207d",
+    "canonical": "struct<spin_rev_per_s?:f32,first_reading_unix_ns?:i64,last_reading_unix_ns?:i64,bearing_deg?:list<item!:f32>,range_m?:list<item?:f32>,intensity?:list<item!:u8>>"
   },
   "scene": {
     "fingerprint": "276d4cb3e8308722",

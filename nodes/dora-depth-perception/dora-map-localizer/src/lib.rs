@@ -17,6 +17,10 @@
 //! odometry pose that joined one. A keyframe that waits longer than the retention, or that falls before the
 //! odometry kept, is left out and reported in `unjoined`.
 //!
+//! Odometry also gives the localizer each keyframe's odometry step: the camera's motion since the previous keyframe,
+//! when odometry has reached the keyframe's camera time and both keyframes are in one odom frame. A keyframe without
+//! one is reported in `KeyframeWork::odometry_step`.
+//!
 //! Each odometry pose names its odom frame by the camera time odometry started at. A pose with a later start is from
 //! odometry that started again in a new odom frame: the poses and correction of the old frame are dropped, a waiting
 //! keyframe from before the new start is reported in `unjoined`, no correction is sent until a keyframe joins the new
@@ -24,6 +28,7 @@
 //! Odometry camera times keep increasing across a restart.
 
 pub mod config;
+pub mod recording;
 
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
@@ -81,7 +86,7 @@ pub struct OdometryRestart {
 }
 
 /// The node's own work on a keyframe, around the localizer's stages (`KeyframeEstimate::timings`).
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct KeyframeWork {
     /// Points in the registration cloud.
     pub cloud_points: usize,
@@ -89,6 +94,28 @@ pub struct KeyframeWork {
     pub cloud: Duration,
     /// Joining keyframes to odometry and estimating the map to odom correction.
     pub map_to_odom: Duration,
+    /// The odometry step the localizer was given, or why it had none.
+    pub odometry_step: Result<room_map::Pose, NoOdometryStep>,
+}
+
+/// Why a keyframe had no odometry step.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum NoOdometryStep {
+    #[error("the settings have no [odometry] section")]
+    NotConfigured,
+    #[error("no keyframe before this one has an odometry pose")]
+    FirstKeyframe,
+    #[error("odometry started again in a new odom frame since the previous keyframe")]
+    OdomFrameChanged,
+    #[error(transparent)]
+    Odometry(#[from] OdomError),
+}
+
+/// Where odometry put the camera's floor frame at the latest keyframe, and in which odom frame.
+#[derive(Clone, Copy, Debug)]
+struct KeyframeInOdom {
+    odom_started: CameraNanos,
+    pose: room_map::Pose,
 }
 
 /// What handling one input did.
@@ -122,6 +149,7 @@ struct OdometryLink {
     estimator: MapToOdomEstimator,
     /// Oldest first.
     waiting: VecDeque<(FrameId, CameraNanos)>,
+    previous_keyframe: Option<KeyframeInOdom>,
 }
 
 impl OdometryLink {
@@ -133,6 +161,21 @@ impl OdometryLink {
             estimator: MapToOdomEstimator::new(settings.estimator.clone()),
             settings,
             waiting: VecDeque::new(),
+            previous_keyframe: None,
+        }
+    }
+
+    /// The camera's motion from the previous keyframe to the keyframe at `time`, which becomes the previous one. A
+    /// keyframe odometry does not cover leaves no previous keyframe to step from.
+    fn step_to(&mut self, time: CameraNanos) -> Result<room_map::Pose, NoOdometryStep> {
+        let previous = self.previous_keyframe.take();
+        let pose = self.history.at(time)?;
+        let (odom_started, _) = self.odom_frame.expect("odometry with poses has an odom frame");
+        self.previous_keyframe = Some(KeyframeInOdom { odom_started, pose });
+        match previous {
+            None => Err(NoOdometryStep::FirstKeyframe),
+            Some(previous) if previous.odom_started != odom_started => Err(NoOdometryStep::OdomFrameChanged),
+            Some(previous) => Ok(pose.relative_to(&previous.pose)),
         }
     }
 
@@ -311,8 +354,17 @@ impl LocalizerNode {
         let started = Instant::now();
         let cloud = registration_cloud(&keyframe, &self.settings.cloud);
         let (cloud_time, cloud_points) = (started.elapsed(), cloud.len());
-        let estimate =
-            self.localizer.localize(LocalizerInput { frame_id, captured: UnixNanos(keyframe.captured_unix_ns), cloud, yaw_prior: heading.yaw_prior });
+        let odometry_step = match self.odometry.as_mut() {
+            Some(link) => link.step_to(camera_time),
+            None => Err(NoOdometryStep::NotConfigured),
+        };
+        let estimate = self.localizer.localize(LocalizerInput {
+            frame_id,
+            captured: UnixNanos(keyframe.captured_unix_ns),
+            cloud,
+            yaw_prior: heading.yaw_prior,
+            odometry_step: odometry_step.as_ref().ok().copied(),
+        });
         let started = Instant::now();
         let mut unjoined = Vec::new();
         if let Some(link) = self.odometry.as_mut() {
@@ -326,7 +378,7 @@ impl LocalizerNode {
             link.expire(camera_time, &mut unjoined);
         }
         let map_to_odom = self.map_to_odom();
-        let keyframe_work = KeyframeWork { cloud_points, cloud: cloud_time, map_to_odom: started.elapsed() };
+        let keyframe_work = KeyframeWork { cloud_points, cloud: cloud_time, map_to_odom: started.elapsed(), odometry_step };
         let moved = estimate.optimization.as_ref().and_then(|_| self.pose_graph_update());
         if estimate.selection == KeyframeSelection::Selected {
             self.sent.insert(frame_id, estimate.pose);
